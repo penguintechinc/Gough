@@ -8,6 +8,15 @@ env:
     value: "DEBUG"
   - name: RELEASE_MODE
     value: "false"
+ingress:
+  enabled: true
+  className: "nginx"
+  hosts:
+    - host: gough.localhost.local
+      paths:
+        - path: /
+          pathType: Prefix
+  tls: []
 resources:
   limits:
     cpu: 200m
