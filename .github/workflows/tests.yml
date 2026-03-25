@@ -33,7 +33,7 @@ jobs:
     
     steps:
     - name: Checkout code
-      uses: actions/checkout@v4
+      uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5  # v4
       with:
         fetch-depth: 2
 
@@ -104,7 +104,7 @@ jobs:
     
     steps:
     - name: Checkout code
-      uses: actions/checkout@v4
+      uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5  # v4
       
     - name: Set up Python
       uses: actions/setup-python@v4
@@ -180,7 +180,7 @@ jobs:
           
     steps:
     - name: Checkout code
-      uses: actions/checkout@v4
+      uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5  # v4
       
     - name: Set up Python
       uses: actions/setup-python@v4
@@ -233,7 +233,7 @@ jobs:
     
     steps:
     - name: Checkout code
-      uses: actions/checkout@v4
+      uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5  # v4
       
     - name: Set up Python
       uses: actions/setup-python@v4
@@ -294,7 +294,7 @@ jobs:
     
     steps:
     - name: Checkout code
-      uses: actions/checkout@v4
+      uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5  # v4
       
     - name: Set up Python
       uses: actions/setup-python@v4
@@ -372,10 +372,12 @@ else:
     
     steps:
     - name: Checkout code
-      uses: actions/checkout@v4
+      uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5  # v4
       
     - name: Run Trivy vulnerability scanner
-      uses: aquasecurity/trivy-action@v0.35.0
+      uses: aquasecurity/trivy-action@57a97c7e7821a5776cebc9bb87c984fa69cba8f1  # v0.35.0
+        with:
+          trivy-version: 'v0.69.3'
       with:
         scan-type: 'fs'
         scan-ref: '.'
@@ -401,7 +403,7 @@ else:
     
     steps:
     - name: Checkout code
-      uses: actions/checkout@v4
+      uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5  # v4
       
     - name: Download all test artifacts
       uses: actions/download-artifact@v3

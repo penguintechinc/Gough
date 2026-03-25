@@ -1,3 +1,4 @@
+# TODO: migrate to pip-compile --generate-hashes
 # API Manager - Requirements
 # Python 3.13+
 

@@ -1,3 +1,4 @@
+# TODO: migrate to pip-compile --generate-hashes
 # Testing dependencies for Gough hypervisor project
 pytest==7.4.3
 pytest-asyncio==0.21.1

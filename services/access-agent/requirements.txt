@@ -1,3 +1,4 @@
+# TODO: migrate to pip-compile --generate-hashes
 # Gough Access Agent Dependencies
 # Python 3.13+ required
 

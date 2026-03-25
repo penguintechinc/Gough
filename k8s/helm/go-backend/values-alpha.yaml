@@ -1,5 +1,5 @@
 # Alpha environment overrides (local MicroK8s)
-namespace: gough-alpha
+namespace: gough
 replicaCount: 1
 image:
   pullPolicy: Never
