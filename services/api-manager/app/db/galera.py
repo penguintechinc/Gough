@@ -14,13 +14,15 @@ Per CLAUDE.md standards:
 """
 
 import os
-import logging
+from penguintechinc_utils import get_logger
 import time
 from typing import Optional, Callable, Any, Dict
 from dataclasses import dataclass
 from functools import wraps
 
-logger = logging.getLogger(__name__)
+from sqlalchemy import text
+
+logger = get_logger(__name__)
 
 
 @dataclass
@@ -103,7 +105,9 @@ def set_wsrep_sync_wait(db: Any, level: int = 1) -> bool:
         return True
 
     try:
-        db.executesql(f'SET SESSION wsrep_sync_wait = {level}')
+        with db.engine.connect() as conn:
+            conn.execute(text('SET SESSION wsrep_sync_wait = :level'), {'level': level})
+            conn.commit()
         logger.debug(f"Set wsrep_sync_wait to {level}")
         return True
     except Exception as e:
@@ -208,8 +212,10 @@ def set_auto_increment_config(
     increment = increment if increment is not None else config.auto_increment_increment
 
     try:
-        db.executesql(f'SET SESSION auto_increment_offset = {offset}')
-        db.executesql(f'SET SESSION auto_increment_increment = {increment}')
+        with db.engine.connect() as conn:
+            conn.execute(text('SET SESSION auto_increment_offset = :offset'), {'offset': offset})
+            conn.execute(text('SET SESSION auto_increment_increment = :increment'), {'increment': increment})
+            conn.commit()
         logger.debug(f"Set auto_increment_offset={offset}, auto_increment_increment={increment}")
         return True
     except Exception as e:
@@ -231,19 +237,20 @@ def get_cluster_status(db: Any) -> Optional[Dict[str, Any]]:
         return None
 
     try:
-        result = db.executesql(
-            "SHOW STATUS WHERE Variable_name IN ("
-            "'wsrep_cluster_size', "
-            "'wsrep_cluster_status', "
-            "'wsrep_ready', "
-            "'wsrep_connected', "
-            "'wsrep_local_state_comment'"
-            ")",
-            as_dict=True
-        )
+        with db.engine.connect() as conn:
+            result = conn.execute(text(
+                "SHOW STATUS WHERE Variable_name IN ("
+                "'wsrep_cluster_size', "
+                "'wsrep_cluster_status', "
+                "'wsrep_ready', "
+                "'wsrep_connected', "
+                "'wsrep_local_state_comment'"
+                ")"
+            ))
+            rows_raw = [{'Variable_name': r[0], 'Value': r[1]} for r in result]
 
         status = {}
-        for row in result:
+        for row in rows_raw:
             var_name = row.get('Variable_name', '').lower()
             value = row.get('Value', '')
             status[var_name] = value

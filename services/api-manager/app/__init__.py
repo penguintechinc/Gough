@@ -1,8 +1,8 @@
 """Quart Backend Application Factory for Gough.
 
 This module creates and configures the Quart application with:
-- JWT-based authentication with PyDAL user datastore
-- PyDAL for database operations
+- JWT-based authentication with penguin-dal user datastore
+- penguin-dal for database operations
 - CORS for cross-origin requests
 - Prometheus metrics for monitoring
 - Audit logging for security events
@@ -14,6 +14,9 @@ import bcrypt
 from quart import Quart, Response
 from quart_cors import cors
 from prometheus_client import generate_latest, CONTENT_TYPE_LATEST
+from sqlalchemy import text
+from penguin_aaa.middleware.asgi import AuditMiddleware
+from penguin_aaa.audit.emitter import Emitter
 
 from .config import Config
 from .models import init_db, get_db
@@ -93,7 +96,8 @@ async def create_app(config_class: type = Config) -> Quart:
         """Health check endpoint."""
         try:
             db = get_db()
-            db.executesql("SELECT 1")
+            with db.engine.connect() as conn:
+                conn.execute(text("SELECT 1"))
             return {"status": "healthy", "database": "connected"}, 200
         except Exception as e:
             return {"status": "unhealthy", "error": str(e)}, 503
@@ -110,13 +114,17 @@ async def create_app(config_class: type = Config) -> Quart:
         """Prometheus metrics endpoint."""
         return Response(generate_latest(), mimetype=CONTENT_TYPE_LATEST)
 
+    # Wrap with audit middleware for request logging
+    emitter = Emitter()
+    app.asgi_app = AuditMiddleware(app.asgi_app, emitter)
+
     return app
 
 
 def _create_default_admin(user_datastore: PyDALUserDatastore, db) -> None:
     """Create default admin user if no users exist."""
     # Check if any users exist
-    user_count = db(db.auth_user).count()
+    user_count = db(db.auth_user.id > 0).count()
     if user_count > 0:
         return
 

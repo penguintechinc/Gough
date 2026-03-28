@@ -10,7 +10,7 @@ This module provides database initialization and runtime operations:
 from .database import (
     get_db,
     close_db,
-    init_pydal,
+    init_db,
     execute_query,
     get_connection_info,
 )
@@ -23,10 +23,10 @@ from .galera import (
 )
 
 __all__ = [
-    # PyDAL runtime operations
+    # penguin-dal runtime operations
     'get_db',
     'close_db',
-    'init_pydal',
+    'init_db',
     'execute_query',
     'get_connection_info',
     # SQLAlchemy schema initialization

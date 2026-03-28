@@ -22,7 +22,7 @@ try:
     from app import create_app
     from app.config import Config
     from app.models import init_db, get_db
-    from app.models.ipxe import define_ipxe_tables
+    from app.models_sqlalchemy import create_all_tables
 except ImportError:
     # Fallback for testing without full app
     pass
@@ -50,24 +50,40 @@ def test_config():
 
 
 @pytest.fixture(scope="function")
-def app(test_config):
+def app(test_config, tmp_path):
     """Create and configure test Quart application."""
+    import os
     app = Quart(__name__)
     app.config.from_object(test_config)
 
-    with app.app_context():
-        # Initialize database
-        db = init_db(app)
-        define_ipxe_tables(db)
-        db.commit()
-        yield app
+    # Use a temp file so SQLAlchemy schema creation and penguin-dal share the same DB
+    db_path = str(tmp_path / "test_gough.db")
+    db_uri = f"sqlite:///{db_path}"
+    app.config["DATABASE_URL"] = db_uri
+
+    try:
+        from app.models_sqlalchemy import create_all_tables
+        from penguin_dal import DB
+        create_all_tables(db_uri)
+        db = DB(db_uri, pool_size=5)
+        app.config["db"] = db
+    except Exception:
+        pass
+
+    yield app
 
 
 @pytest.fixture(scope="function")
 def db(app):
     """Provide test database connection."""
-    with app.app_context():
+    try:
+        # Try to get db from app config first
+        if "db" in app.config:
+            return app.config["db"]
+        # Fallback: try get_db from app.models
         return get_db()
+    except Exception:
+        return None
 
 
 @pytest.fixture(scope="function")
@@ -79,43 +95,47 @@ def test_client(app):
 @pytest.fixture(scope="function")
 def test_user(app, db):
     """Create a test user for authentication."""
-    from app.models import VALID_ROLES
+    if db is None:
+        return None
 
-    # Ensure admin role exists
-    admin_role = db(db.auth_role.name == "admin").select().first()
-    if not admin_role:
-        role_id = db.auth_role.insert(
-            name="admin",
-            description="Administrator",
-            permissions=json.dumps(["all"])
+    try:
+        # Ensure admin role exists
+        admin_role = db(db.auth_role.name == "admin").select().first()
+        if not admin_role:
+            role_id = db.auth_role.insert(
+                name="admin",
+                description="Administrator",
+                permissions=json.dumps(["all"])
+            )
+            db.commit()
+        else:
+            role_id = admin_role.id
+
+        # Create test user
+        user_email = "testuser@example.com"
+        db(db.auth_user.email == user_email).delete()
+        db.commit()
+
+        user_id = db.auth_user.insert(
+            email=user_email,
+            password="hashed_password",
+            active=True,
+            fs_uniquifier="test-uniquifier-001",
+            confirmed_at=datetime.utcnow(),
+            full_name="Test User"
         )
         db.commit()
-    else:
-        role_id = admin_role.id
 
-    # Create test user
-    user_email = "testuser@example.com"
-    db(db.auth_user.email == user_email).delete()
-    db.commit()
+        # Assign admin role
+        db.auth_user_roles.insert(
+            user_id=user_id,
+            role_id=role_id
+        )
+        db.commit()
 
-    user_id = db.auth_user.insert(
-        email=user_email,
-        password="hashed_password",
-        active=True,
-        fs_uniquifier="test-uniquifier-001",
-        confirmed_at=datetime.utcnow(),
-        full_name="Test User"
-    )
-    db.commit()
-
-    # Assign admin role
-    db.auth_user_roles.insert(
-        user_id=user_id,
-        role_id=role_id
-    )
-    db.commit()
-
-    return db.auth_user(user_id)
+        return db.auth_user(user_id)
+    except Exception:
+        return None
 
 
 @pytest.fixture(scope="function")

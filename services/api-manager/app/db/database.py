@@ -1,171 +1,74 @@
 """
-PyDAL database configuration for runtime operations.
+penguin-dal database configuration for runtime operations.
 
-USAGE: PyDAL handles ALL runtime database operations and migrations.
+USAGE: penguin-dal handles ALL runtime database operations.
 SQLAlchemy is only used for initial schema creation (see init_db.py).
 
 Per CLAUDE.md standards:
-- PyDAL: ALL runtime database operations and migrations (migrate=True)
+- penguin-dal: ALL runtime database operations (auto-reflects tables)
 - SQLAlchemy: Database initialization and schema creation only
 
 Thread Safety:
 - Thread-local storage for database connections
-- Connection pooling via PyDAL
+- Connection pooling via penguin-dal
 - Safe for use with asyncio.to_thread() for blocking operations
 """
 
 import os
-import logging
+from penguintechinc_utils import get_logger
 import threading
 from typing import Optional, Dict, Any, List
 from contextlib import contextmanager
-from pydal import DAL, Field
+from penguin_dal import DB
+from sqlalchemy import text
 from datetime import datetime
 
-logger = logging.getLogger(__name__)
+logger = get_logger(__name__)
 
 # Thread-local storage for database connections
 _thread_local = threading.local()
 
 
-def get_pydal_uri(db_type: str, database_url: str) -> str:
-    """
-    Convert DB_TYPE and DATABASE_URL to PyDAL connection string.
-
-    Args:
-        db_type: Database type (postgres, mysql, mariadb, sqlite)
-        database_url: Database connection URL
-
-    Returns:
-        PyDAL-compatible connection string
-    """
-    db_type_lower = db_type.lower()
-
-    if db_type_lower in ['postgres', 'postgresql']:
-        if database_url.startswith('postgresql://') or database_url.startswith('postgres://'):
-            return database_url.replace('postgres://', 'postgres://')
-        return f'postgres://{database_url}'
-
-    elif db_type_lower in ['mysql', 'mariadb']:
-        if database_url.startswith('mysql://'):
-            return database_url
-        return f'mysql://{database_url}'
-
-    elif db_type_lower == 'sqlite':
-        if database_url.startswith('sqlite://'):
-            return database_url
-        return f'sqlite://{database_url}'
-
-    else:
-        raise ValueError(f"Unsupported DB_TYPE: {db_type}. Supported: postgres, mysql, mariadb, sqlite")
-
-
-def define_tables(db: DAL) -> None:
-    """
-    Define PyDAL table schemas with migrations enabled.
-
-    Args:
-        db: PyDAL database instance
-    """
-    db.define_table(
-        'api_definitions',
-        Field('name', 'string', length=255, notnull=True),
-        Field('version', 'string', length=50, notnull=True),
-        Field('path', 'string', length=500, notnull=True),
-        Field('method', 'string', length=10, notnull=True),
-        Field('description', 'text'),
-        Field('openapi_spec', 'json'),
-        Field('enabled', 'boolean', default=True, notnull=True),
-        Field('created_at', 'datetime', default=datetime.utcnow, notnull=True),
-        Field('updated_at', 'datetime', default=datetime.utcnow, update=datetime.utcnow, notnull=True),
-    )
-
-    db.define_table(
-        'api_usage',
-        Field('api_id', 'integer', notnull=True),
-        Field('timestamp', 'datetime', default=datetime.utcnow, notnull=True),
-        Field('method', 'string', length=10, notnull=True),
-        Field('path', 'string', length=500, notnull=True),
-        Field('status_code', 'integer', notnull=True),
-        Field('response_time_ms', 'integer', notnull=True),
-        Field('user_id', 'string', length=255),
-        Field('ip_address', 'string', length=45),
-        Field('user_agent', 'string', length=500),
-    )
-
-    db.define_table(
-        'api_keys',
-        Field('key_hash', 'string', length=255, notnull=True, unique=True),
-        Field('name', 'string', length=255, notnull=True),
-        Field('user_id', 'string', length=255, notnull=True),
-        Field('scopes', 'json', notnull=True),
-        Field('enabled', 'boolean', default=True, notnull=True),
-        Field('rate_limit', 'integer', default=1000, notnull=True),
-        Field('created_at', 'datetime', default=datetime.utcnow, notnull=True),
-        Field('expires_at', 'datetime'),
-        Field('last_used_at', 'datetime'),
-    )
-
-    db.commit()
-
-
-def init_pydal(
+def init_db(
     database_url: Optional[str] = None,
-    db_type: Optional[str] = None,
     pool_size: int = 10,
-    migrate: bool = True,
-    fake_migrate: bool = False
-) -> DAL:
+) -> DB:
     """
-    Initialize PyDAL database connection with migrations enabled.
+    Initialize penguin-dal database connection.
 
     Args:
-        database_url: Database connection URL (defaults to DATABASE_URL env var)
-        db_type: Database type (defaults to DB_TYPE env var)
+        database_url: Standard SQLAlchemy URI (postgresql://, mysql://, sqlite://)
+                      Defaults to DATABASE_URL environment variable.
         pool_size: Connection pool size
-        migrate: Enable automatic migrations
-        fake_migrate: Enable fake migrations (for manual schema management)
 
     Returns:
-        PyDAL DAL instance
+        penguin-dal DB instance
     """
-    db_type = db_type or os.getenv('DB_TYPE', 'postgres')
     database_url = database_url or os.getenv('DATABASE_URL')
 
     if not database_url:
         raise ValueError("DATABASE_URL environment variable not set")
 
-    pydal_uri = get_pydal_uri(db_type, database_url)
+    logger.info(f"Initializing penguin-dal with pool_size={pool_size}")
 
-    logger.info(f"Initializing PyDAL with DB_TYPE={db_type}, pool_size={pool_size}")
+    db = DB(database_url, pool_size=pool_size)
 
-    db = DAL(
-        pydal_uri,
-        pool_size=pool_size,
-        migrate=migrate,
-        fake_migrate=fake_migrate,
-        check_reserved=['all'],
-        folder=os.getenv('PYDAL_MIGRATIONS_FOLDER', 'databases'),
-    )
-
-    define_tables(db)
-
-    logger.info("PyDAL initialized successfully")
+    logger.info("penguin-dal initialized successfully")
     return db
 
 
-def get_db() -> DAL:
+def get_db() -> DB:
     """
     Get thread-local database connection.
 
     Returns:
-        PyDAL DAL instance for current thread
+        penguin-dal DB instance for current thread
 
     Raises:
         RuntimeError: If database not initialized for current thread
     """
     if not hasattr(_thread_local, 'db') or _thread_local.db is None:
-        _thread_local.db = init_pydal()
+        _thread_local.db = init_db()
 
     return _thread_local.db
 
@@ -220,14 +123,14 @@ def execute_query(
     """
     db = get_db()
     try:
-        result = db.executesql(query, placeholders=params or {}, as_dict=True)
-        if fetch:
-            return result
-        db.commit()
-        return None
+        with db.engine.connect() as conn:
+            result = conn.execute(text(query), params or {})
+            if fetch:
+                return [dict(row._mapping) for row in result]
+            conn.commit()
+            return None
     except Exception as e:
         logger.error(f"Query execution failed: {e}", exc_info=True)
-        db.rollback()
         raise
 
 
@@ -241,10 +144,7 @@ def get_connection_info() -> Dict[str, Any]:
     db = get_db()
     return {
         'db_type': os.getenv('DB_TYPE', 'postgres'),
-        'pool_size': db._pool_size,
-        'migrate_enabled': db._migrate,
-        'tables': list(db.tables),
-        'adapter': str(type(db._adapter).__name__),
+        'tables': list(db.tables.keys()),
     }
 
 

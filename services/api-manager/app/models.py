@@ -11,12 +11,7 @@ Architecture:
 from datetime import datetime
 
 from quart import Quart, g
-from pydal import DAL, Field
-from pydal.validators import (
-    IS_EMAIL,
-    IS_IN_SET,
-    IS_NOT_IN_DB,
-)
+from penguin_dal import DB
 
 from .config import Config
 from .models_sqlalchemy import create_all_tables
@@ -85,19 +80,17 @@ def validate_database_schema(db_uri: str) -> bool:
     return True
 
 
-def init_db(app: Quart) -> DAL:
+def init_db(app: Quart) -> DB:
     """Initialize database connection.
 
-    Uses SQLAlchemy for schema creation/migration, PyDAL for runtime operations.
+    Uses SQLAlchemy for schema creation/migration, penguin-dal for runtime operations.
 
     Startup workflow:
     1. Validate database schema has expected keys
     2. If validation fails, run SQLAlchemy schema creation
     3. Create default admin if missing
-    4. Connect PyDAL for runtime queries (no table definitions)
+    4. Connect penguin-dal for runtime queries (no table definitions)
     """
-    import os
-
     db_uri = Config.get_db_uri()
 
     # Step 1: Validate schema or create it
@@ -108,24 +101,8 @@ def init_db(app: Quart) -> DAL:
     else:
         print("Database schema already exists and is valid")
 
-    # Step 2: Connect PyDAL for runtime operations (no table definitions)
-    # PyDAL will use existing tables created by SQLAlchemy
-    db = DAL(
-        db_uri,
-        pool_size=Config.DB_POOL_SIZE,
-        folder=None,  # No migration folder needed
-        migrate=False,  # Don't migrate - SQLAlchemy handles schema
-        fake_migrate=False,  # No fake migrations
-        check_reserved=None,  # Allow reserved keywords (we quote them)
-        lazy_tables=True,  # Don't define tables - use SQLAlchemy schema
-        entity_quoting=True,  # Quote all identifiers
-        db_codec='UTF-8',
-    )
-
-    # =========================================================================
-    # NOTE: No PyDAL table definitions - SQLAlchemy creates the schema
-    # PyDAL will access tables via lazy_tables=True
-    # =========================================================================
+    # Step 2: Connect penguin-dal for runtime operations
+    db = DB(db_uri, pool_size=Config.DB_POOL_SIZE)
 
     # Store db instance in app
     app.config["db"] = db
@@ -133,7 +110,7 @@ def init_db(app: Quart) -> DAL:
     return db
 
 
-def get_db() -> DAL:
+def get_db() -> DB:
     """Get database connection for current request context."""
     from quart import current_app
 
@@ -190,7 +167,7 @@ def get_user_by_email(email: str) -> dict | None:
     }
 
 
-def _get_user_role(db: DAL, user_id: int) -> str:
+def _get_user_role(db: DB, user_id: int) -> str:
     """Get the primary role name for a user."""
     user_role = db(db.auth_user_roles.user_id == user_id).select().first()
     if user_role:

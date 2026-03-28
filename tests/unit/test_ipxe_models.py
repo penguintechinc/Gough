@@ -36,7 +36,7 @@ class TestIPXEConfig:
         )
         db.commit()
 
-        config = db.ipxe_config(config_id)
+        config = db.ipxe_config[config_id]
         assert config is not None
         assert config.name == "prod-ipxe"
         assert config.dhcp_mode == "proxy"
@@ -72,7 +72,7 @@ class TestIPXEConfig:
                 dhcp_interface="eth0"
             )
             db.commit()
-            assert db.ipxe_config(config_id).dhcp_mode == mode
+            assert db.ipxe_config[config_id].dhcp_mode == mode
 
     def test_ipxe_config_timestamps(self, db):
         """Test that timestamps are automatically set."""
@@ -83,7 +83,7 @@ class TestIPXEConfig:
         )
         db.commit()
 
-        config = db.ipxe_config(config_id)
+        config = db.ipxe_config[config_id]
         assert config.created_at is not None
         assert config.updated_at is not None
         assert isinstance(config.created_at, datetime)
@@ -111,7 +111,7 @@ class TestIPXEMachine:
         )
         db.commit()
 
-        machine = db.ipxe_machines(machine_id)
+        machine = db.ipxe_machines[machine_id]
         assert machine.system_id == "node-001"
         assert machine.hostname == "server-01.local"
         assert machine.mac_address == "00:1a:2b:3c:4d:5e"
@@ -147,7 +147,7 @@ class TestIPXEMachine:
                 status=status
             )
             db.commit()
-            assert db.ipxe_machines(machine_id).status == status
+            assert db.ipxe_machines[machine_id].status == status
 
     def test_machine_boot_modes(self, db):
         """Test valid boot modes."""
@@ -160,7 +160,7 @@ class TestIPXEMachine:
                 boot_mode=mode
             )
             db.commit()
-            assert db.ipxe_machines(machine_id).boot_mode == mode
+            assert db.ipxe_machines[machine_id].boot_mode == mode
 
     def test_machine_tags_storage(self, db):
         """Test storing tags as JSON."""
@@ -172,7 +172,7 @@ class TestIPXEMachine:
         )
         db.commit()
 
-        machine = db.ipxe_machines(machine_id)
+        machine = db.ipxe_machines[machine_id]
         stored_tags = json.loads(machine.tags) if machine.tags else []
         assert stored_tags == tags
 
@@ -197,7 +197,7 @@ class TestEgg:
         )
         db.commit()
 
-        egg = db.eggs(egg_id)
+        egg = db.eggs[egg_id]
         assert egg.name == "postgresql"
         assert egg.egg_type == "snap"
         assert egg.snap_name == "postgresql"
@@ -221,7 +221,7 @@ runcmd:
         )
         db.commit()
 
-        egg = db.eggs(egg_id)
+        egg = db.eggs[egg_id]
         assert egg.egg_type == "cloud_init"
         assert "packages:" in egg.cloud_init_content
         assert "curl" in egg.cloud_init_content
@@ -239,7 +239,7 @@ runcmd:
         )
         db.commit()
 
-        egg = db.eggs(egg_id)
+        egg = db.eggs[egg_id]
         assert egg.egg_type == "lxd_container"
         assert egg.lxd_image_alias == "ubuntu-24.04"
         profiles = json.loads(egg.lxd_profiles)
@@ -279,7 +279,7 @@ runcmd:
         )
         db.commit()
 
-        egg = db.eggs(egg2_id)
+        egg = db.eggs[egg2_id]
         deps = json.loads(egg.dependencies) if egg.dependencies else []
         assert egg1_id in deps
 
@@ -295,7 +295,7 @@ runcmd:
         )
         db.commit()
 
-        egg = db.eggs(egg_id)
+        egg = db.eggs[egg_id]
         assert egg.min_ram_mb == 4096
         assert egg.min_disk_gb == 100
         assert egg.required_architecture == "arm64"
@@ -324,7 +324,7 @@ class TestIPXEImage:
         )
         db.commit()
 
-        image = db.ipxe_images(image_id)
+        image = db.ipxe_images[image_id]
         assert image.name == "ubuntu-24.04"
         assert image.os_name == "ubuntu"
         assert image.os_version == "24.04"
@@ -343,7 +343,7 @@ class TestIPXEImage:
                 image_type=img_type
             )
             db.commit()
-            assert db.ipxe_images(image_id).image_type == img_type
+            assert db.ipxe_images[image_id].image_type == img_type
 
     def test_image_architecture(self, db):
         """Test valid architectures for images."""
@@ -357,7 +357,7 @@ class TestIPXEImage:
                 architecture=arch
             )
             db.commit()
-            assert db.ipxe_images(image_id).architecture == arch
+            assert db.ipxe_images[image_id].architecture == arch
 
 
 class TestBootConfig:
@@ -377,7 +377,7 @@ class TestBootConfig:
         )
         db.commit()
 
-        config = db.ipxe_boot_configs(config_id)
+        config = db.ipxe_boot_configs[config_id]
         assert config.name == "standard-boot"
         assert config.timeout_seconds == 30
         assert config.default_image_id == test_image.id
@@ -415,7 +415,7 @@ class TestDeploymentJob:
         )
         db.commit()
 
-        job = db.deployment_jobs(job_id)
+        job = db.deployment_jobs[job_id]
         assert job.job_id == "deploy-001"
         assert job.machine_id == test_machine.id
         assert job.status == "pending"
@@ -434,7 +434,7 @@ class TestDeploymentJob:
                 status=status
             )
             db.commit()
-            assert db.deployment_jobs(job_id).status == status
+            assert db.deployment_jobs[job_id].status == status
 
     def test_deployment_job_progress_tracking(self, db, test_machine, test_image):
         """Test tracking deployment progress."""
@@ -451,7 +451,7 @@ class TestDeploymentJob:
         db(db.deployment_jobs.id == job_id).update(progress_percent=75)
         db.commit()
 
-        job = db.deployment_jobs(job_id)
+        job = db.deployment_jobs[job_id]
         assert job.progress_percent == 75
 
 
@@ -470,7 +470,7 @@ class TestBootEvent:
         )
         db.commit()
 
-        event = db.boot_events(event_id)
+        event = db.boot_events[event_id]
         assert event.machine_id == test_machine.id
         assert event.event_type == "dhcp_request"
         assert event.status == "success"
@@ -488,7 +488,7 @@ class TestBootEvent:
                 event_type=event_type
             )
             db.commit()
-            assert db.boot_events(event_id).event_type == event_type
+            assert db.boot_events[event_id].event_type == event_type
 
     def test_boot_event_details_storage(self, db, test_machine):
         """Test storing detailed event information."""
@@ -505,7 +505,7 @@ class TestBootEvent:
         )
         db.commit()
 
-        event = db.boot_events(event_id)
+        event = db.boot_events[event_id]
         stored_details = json.loads(event.details) if event.details else {}
         assert stored_details["dhcp_server"] == "10.0.0.1"
 
@@ -524,7 +524,7 @@ class TestEggGroup:
         )
         db.commit()
 
-        group = db.egg_groups(group_id)
+        group = db.egg_groups[group_id]
         assert group.name == "hypervisor-stack"
         eggs = json.loads(group.eggs)
         assert len(eggs) == 1
@@ -553,7 +553,7 @@ class TestEggGroup:
         )
         db.commit()
 
-        group = db.egg_groups(group_id)
+        group = db.egg_groups[group_id]
         eggs = json.loads(group.eggs)
         assert len(eggs) == 3
         assert all(e["egg_id"] in egg_ids for e in eggs)

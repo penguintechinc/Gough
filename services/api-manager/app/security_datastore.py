@@ -9,11 +9,9 @@ from __future__ import annotations
 
 import uuid
 from datetime import datetime
-from typing import TYPE_CHECKING, Any
+from typing import Any
 
-if TYPE_CHECKING:
-    from pydal import DAL
-    from pydal.objects import Row
+from penguin_dal import DB, Row
 
 
 class RoleMixin:
@@ -50,7 +48,8 @@ class UserMixin:
         return False
 
     def get_id(self) -> str:
-        return str(getattr(self, "id", ""))
+        id_val = getattr(self, "id", "")
+        return "" if id_val is None else str(id_val)
 
     def has_role(self, role: str | RoleMixin) -> bool:
         roles = getattr(self, "roles", [])
@@ -246,7 +245,7 @@ class PyDALUserDatastore:
     by CLAUDE.md standards.
     """
 
-    def __init__(self, db: DAL) -> None:
+    def __init__(self, db: DB) -> None:
         self.db = db
         self.user_model = PyDALUser
         self.role_model = PyDALRole
