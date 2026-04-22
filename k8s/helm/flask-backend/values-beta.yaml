@@ -12,7 +12,7 @@ env:
   - name: RELEASE_MODE
     value: "false"
 ingress:
-  enabled: true
+  enabled: false
   className: "nginx"
   hosts:
     - host: gough.penguintech.cloud
@@ -23,6 +23,17 @@ ingress:
     - secretName: penguintech-wildcard-tls
       hosts:
         - gough.penguintech.cloud
+
+httproute:
+  enabled: true
+  gatewayName: shared
+  gatewayNamespace: gateway
+  host: "gough.penguintech.cloud"
+  rules:
+    - path: /api/v1
+      service: "flask-backend"
+      port: 80
+
 resources:
   limits:
     cpu: 500m
