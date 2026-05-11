@@ -136,7 +136,6 @@ class TestUpgradeBiome:
         data = await response.get_json()
         assert data["error"]["code"] == "forbidden_scope"  # 2
 
-    @pytest.mark.skip(reason="gh-16: Phase 3 test harness rework — Quart background-task patching + DB schema mirror needed")
     @pytest.mark.asyncio
     async def test_canary_success_progresses_to_batched(self, db):
         """Canary success → status=completed, phase=done."""
@@ -196,7 +195,6 @@ class TestUpgradeBiome:
         assert run.phase == "done"  # 2
         assert run.nodes_completed == 3  # 3
 
-    @pytest.mark.skip(reason="gh-16: Phase 3 test harness rework — Quart background-task patching + DB schema mirror needed")
     @pytest.mark.asyncio
     async def test_canary_failure_rolls_back(self, db):
         """Canary failure → status=rolled_back, phase=canary."""
@@ -255,7 +253,6 @@ class TestUpgradeBiome:
         assert run.phase == "canary"  # 2
         assert run.rollback_reason == "canary_failed"  # 3
 
-    @pytest.mark.skip(reason="gh-16: Phase 3 test harness rework — Quart background-task patching + DB schema mirror needed")
     @pytest.mark.asyncio
     async def test_batched_failure_marks_failed(self, db):
         """Batched phase failure → status=failed, phase=batched."""
@@ -319,7 +316,6 @@ class TestUpgradeBiome:
         assert run.phase == "batched"  # 2
         assert run.rollback_reason == "batched_phase_failed"  # 3
 
-    @pytest.mark.skip(reason="gh-16: Phase 3 test harness rework — Quart background-task patching + DB schema mirror needed")
     @pytest.mark.asyncio
     async def test_batch_size_honored(self, db):
         """Batch size from rollout_plan is respected."""
@@ -383,7 +379,6 @@ class TestUpgradeBiome:
         assert len(node_batches[1]) == 2  # 3 - batch
         assert len(node_batches[2]) == 2  # 4 - batch
 
-    @pytest.mark.skip(reason="gh-16: Phase 3 test harness rework — Quart background-task patching + DB schema mirror needed")
     @pytest.mark.asyncio
     async def test_get_upgrade_run_returns_row(self, authed_client, db):
         """GET /api/v1/biomes/{id}/upgrade-runs/{run_id} returns 200."""

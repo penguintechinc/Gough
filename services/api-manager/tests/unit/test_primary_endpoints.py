@@ -15,10 +15,6 @@ import pytest
 import pytest_asyncio
 from quart import g
 
-pytestmark = pytest.mark.skip(
-    reason="gh-16: Phase 2 test harness rework — etcd3 mock + async fixture wiring needed"
-)
-
 # Mock etcd3 module before any imports that use it
 sys.modules['etcd3'] = MagicMock()
 
