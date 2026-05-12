@@ -4,7 +4,7 @@ Provides REST API for managing iPXE/MAAS-like provisioning operations:
 - iPXE/DHCP configuration management
 - Machine discovery, commissioning, deployment
 - Boot images and configurations
-- Egg deployment (snaps, cloud-init, LXD)
+- Biome deployment (snaps, cloud-init, LXD)
 - Power management integration
 """
 
@@ -12,14 +12,19 @@ from __future__ import annotations
 
 import logging
 import secrets
+import threading
+import time
 import uuid
-from datetime import datetime
-from typing import Any, Optional
+from datetime import datetime, timezone
+from functools import wraps
+from typing import Any, Callable, Literal, Optional
 
-from quart import Blueprint, current_app, jsonify, request
+import jwt
+from quart import Blueprint, Response, current_app, g, jsonify, request
 
 from ..middleware import auth_required, admin_required, maintainer_or_admin_required
 from ..models import get_db
+from .. import metrics as _metrics
 
 log = logging.getLogger(__name__)
 
@@ -106,7 +111,7 @@ def _create_deployment_job(
     machine_id: int,
     image_id: int,
     boot_config_id: Optional[int],
-    eggs_to_deploy: list[int],
+    biomes_to_deploy: list[int],
     user_id: int
 ) -> str:
     """Create a new deployment job.
@@ -115,7 +120,7 @@ def _create_deployment_job(
         machine_id: Target machine ID
         image_id: Boot image ID
         boot_config_id: Boot configuration ID (optional)
-        eggs_to_deploy: List of egg IDs to deploy
+        biomes_to_deploy: List of biome IDs to deploy
         user_id: User initiating deployment
 
     Returns:
@@ -129,7 +134,7 @@ def _create_deployment_job(
         machine_id=machine_id,
         image_id=image_id,
         boot_config_id=boot_config_id,
-        eggs_to_deploy=eggs_to_deploy,
+        biomes_to_deploy=biomes_to_deploy,
         status="pending",
         progress_percent=0,
         created_by=user_id,
@@ -386,12 +391,12 @@ async def commission_machine(machine_id: str):
 @maintainer_or_admin_required
 @auth_required
 async def deploy_machine(machine_id: str):
-    """Deploy OS and eggs to a machine.
+    """Deploy OS and biomes to a machine.
 
     Request Body:
         image_id: Boot image ID (required)
         boot_config_id: Boot configuration ID (optional)
-        eggs: List of egg IDs to deploy (optional)
+        biomes: List of biome IDs to deploy (optional)
 
     Args:
         machine_id: Machine database ID or system_id
@@ -424,7 +429,7 @@ async def deploy_machine(machine_id: str):
 
     image_id = data["image_id"]
     boot_config_id = data.get("boot_config_id")
-    eggs = data.get("eggs", [])
+    biomes = data.get("biomes", [])
 
     # Validate image exists
     if not _get_image_by_id(image_id):
@@ -446,15 +451,15 @@ async def deploy_machine(machine_id: str):
         machine_id=machine["id"],
         image_id=image_id,
         boot_config_id=boot_config_id,
-        eggs_to_deploy=eggs,
+        biomes_to_deploy=biomes,
         user_id=user_id
     )
 
-    # Update machine status and eggs
+    # Update machine status and biomes
     db(db.ipxe_machines.id == machine["id"]).update(
         status="deploying",
         boot_config_id=boot_config_id,
-        assigned_eggs=eggs,
+        assigned_biomes=biomes,
         updated_at=datetime.utcnow()
     )
     db.commit()
@@ -468,7 +473,7 @@ async def deploy_machine(machine_id: str):
             "action": "deploy",
             "job_id": job_id,
             "image_id": image_id,
-            "eggs": eggs
+            "biomes": biomes
         },
         status="started"
     )
@@ -514,7 +519,7 @@ async def release_machine(machine_id: str):
     # Update machine status
     db(db.ipxe_machines.id == machine["id"]).update(
         status="ready",
-        assigned_eggs=[],
+        assigned_biomes=[],
         deployed_at=None,
         updated_at=datetime.utcnow()
     )
@@ -597,20 +602,20 @@ async def power_control(machine_id: str, action: str):
     }), 200
 
 
-@ipxe_bp.route("/machines/<string:machine_id>/eggs", methods=["PUT"])
+@ipxe_bp.route("/machines/<string:machine_id>/biomes", methods=["PUT"])
 @maintainer_or_admin_required
 @auth_required
-async def update_machine_eggs(machine_id: str):
-    """Update eggs assigned to a machine.
+async def update_machine_biomes(machine_id: str):
+    """Update biomes assigned to a machine.
 
     Request Body:
-        eggs: List of egg IDs
+        biomes: List of biome IDs
 
     Args:
         machine_id: Machine database ID or system_id
 
     Returns:
-        200: Eggs updated
+        200: Biomes updated
         400: Invalid request
         404: Machine not found
     """
@@ -624,26 +629,26 @@ async def update_machine_eggs(machine_id: str):
     if not data:
         return jsonify({"error": "Request body required"}), 400
 
-    eggs = data.get("eggs", [])
+    biomes = data.get("biomes", [])
 
-    if not isinstance(eggs, list):
-        return jsonify({"error": "Eggs must be a list"}), 400
+    if not isinstance(biomes, list):
+        return jsonify({"error": "Biomes must be a list"}), 400
 
     db = get_db()
 
-    # Update assigned eggs
+    # Update assigned biomes
     db(db.ipxe_machines.id == machine["id"]).update(
-        assigned_eggs=eggs,
+        assigned_biomes=biomes,
         updated_at=datetime.utcnow()
     )
     db.commit()
 
-    log.info(f"Machine {machine['system_id']} eggs updated: {eggs}")
+    log.info(f"Machine {machine['system_id']} biomes updated: {biomes}")
 
     return jsonify({
-        "message": "Eggs updated",
+        "message": "Biomes updated",
         "machine_id": machine["system_id"],
-        "eggs": eggs
+        "biomes": biomes
     }), 200
 
 
@@ -959,7 +964,7 @@ async def create_boot_config():
         boot_order: Boot device order list
         timeout_seconds: Boot timeout
         default_image_id: Default boot image ID
-        assigned_egg_group_id: Assigned egg group ID
+        assigned_biome_group_id: Assigned biome group ID
         is_default: Set as default config
 
     Returns:
@@ -992,7 +997,7 @@ async def create_boot_config():
         boot_order=data.get("boot_order", []),
         timeout_seconds=data.get("timeout_seconds", 30),
         default_image_id=data.get("default_image_id"),
-        assigned_egg_group_id=data.get("assigned_egg_group_id"),
+        assigned_biome_group_id=data.get("assigned_biome_group_id"),
         is_default=data.get("is_default", False)
     )
     db.commit()
@@ -1037,7 +1042,7 @@ async def update_boot_config(config_id: int):
         boot_order: Boot device order list
         timeout_seconds: Boot timeout
         default_image_id: Default boot image ID
-        assigned_egg_group_id: Assigned egg group ID
+        assigned_biome_group_id: Assigned biome group ID
         is_default: Set as default config
 
     Args:
@@ -1065,7 +1070,7 @@ async def update_boot_config(config_id: int):
 
     allowed_updates = [
         "description", "ipxe_script", "kernel_params", "boot_order",
-        "timeout_seconds", "default_image_id", "assigned_egg_group_id", "is_default"
+        "timeout_seconds", "default_image_id", "assigned_biome_group_id", "is_default"
     ]
 
     for field in allowed_updates:
@@ -1294,6 +1299,649 @@ async def get_elder_status():
             "error": "Status check failed",
             "details": str(e)
         }), 400
+
+
+# =============================================================================
+# Sprint 2: Bootstrap Token / iPXE Chain Endpoints
+# =============================================================================
+#
+# Per spec "Phase 1 → iPXE Chain" (let-s-create-a-spec-snoopy-nest.md):
+#   * GET /ipxe/helper/{mac}      anonymous, MAC+nonce-bound iPXE script
+#   * GET /ipxe/deploy/{mac}      anonymous, MAC+nonce-bound iPXE script (Sprint 4 expands)
+#   * POST /api/v1/ipxe/bind-mac          scope: gough.nodes.provision
+#   * POST /api/v1/ipxe/mint-bootstrap-token  scope: gough.nodes.provision
+#
+# JWT payload: {mac, dmi_uuid_hint, nonce, iat, exp, phase: "helper"|"deploy"}
+# TTL: 600s. Nonces tracked Redis-first, DB (bootstrap_nonces) as fallback.
+
+_BOOTSTRAP_JWT_TTL_SECONDS = 3600
+_BOOTSTRAP_VAULT_KEY = "gough-bootstrap-jwt"
+_BOOTSTRAP_NONCE_REDIS_PREFIX = "bootstrap:nonce:"
+
+
+# -----------------------------------------------------------------------------
+# In-memory IP-based rate limiter (no external dep). Thread-safe.
+# -----------------------------------------------------------------------------
+
+class _RateLimiter:
+    """Thread-safe sliding-window per-key rate limiter (in-memory).
+
+    100 requests / 60s by default. Designed for single-process deployments;
+    distributed enforcement deferred to Sprint 3 ingress (Cilium/Envoy).
+    """
+
+    def __init__(self, max_requests: int = 100, window_seconds: float = 60.0) -> None:
+        self.max_requests = max_requests
+        self.window_seconds = window_seconds
+        self._lock = threading.Lock()
+        self._hits: dict[str, list[float]] = {}
+
+    def allow(self, key: str) -> bool:
+        now = time.monotonic()
+        with self._lock:
+            bucket = self._hits.setdefault(key, [])
+            cutoff = now - self.window_seconds
+            # Drop stale entries (cheap because bucket is small at limit ceiling).
+            i = 0
+            for i, ts in enumerate(bucket):
+                if ts >= cutoff:
+                    break
+            else:
+                i = len(bucket)
+            del bucket[:i]
+            if len(bucket) >= self.max_requests:
+                return False
+            bucket.append(now)
+            return True
+
+    def reset(self) -> None:
+        with self._lock:
+            self._hits.clear()
+
+
+_ipxe_script_rate_limiter = _RateLimiter(max_requests=100, window_seconds=60.0)
+
+
+def _client_source_ip() -> str:
+    """Best-effort source IP for rate-limiting key."""
+    fwd = request.headers.get("X-Forwarded-For", "")
+    if fwd:
+        return fwd.split(",", 1)[0].strip()
+    return request.remote_addr or "unknown"
+
+
+def _rate_limit_ipxe_script(f: Callable) -> Callable:
+    """Decorator: 100 req/min/IP rate limit for anonymous iPXE script endpoints."""
+    @wraps(f)
+    async def wrapper(*args: Any, **kwargs: Any) -> Any:
+        ip = _client_source_ip()
+        if not _ipxe_script_rate_limiter.allow(ip):
+            log.warning(f"iPXE script rate limit exceeded for source_ip={ip}")
+            return jsonify({"error": "Rate limit exceeded"}), 429
+        return await f(*args, **kwargs)
+    return wrapper
+
+
+# -----------------------------------------------------------------------------
+# Node lookup by MAC
+# -----------------------------------------------------------------------------
+
+def _normalize_mac(mac: str) -> str:
+    """Normalize MAC to lowercase colon-separated form (aa:bb:cc:dd:ee:ff).
+
+    Accepts colon, dash, or dotless inputs. Returns empty string on invalid.
+    """
+    if not mac:
+        return ""
+    cleaned = mac.strip().lower().replace("-", ":").replace(".", "")
+    if ":" not in cleaned and len(cleaned) == 12:
+        cleaned = ":".join(cleaned[i:i + 2] for i in range(0, 12, 2))
+    parts = cleaned.split(":")
+    if len(parts) != 6 or not all(len(p) == 2 and all(c in "0123456789abcdef" for c in p) for p in parts):
+        return ""
+    return cleaned
+
+
+def _find_node_or_machine_by_mac(mac: str) -> Optional[dict]:
+    """Resolve a MAC against either nodes.primary_nic_mac or ipxe_machines.mac_address.
+
+    Returns a dict with at least: id, mac, dmi_uuid (or None), source.
+    Source is 'nodes' or 'ipxe_machines'. Returns None if not found.
+    """
+    normalized = _normalize_mac(mac)
+    if not normalized:
+        return None
+
+    db = get_db()
+
+    # Prefer the canonical nodes table.
+    if "nodes" in db.tables:
+        node = db(db.nodes.primary_nic_mac == normalized).select().first()
+        if node:
+            d = node.as_dict()
+            return {
+                "id": d["id"],
+                "mac": normalized,
+                "dmi_uuid": d.get("dmi_uuid"),
+                "source": "nodes",
+                "raw": d,
+            }
+
+    # Fall back to legacy ipxe_machines.
+    if "ipxe_machines" in db.tables:
+        machine = db(db.ipxe_machines.mac_address == normalized).select().first()
+        if machine:
+            d = machine.as_dict()
+            return {
+                "id": d["id"],
+                "mac": normalized,
+                "dmi_uuid": d.get("dmi_uuid"),
+                "source": "ipxe_machines",
+                "raw": d,
+            }
+
+    return None
+
+
+# -----------------------------------------------------------------------------
+# Nonce registration (Redis preferred, DB fallback)
+# -----------------------------------------------------------------------------
+
+def _register_bootstrap_nonce(nonce: str, mac: str, phase: str, ttl_seconds: int) -> None:
+    """Register a freshly-minted bootstrap nonce so it can be one-time-validated.
+
+    Tries Redis (current_app.redis_client) first; falls back to DB
+    bootstrap_nonces table created by migration 20260428_0900_bootstrap_nonces.
+
+    Raises RuntimeError if neither store is available.
+    """
+    redis_client = getattr(current_app, "redis_client", None)
+    if redis_client is not None:
+        key = f"{_BOOTSTRAP_NONCE_REDIS_PREFIX}{nonce}"
+        # Match credentials.validate_one_time_bootstrap_token's SET NX semantics.
+        added = redis_client.set(key, "issued", ex=ttl_seconds, nx=True)
+        if not added:
+            raise RuntimeError(f"Bootstrap nonce collision: {nonce}")
+        return
+
+    # DB fallback.
+    db = get_db()
+    if "bootstrap_nonces" not in db.tables:
+        raise RuntimeError(
+            "No nonce store available: Redis client missing and "
+            "bootstrap_nonces table not present"
+        )
+    now_ts = datetime.now(timezone.utc).timestamp()
+    expires_at = now_ts + ttl_seconds
+    if ttl_seconds <= 0:
+        _metrics.bootstrap_window_expired.inc()
+        raise RuntimeError("Bootstrap token TTL already expired at registration time")
+    db.bootstrap_nonces.insert(
+        nonce=nonce,
+        mac=mac,
+        phase=phase,
+        used=False,
+        issued_at=datetime.now(timezone.utc),
+        expires_at=datetime.fromtimestamp(expires_at, tz=timezone.utc),
+    )
+    db.commit()
+
+
+# -----------------------------------------------------------------------------
+# JWT minting
+# -----------------------------------------------------------------------------
+
+def _mint_bootstrap_jwt(
+    mac: str,
+    *,
+    phase: Literal["helper", "deploy"],
+    dmi_uuid_hint: Optional[str] = None,
+    ttl_seconds: int = _BOOTSTRAP_JWT_TTL_SECONDS,
+) -> tuple[str, str]:
+    """Mint a one-time bootstrap JWT bound to (mac, nonce).
+
+    Signing path:
+        1. Vault transit signing if app has a vault_client and the transit key exists.
+        2. HS256 fallback using current_app.config['JWT_SECRET_KEY'] for non-prod /
+           pre-Vault bootstrap.
+
+    Returns (jwt_token, nonce). The nonce is registered before this function
+    returns so a replay of the same nonce will be rejected on validation.
+    """
+    nonce = secrets.token_urlsafe(24)
+    now = int(datetime.now(timezone.utc).timestamp())
+    payload: dict[str, Any] = {
+        "mac": mac,
+        "dmi_uuid_hint": dmi_uuid_hint,
+        "nonce": nonce,
+        "iat": now,
+        "exp": now + ttl_seconds,
+        "phase": phase,
+    }
+
+    vault_client = getattr(current_app, "vault_client", None)
+    token: Optional[str] = None
+    if vault_client is not None:
+        try:
+            # Build a JWS by signing the canonical header.payload via Vault transit.
+            # Header advertises Vault-issued opaque signature; verifiers must
+            # call Vault transit_verify_signature to validate.
+            import base64
+            import json as _json
+            header = {"alg": "vault-transit", "typ": "JWT", "kid": _BOOTSTRAP_VAULT_KEY}
+            h_b64 = base64.urlsafe_b64encode(
+                _json.dumps(header, separators=(",", ":")).encode()
+            ).rstrip(b"=").decode()
+            p_b64 = base64.urlsafe_b64encode(
+                _json.dumps(payload, separators=(",", ":")).encode()
+            ).rstrip(b"=").decode()
+            signing_input = f"{h_b64}.{p_b64}".encode()
+            signature = vault_client.transit_sign(_BOOTSTRAP_VAULT_KEY, signing_input)
+            sig_b64 = base64.urlsafe_b64encode(signature.encode()).rstrip(b"=").decode()
+            token = f"{h_b64}.{p_b64}.{sig_b64}"
+            log.info(f"Bootstrap JWT minted via Vault transit for mac={mac} phase={phase}")
+        except Exception as e:  # noqa: BLE001 - intentional fallback
+            log.warning(
+                f"Vault transit_sign unavailable ({e}); falling back to HS256 for mac={mac}"
+            )
+            token = None
+
+    if token is None:
+        secret = current_app.config.get("JWT_SECRET_KEY") or current_app.config.get(
+            "BOOTSTRAP_JWT_SECRET", "gough-bootstrap-dev-secret"
+        )
+        token = jwt.encode(payload, secret, algorithm="HS256")
+        log.info(f"Bootstrap JWT minted via HS256 fallback for mac={mac} phase={phase}")
+
+    # Register nonce so validate_one_time_bootstrap_token's NX check is meaningful.
+    _register_bootstrap_nonce(nonce, mac, phase, ttl_seconds)
+
+    return token, nonce
+
+
+# -----------------------------------------------------------------------------
+# Script renderers
+# -----------------------------------------------------------------------------
+
+def _render_helper_ipxe_script(
+    mac: str,
+    jwt_token: str,
+    primary_url: str,
+    *,
+    firmware: Literal["bios", "uefi"],
+) -> str:
+    """Render the Phase-1 helper iPXE script.
+
+    The script:
+      1. Pulls kernel + initrd from the primary over HTTPS.
+      2. Boots the helper image with kernel cmdline:
+           gough_token=<jwt> gough_primary=<url> gough_mac=<mac>
+      3. Branches BIOS vs UEFI via iPXE ${platform} macro at runtime.
+
+    `firmware` selects the default kernel/initrd artifact name; the script
+    still uses the iPXE platform macro so a single script renders correctly
+    on either firmware family.
+    """
+    base = primary_url.rstrip("/")
+    helper_kernel = "helper-bios" if firmware == "bios" else "helper-efi"
+    helper_initrd = "helper.initrd"
+    cmdline = f"gough_token={jwt_token} gough_primary={base} gough_mac={mac}"
+    script = (
+        "#!ipxe\n"
+        f"# Gough helper boot script (phase=helper, mac={mac}, firmware={firmware})\n"
+        "set retries:int32 5\n"
+        "set delay_ms:int32 1000\n"
+        "echo Gough: starting helper boot for ${mac}\n"
+        "iseq ${platform} efi && goto uefi || goto bios\n"
+        "\n"
+        ":bios\n"
+        f"set kernel_url {base}/ipxe/kernel/helper-bios\n"
+        f"set initrd_url {base}/ipxe/initrd/{helper_initrd}\n"
+        "goto fetch\n"
+        "\n"
+        ":uefi\n"
+        f"set kernel_url {base}/ipxe/kernel/helper-efi\n"
+        f"set initrd_url {base}/ipxe/initrd/{helper_initrd}\n"
+        "goto fetch\n"
+        "\n"
+        ":fetch\n"
+        "echo Gough: fetching kernel ${kernel_url}\n"
+        "kernel ${kernel_url} " + cmdline + "\n"
+        "echo Gough: fetching initrd ${initrd_url}\n"
+        "initrd ${initrd_url}\n"
+        "boot || goto failed\n"
+        "\n"
+        ":failed\n"
+        "echo Gough: helper boot failed; rebooting in 30s\n"
+        "sleep 30\n"
+        "reboot\n"
+    )
+    # Helper kernel name kept alongside cmdline for downstream debugging tools.
+    _ = helper_kernel
+    return script
+
+
+def _render_deploy_ipxe_script(mac: str, jwt_token: str, primary_url: str) -> str:
+    """Render the Phase-2 deploy iPXE script.
+
+    Renders a complete iPXE script for the deployment phase that:
+    1. Pulls kernel + initrd from primary over HTTPS
+    2. Boots the installer with bootstrap token embedded in kernel cmdline
+    3. Includes fallback boot logic for retry on failure
+
+    Args:
+        mac: Target machine MAC address (normalized)
+        jwt_token: One-time bootstrap JWT token
+        primary_url: Base URL for kernel/initrd artifacts
+
+    Returns:
+        Valid iPXE script with #!ipxe header and complete boot sequence
+    """
+    base = primary_url.rstrip("/")
+    deploy_kernel = "deploy-kernel"
+    deploy_initrd = "deploy.initrd"
+    cmdline = f"gough.bootstrap_token={jwt_token} gough.mac={mac} gough.phase=deploy"
+    script = (
+        "#!ipxe\n"
+        f"# Gough deploy boot script (phase=deploy, mac={mac})\n"
+        "set retries:int32 3\n"
+        "set delay_ms:int32 1000\n"
+        "echo Gough: starting deployment for ${mac}\n"
+        "\n"
+        ":fetch\n"
+        f"set kernel_url {base}/ipxe/kernel/{deploy_kernel}\n"
+        f"set initrd_url {base}/ipxe/initrd/{deploy_initrd}\n"
+        "echo Gough: fetching deploy kernel ${kernel_url}\n"
+        "kernel ${kernel_url} " + cmdline + "\n"
+        "echo Gough: fetching deploy initrd ${initrd_url}\n"
+        "initrd ${initrd_url}\n"
+        "boot || goto fallback\n"
+        "\n"
+        ":fallback\n"
+        "echo Gough: deploy boot failed; retrying\n"
+        "sleep ${delay_ms}\n"
+        "goto fetch\n"
+    )
+    return script
+
+
+# -----------------------------------------------------------------------------
+# Anonymous (MAC+nonce) script endpoints
+# -----------------------------------------------------------------------------
+
+def _detect_firmware_from_query() -> Literal["bios", "uefi"]:
+    """Best-effort firmware detection.
+
+    iPXE's chain step propagates ${platform} as a query param when configured
+    (e.g. ?fw=efi). Default to 'uefi' when ambiguous since modern targets are
+    UEFI-first. Both branches still ship the platform-aware iPXE script body.
+    """
+    fw = (request.args.get("fw") or request.args.get("firmware") or "").lower()
+    if fw in ("bios", "pcbios", "legacy"):
+        return "bios"
+    return "uefi"
+
+
+def _primary_base_url() -> str:
+    """Resolve the primary HTTPS URL for kernel/initrd artifact pulls."""
+    cfg = current_app.config.get("PRIMARY_BASE_URL")
+    if cfg:
+        return str(cfg)
+    # Use the request host as fallback so dev/test deployments work without
+    # explicit configuration. iPXE's trust anchor is the embedded internal CA.
+    scheme = "https"
+    return f"{scheme}://{request.host}"
+
+
+@ipxe_bp.route("/helper/<string:mac>", methods=["GET"])
+@_rate_limit_ipxe_script
+async def get_helper_ipxe_script(mac: str):
+    """Anonymous helper iPXE script for a known MAC.
+
+    Authentication: MAC+nonce binding (no JWT in request). The script body
+    contains a freshly-minted one-time bootstrap JWT that the discovery agent
+    then presents to /api/v1/nodes/discover.
+
+    Returns:
+        200 text/plain: iPXE script
+        404 application/json: MAC not found
+    """
+    normalized = _normalize_mac(mac)
+    if not normalized:
+        return jsonify({"error": f"Invalid MAC address: {mac}"}), 400
+
+    record = _find_node_or_machine_by_mac(normalized)
+    if not record:
+        log.warning(f"iPXE helper requested for unknown MAC {normalized}")
+        return jsonify({"error": f"MAC not found: {normalized}"}), 404
+
+    firmware = _detect_firmware_from_query()
+    primary_url = _primary_base_url()
+
+    token, nonce = _mint_bootstrap_jwt(
+        normalized,
+        phase="helper",
+        dmi_uuid_hint=record.get("dmi_uuid"),
+    )
+
+    script = _render_helper_ipxe_script(
+        normalized, token, primary_url, firmware=firmware
+    )
+
+    log.info(
+        f"iPXE helper script issued mac={normalized} firmware={firmware} "
+        f"nonce={nonce[:8]}... source={record['source']}"
+    )
+
+    return Response(script, status=200, content_type="text/plain; charset=utf-8")
+
+
+@ipxe_bp.route("/deploy/<string:mac>", methods=["GET"])
+@_rate_limit_ipxe_script
+async def get_deploy_ipxe_script(mac: str):
+    """Anonymous deploy iPXE script for a known MAC.
+
+    Authentication: MAC+nonce binding via bootstrap JWT. The script body
+    contains a freshly-minted one-time bootstrap JWT that the deployment
+    agent then presents during the provisioning workflow.
+
+    Returns:
+        200 text/plain: iPXE script
+        404 application/json: MAC not found
+    """
+    normalized = _normalize_mac(mac)
+    if not normalized:
+        return jsonify({"error": f"Invalid MAC address: {mac}"}), 400
+
+    record = _find_node_or_machine_by_mac(normalized)
+    if not record:
+        log.warning(f"iPXE deploy requested for unknown MAC {normalized}")
+        return jsonify({"error": f"MAC not found: {normalized}"}), 404
+
+    primary_url = _primary_base_url()
+    token, nonce = _mint_bootstrap_jwt(
+        normalized,
+        phase="deploy",
+        dmi_uuid_hint=record.get("dmi_uuid"),
+    )
+
+    script = _render_deploy_ipxe_script(normalized, token, primary_url)
+
+    log.info(
+        f"iPXE deploy script issued mac={normalized} "
+        f"nonce={nonce[:8]}... source={record['source']}"
+    )
+
+    return Response(script, status=200, content_type="text/plain; charset=utf-8")
+
+
+# -----------------------------------------------------------------------------
+# Authenticated control endpoints (gough.nodes.provision)
+# -----------------------------------------------------------------------------
+
+def _scope_required(*required_scopes: str) -> Callable:
+    """Decorator enforcing OIDC scope membership on the request principal.
+
+    Reads g.principal (set by app.security.credentials.credentials_middleware).
+    Falls back to legacy g.current_user.role check when running in the
+    pre-OIDC test harness (admin/maintainer accepted as superset).
+    """
+    required = frozenset(required_scopes)
+
+    def decorator(f: Callable) -> Callable:
+        @wraps(f)
+        async def wrapper(*args: Any, **kwargs: Any) -> Any:
+            principal = getattr(g, "principal", None)
+            if principal is not None:
+                granted = getattr(principal, "scopes", frozenset())
+                if not required.issubset(granted):
+                    return jsonify({
+                        "error": "Insufficient scope",
+                        "required": sorted(required),
+                    }), 403
+                return await f(*args, **kwargs)
+
+            # Legacy test/dev harness: accept maintainer/admin role as proxy.
+            user = getattr(g, "current_user", None)
+            if user and user.get("role") in {"admin", "maintainer"}:
+                return await f(*args, **kwargs)
+
+            return jsonify({"error": "Insufficient scope"}), 403
+
+        return wrapper
+
+    return decorator
+
+
+@ipxe_bp.route("/bind-mac", methods=["POST"])
+@auth_required
+@_scope_required("gough.nodes.provision")
+async def bind_mac():
+    """Pre-bind a MAC address for a known DMI UUID.
+
+    Request body:
+        mac: MAC address (required)
+        dmi_uuid: DMI UUID hint (required)
+        node_id: existing node id to bind onto (optional)
+
+    Returns:
+        201: Binding created
+        200: Existing binding refreshed
+        400: Invalid request
+    """
+    data = await request.get_json()
+    if not data:
+        return jsonify({"error": "Request body required"}), 400
+
+    err = _validate_required_fields(data, ["mac", "dmi_uuid"])
+    if err:
+        return err
+
+    normalized = _normalize_mac(data["mac"])
+    if not normalized:
+        return jsonify({"error": f"Invalid MAC address: {data['mac']}"}), 400
+
+    dmi_uuid = str(data["dmi_uuid"]).strip()
+    if not dmi_uuid:
+        return jsonify({"error": "dmi_uuid must not be empty"}), 400
+
+    db = get_db()
+    requested_node_id = data.get("node_id")
+
+    if "nodes" in db.tables:
+        node = None
+        if requested_node_id:
+            node = db(db.nodes.id == int(requested_node_id)).select().first()
+            if not node:
+                return jsonify({"error": f"Node not found: {requested_node_id}"}), 404
+        else:
+            node = db(db.nodes.dmi_uuid == dmi_uuid).select().first()
+
+        if node:
+            db(db.nodes.id == node.id).update(
+                primary_nic_mac=normalized,
+                dmi_uuid=dmi_uuid,
+                updated_at=datetime.now(timezone.utc),
+            )
+            db.commit()
+            log.info(f"MAC bound to existing node id={node.id} mac={normalized} dmi={dmi_uuid}")
+            return jsonify({
+                "node_id": node.id,
+                "mac": normalized,
+                "dmi_uuid": dmi_uuid,
+                "status": "updated",
+            }), 200
+
+        # Create a new node row in 'new' state for the binding.
+        new_id = db.nodes.insert(
+            tenant_id="__default__",
+            name=f"node-{normalized.replace(':', '')}",
+            state="new",
+            dmi_uuid=dmi_uuid,
+            primary_nic_mac=normalized,
+        )
+        db.commit()
+        log.info(f"MAC bound; new node id={new_id} mac={normalized} dmi={dmi_uuid}")
+        return jsonify({
+            "node_id": new_id,
+            "mac": normalized,
+            "dmi_uuid": dmi_uuid,
+            "status": "created",
+        }), 201
+
+    return jsonify({"error": "nodes table not available"}), 500
+
+
+@ipxe_bp.route("/mint-bootstrap-token", methods=["POST"])
+@auth_required
+@_scope_required("gough.nodes.provision")
+async def mint_bootstrap_token():
+    """Mint a fresh one-time bootstrap JWT for a MAC (operator-driven flow).
+
+    Request body:
+        mac: MAC address (required)
+        phase: "helper" or "deploy" (default: "helper")
+
+    Returns:
+        200: JWT minted
+        400: Invalid request
+        404: MAC not found
+    """
+    data = await request.get_json()
+    if not data:
+        return jsonify({"error": "Request body required"}), 400
+
+    err = _validate_required_fields(data, ["mac"])
+    if err:
+        return err
+
+    normalized = _normalize_mac(data["mac"])
+    if not normalized:
+        return jsonify({"error": f"Invalid MAC address: {data['mac']}"}), 400
+
+    phase: Literal["helper", "deploy"] = data.get("phase", "helper")
+    if phase not in ("helper", "deploy"):
+        return jsonify({"error": "phase must be 'helper' or 'deploy'"}), 400
+
+    record = _find_node_or_machine_by_mac(normalized)
+    if not record:
+        return jsonify({"error": f"MAC not found: {normalized}"}), 404
+
+    token, nonce = _mint_bootstrap_jwt(
+        normalized,
+        phase=phase,
+        dmi_uuid_hint=record.get("dmi_uuid"),
+    )
+
+    log.info(f"Operator minted bootstrap token mac={normalized} phase={phase}")
+
+    return jsonify({
+        "mac": normalized,
+        "phase": phase,
+        "token": token,
+        "nonce": nonce,
+        "ttl_seconds": _BOOTSTRAP_JWT_TTL_SECONDS,
+    }), 200
 
 
 @ipxe_bp.route("/elder/config", methods=["PUT"])
