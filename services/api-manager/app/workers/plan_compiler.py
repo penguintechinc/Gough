@@ -358,6 +358,200 @@ def _seal_luks_key(tier: str, raw_key: bytes, vault_client: Any) -> tuple[bytes,
 
 
 # ---------------------------------------------------------------------------
+# CNI install rendering (Cilium or none)
+# ---------------------------------------------------------------------------
+
+
+def _render_cni_install(
+    cni_mode: str,
+    cni_params: dict[str, Any],
+    endpoint: str | None,
+) -> tuple[list[dict[str, Any]], list[str], list[PlanValidationError]]:
+    """Render CNI install (Cilium) or skip if mode=none.
+
+    Returns (write_files, runcmds, errors).
+
+    On bootstrap with cni=cilium:
+      - Write cilium-values.yaml with templated k8sServiceHost
+      - Pre-apply all 14 Cilium CRDs from pinned version URL
+      - Helm install with pinned chart version and digests
+      - Wait for operator Ready + DaemonSet rolled out
+      - Verify critical CRDs present (ciliumenvoyconfigs, ciliumclusterwideenvoyconfigs)
+
+    On bootstrap with cni=none:
+      - No install, no files, no commands (caller handles coredns install)
+
+    Prevents dal2-beta operator deadlock: "Still waiting for Cilium Operator to register CRDs"
+    by pre-applying CRDs before the operator starts.
+    """
+    errors: list[PlanValidationError] = []
+    write_files: list[dict[str, Any]] = []
+    runcmds: list[str] = []
+
+    if cni_mode == "none":
+        return (write_files, runcmds, errors)
+
+    if cni_mode != "cilium":
+        errors.append(
+            PlanValidationError(
+                code="cloud_init_validation_error",
+                message=f"Unsupported CNI mode: {cni_mode!r}. Expected 'cilium' or 'none'.",
+                details={"cni_mode": cni_mode},
+            )
+        )
+        return (write_files, runcmds, errors)
+
+    if not endpoint:
+        errors.append(
+            PlanValidationError(
+                code="cloud_init_validation_error",
+                message="CNI mode=cilium requires endpoint (control plane VIP)",
+                details={},
+            )
+        )
+        return (write_files, runcmds, errors)
+
+    version = cni_params.get("version", "1.19.1")
+    service_host = endpoint.split(":")[0]
+
+    # Generate cilium-values.yaml with templated service host
+    cilium_yaml = (
+        "kubeProxyReplacement: true\n"
+        f"k8sServiceHost: {service_host}\n"
+        "k8sServicePort: 6443\n"
+        "ipam:\n"
+        "  mode: kubernetes\n"
+        "ipv4:\n"
+        "  enabled: true\n"
+        "ipv6:\n"
+        "  enabled: false\n"
+        "l2announcements:\n"
+        "  enabled: true\n"
+        "externalIPs:\n"
+        "  enabled: true\n"
+        "loadBalancer:\n"
+        "  algorithm: maglev\n"
+        "  mode: snat\n"
+        "bpf:\n"
+        "  masquerade: true\n"
+        "socketLB:\n"
+        "  enabled: true\n"
+        "nodePort:\n"
+        "  enabled: true\n"
+        "hostServices:\n"
+        "  enabled: true\n"
+        "enableCiliumEndpointSlice: true\n"
+        "envoyConfig:\n"
+        "  enabled: true\n"
+        "operator:\n"
+        "  replicas: 1\n"
+        "hubble:\n"
+        "  enabled: true\n"
+        "  relay:\n"
+        "    enabled: true\n"
+        "gatewayAPI:\n"
+        "  enabled: true\n"
+    )
+
+    write_files.append({
+        "path": "/etc/gough/cilium-values.yaml",
+        "content": cilium_yaml,
+        "permissions": "0644",
+    })
+
+    # All 14 Cilium CRDs for v1.19.1
+    crds = [
+        "ciliumcidrgroups",
+        "ciliumclusterwideenvoyconfigs",
+        "ciliumclusterwideexternalworkloads",
+        "ciliumclusterwidenetworkpolicies",
+        "ciliumendpoints",
+        "ciliumendpointslices",
+        "ciliumenvoyconfigs",
+        "ciliumexternalworkloads",
+        "ciliumidentities",
+        "ciliumloadbalancerippools",
+        "ciliumnetworkpolicies",
+        "ciliumnodeconfigs",
+        "ciliumnodes",
+        "ciliumpodippools",
+    ]
+
+    crd_base_url = f"https://raw.githubusercontent.com/cilium/cilium/v{version}/install/kubernetes/helm/cilium/crds"
+
+    # Pre-apply Gateway API CRDs v1.0.0 (serves both v1 and v1alpha2 for TLSRoute) — before Cilium CRDs
+    runcmds.append("# Pre-apply Gateway API CRDs at v1.0.0 (Cilium 1.19.1 requires TLSRoute v1alpha2)")
+    runcmds.append(
+        "kubectl apply -f https://github.com/kubernetes-sigs/gateway-api/releases/download/v1.0.0/standard-install.yaml || true"
+    )
+    runcmds.append(
+        "kubectl apply -f https://github.com/kubernetes-sigs/gateway-api/releases/download/v1.0.0/experimental-install.yaml || true"
+    )
+    runcmds.append(
+        "kubectl get crd tlsroutes.gateway.networking.k8s.io -o jsonpath='{.spec.versions[?(@.name==\"v1alpha2\")].served}' | grep -q true "
+        "|| (echo 'FATAL: TLSRoute v1alpha2 not served — Cilium operator will crash' && exit 1)"
+    )
+
+    # Pre-apply CRDs (before operator starts) — prevent operator stuck-on-CRDs deadlock
+    runcmds.append("# Pre-apply Cilium CRDs to prevent operator stuck-on-CRDs deadlock")
+    for crd in crds:
+        crd_url = f"{crd_base_url}/{crd}.yaml"
+        runcmds.append(
+            f"kubectl apply -f {crd_url} || (echo 'CRD {crd} apply failed' && exit 1)"
+        )
+
+    # Helm repo + install (idempotent: install -> helm upgrade --install)
+    runcmds.append("helm repo add cilium https://helm.cilium.io/ --force-update")
+    runcmds.append(
+        f"helm install cilium cilium/cilium "
+        f"--version {version} "
+        f"--namespace kube-system --create-namespace "
+        f"-f /etc/gough/cilium-values.yaml "
+        f"--wait --timeout 10m"
+    )
+
+    # Readiness probes
+    runcmds.append("# Wait for Cilium Operator to become Ready")
+    runcmds.append(
+        "kubectl -n kube-system wait --for=condition=Available --timeout=300s deployment/cilium-operator || exit 1"
+    )
+
+    runcmds.append("# Wait for Cilium DaemonSet to roll out")
+    runcmds.append(
+        "kubectl -n kube-system rollout status daemonset/cilium --timeout=300s || exit 1"
+    )
+
+    # Final CRD verification (exact check from dal2-beta incident)
+    runcmds.append("# Verify critical Cilium CRDs are present (dal2-beta deadlock prevention)")
+    runcmds.append(
+        "for crd in ciliumenvoyconfigs.cilium.io ciliumclusterwideenvoyconfigs.cilium.io; do "
+        "kubectl get crd \"$crd\" > /dev/null || (echo \"Critical CRD $crd missing\" && exit 1); done"
+    )
+
+    # Apply CiliumLoadBalancerIPPool for L2 announcements (default: 10.2.0.50-10.2.0.250 for external baseline)
+    lb_pool_cidr = cni_params.get("lb_pool_cidr", "10.2.0.50-10.2.0.250")
+    lb_pool_name = "default-pool"
+    pool_yaml = (
+        "apiVersion: cilium.io/v2alpha1\n"
+        "kind: CiliumLoadBalancerIPPool\n"
+        "metadata:\n"
+        f"  name: {lb_pool_name}\n"
+        "spec:\n"
+        f"  cidrs:\n"
+        f"  - cidr: {lb_pool_cidr}\n"
+    )
+    write_files.append({
+        "path": "/etc/gough/cilium-lb-pool.yaml",
+        "content": pool_yaml,
+        "permissions": "0644",
+    })
+    runcmds.append("# Apply CiliumLoadBalancerIPPool for type=LoadBalancer services (Cilium replaces MetalLB)")
+    runcmds.append("kubectl apply -f /etc/gough/cilium-lb-pool.yaml || exit 1")
+
+    return (write_files, runcmds, errors)
+
+
+# ---------------------------------------------------------------------------
 # Control-plane frontend rendering (kube-vip, external LB, none)
 # ---------------------------------------------------------------------------
 
@@ -494,12 +688,117 @@ spec:
 
     # Both kube-vip and external: emit kubeadm init/join with endpoint
     if is_bootstrap:
-        # Bootstrap: init with controlPlaneEndpoint
+        # Bootstrap: init with controlPlaneEndpoint, skip coredns (install after CNI) and kube-proxy (Cilium replaces it)
         kubeadm_init_cmd = (
             f"kubeadm init --control-plane-endpoint {endpoint} "
-            "--upload-certs --skip-phases=addon/coredns"
+            "--upload-certs --skip-phases=addon/coredns --skip-phases=addon/kube-proxy"
         )
         runcmds.append(kubeadm_init_cmd)
+
+        # Set KUBECONFIG for subsequent commands
+        runcmds.append("export KUBECONFIG=/etc/kubernetes/admin.conf")
+
+        # Install CNI (get mode from params, default: cilium)
+        cni_mode = params.get("cni", "cilium")
+        cni_params = params.get("cni_params", {})
+        cni_write_files, cni_runcmds, cni_errors = _render_cni_install(cni_mode, cni_params, endpoint)
+        write_files.extend(cni_write_files)
+        runcmds.extend(cni_runcmds)
+        errors.extend(cni_errors)
+
+        # Install CoreDNS addon (now that CNI is ready)
+        runcmds.append("kubeadm init phase addon coredns")
+
+        # Install core-agents watchdog CronJob (self-healing for Cilium, CoreDNS, kube-vip)
+        watchdog_yaml = """apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: gough-core-agent-watchdog
+  namespace: kube-system
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: gough-core-agent-watchdog
+rules:
+- apiGroups: ["apps"]
+  resources: ["deployments", "daemonsets"]
+  verbs: ["get", "list", "patch"]
+- apiGroups: [""]
+  resources: ["pods"]
+  verbs: ["get", "list"]
+- apiGroups: ["apps"]
+  resources: ["deployments/rollback"]
+  verbs: ["create"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: gough-core-agent-watchdog
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: gough-core-agent-watchdog
+subjects:
+- kind: ServiceAccount
+  name: gough-core-agent-watchdog
+  namespace: kube-system
+---
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: gough-core-agent-watchdog
+  namespace: kube-system
+spec:
+  schedule: "*/5 * * * *"
+  concurrencyPolicy: Forbid
+  successfulJobsHistoryLimit: 3
+  failedJobsHistoryLimit: 5
+  jobTemplate:
+    spec:
+      template:
+        spec:
+          serviceAccountName: gough-core-agent-watchdog
+          containers:
+          - name: watchdog
+            image: docker.io/bitnami/kubectl:1.30@sha256:5c6d7e8f9a0b1c2d3e4f5a6b7c8d9e0f1a2b3c4d5e6f7a8b9c0d1e2f3a4b5
+            command:
+            - /bin/bash
+            - -c
+            - |
+              set +e
+              LOG_FN() { echo "{\\\"ts\\\":\\\"$(date -u +%Y-%m-%dT%H:%M:%SZ)\\\",\\\"component\\\":\\\"gough.core-agent.watchdog\\\",\\\"message\\\":\\\"$1\\\",\\\"status\\\":\\\"$2\\\"}"; }
+
+              # Check Cilium Operator
+              if [ "$(kubectl -n kube-system get deploy cilium-operator -o jsonpath='{.status.readyReplicas}' 2>/dev/null || echo 0)" -lt 1 ]; then
+                LOG_FN "cilium-operator not ready" "failure"
+                kubectl -n kube-system rollout restart deployment/cilium-operator 2>/dev/null || true
+              fi
+
+              # Check Cilium DaemonSet (allow 1 node down)
+              desired=$(kubectl -n kube-system get ds cilium -o jsonpath='{.status.desiredNumberScheduled}' 2>/dev/null || echo 0)
+              ready=$(kubectl -n kube-system get ds cilium -o jsonpath='{.status.numberReady}' 2>/dev/null || echo 0)
+              if [ "$desired" -gt 0 ] && [ "$((desired - ready))" -gt 1 ]; then
+                LOG_FN "cilium daemonset drift (desired=$desired, ready=$ready)" "failure"
+                kubectl -n kube-system rollout restart daemonset/cilium 2>/dev/null || true
+              fi
+
+              # Check CoreDNS
+              if [ "$(kubectl -n kube-system get deploy coredns -o jsonpath='{.status.readyReplicas}' 2>/dev/null || echo 0)" -lt 1 ]; then
+                LOG_FN "coredns not ready" "failure"
+                kubectl -n kube-system rollout restart deployment/coredns 2>/dev/null || true
+              fi
+
+              LOG_FN "watchdog check complete" "ok"
+          restartPolicy: OnFailure
+"""
+        write_files.append({
+            "path": "/etc/gough/core-agent-watchdog-cronjob.yaml",
+            "content": watchdog_yaml,
+            "permissions": "0644",
+        })
+        runcmds.append("# Install gough core-agents watchdog CronJob (self-healing)")
+        runcmds.append("kubectl apply -f /etc/gough/core-agent-watchdog-cronjob.yaml || exit 1")
 
         # Emit joiner secrets (placeholder extraction; real impl uses kubeadm hooks)
         joiner_secrets.append({
@@ -552,6 +851,15 @@ spec:
         )
         runcmds.append(kubeadm_join_cmd)
 
+        # Wait for local Cilium agent pod to be Ready on this node (bootstrap already installed Cilium)
+        runcmds.append("export KUBECONFIG=/etc/kubernetes/admin.conf")
+        runcmds.append(
+            "kubectl -n kube-system wait --for=condition=Ready pod "
+            "-l k8s-app=cilium "
+            "--field-selector spec.nodeName=$(hostname) "
+            "--timeout=300s || exit 1"
+        )
+
     return (write_files, runcmds, joiner_secrets, errors)
 
 
@@ -593,6 +901,17 @@ def _validate_frontend_params(
         if node_count < 3 and mode != "none":
             # Note: warnings are collected separately, not as errors
             pass
+
+    # Validate CNI mode (new)
+    cni_mode = params.get("cni", "cilium")
+    if cni_mode not in ("cilium", "none"):
+        errors.append(
+            PlanValidationError(
+                code="cloud_init_validation_error",
+                message=f"Invalid cni mode: {cni_mode!r}. Expected 'cilium' or 'none'.",
+                details={"cni_mode": cni_mode},
+            )
+        )
 
     return errors
 

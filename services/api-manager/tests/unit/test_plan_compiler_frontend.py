@@ -22,6 +22,7 @@ import pytest
 
 from app.workers.plan_compiler import (
     PlanValidationError,
+    _render_cni_install,
     _render_control_plane_frontend,
     _validate_frontend_params,
 )
@@ -75,10 +76,19 @@ def test_mode_kube_vip_bootstrap() -> None:
     )
 
     assert len(errors) == 0, f"Expected no errors, got {errors}"
-    assert len(write_files) == 1, "Should render kube-vip manifest"
-    assert write_files[0]["path"] == "/etc/kubernetes/manifests/kube-vip.yaml"
-    assert "kube-vip" in write_files[0]["content"]
-    assert "10.2.0.10" in write_files[0]["content"]
+    assert len(write_files) == 4, "Should render kube-vip manifest + cilium-values.yaml + CiliumLoadBalancerIPPool + watchdog CronJob"
+
+    # Check kube-vip manifest
+    kube_vip_file = next((wf for wf in write_files if "kube-vip" in wf["path"]), None)
+    assert kube_vip_file is not None
+    assert kube_vip_file["path"] == "/etc/kubernetes/manifests/kube-vip.yaml"
+    assert "kube-vip" in kube_vip_file["content"]
+    assert "10.2.0.10" in kube_vip_file["content"]
+
+    # Check cilium-values written (default CNI)
+    cilium_file = next((wf for wf in write_files if "cilium-values" in wf["path"]), None)
+    assert cilium_file is not None
+    assert "kubeProxyReplacement: true" in cilium_file["content"]
 
     assert any("kubeadm init" in cmd and "--control-plane-endpoint" in cmd for cmd in runcmds), \
         "Should run kubeadm init with controlPlaneEndpoint"
@@ -134,8 +144,11 @@ def test_mode_kube_vip_join() -> None:
     )
 
     assert len(errors) == 0, f"Expected no errors, got {errors}"
-    assert len(write_files) == 1, "Should render kube-vip manifest even on join"
-    assert write_files[0]["path"] == "/etc/kubernetes/manifests/kube-vip.yaml"
+    assert len(write_files) == 1, "Join should render kube-vip manifest only (no CNI install on join)"
+
+    kube_vip_file = next((wf for wf in write_files if "kube-vip" in wf["path"]), None)
+    assert kube_vip_file is not None
+    assert kube_vip_file["path"] == "/etc/kubernetes/manifests/kube-vip.yaml"
 
     assert any("kubeadm join" in cmd and "--control-plane" in cmd for cmd in runcmds), \
         "Should run kubeadm join --control-plane"
@@ -164,7 +177,11 @@ def test_mode_external_bootstrap() -> None:
     )
 
     assert len(errors) == 0, f"Expected no errors, got {errors}"
-    assert len(write_files) == 0, "mode=external should not render manifest"
+    assert len(write_files) == 3, "mode=external should write cilium-values.yaml + CiliumLoadBalancerIPPool + watchdog CronJob"
+
+    cilium_file = next((wf for wf in write_files if "cilium-values" in wf["path"]), None)
+    assert cilium_file is not None
+    assert "kubeProxyReplacement: true" in cilium_file["content"]
 
     assert any("kubeadm init" in cmd and "--control-plane-endpoint" in cmd for cmd in runcmds), \
         "Should run kubeadm init with external endpoint"
@@ -394,7 +411,11 @@ def test_3node_ha_kube_vip_scenario() -> None:
     )
 
     assert len(errors_1) == 0, f"Bootstrap should succeed, got {errors_1}"
-    assert len(write_files_1) == 1, "Bootstrap should render manifest"
+    assert len(write_files_1) == 4, "Bootstrap should render kube-vip manifest + cilium-values.yaml + CiliumLoadBalancerIPPool + watchdog CronJob"
+
+    # Check kube-vip manifest
+    kube_vip_file = next((wf for wf in write_files_1 if "kube-vip" in wf["path"]), None)
+    assert kube_vip_file is not None
     assert any("kubeadm init" in cmd for cmd in runcmds_1), "Bootstrap should run init"
     assert len(joiner_secrets_1) == 2, "Bootstrap should emit secrets"
 
@@ -434,8 +455,13 @@ def test_3node_ha_kube_vip_scenario() -> None:
     )
 
     assert len(errors_2) == 0, f"Join node 2 should succeed, got {errors_2}"
-    assert len(write_files_2) == 1, "Join should render same manifest"
-    assert write_files_1[0]["content"] == write_files_2[0]["content"], "Manifests should be identical"
+    assert len(write_files_2) == 1, "Join should render kube-vip manifest only (no CNI install on join)"
+
+    # Extract kube-vip files to compare
+    bootstrap_manifest = next((wf for wf in write_files_1 if "kube-vip" in wf["path"]), None)
+    join2_manifest = next((wf for wf in write_files_2 if "kube-vip" in wf["path"]), None)
+    assert bootstrap_manifest is not None and join2_manifest is not None
+    assert bootstrap_manifest["content"] == join2_manifest["content"], "Manifests should be identical"
     assert any("kubeadm join" in cmd for cmd in runcmds_2), "Join should run join command"
 
     # Node 3: Also joins with same secrets
@@ -448,11 +474,336 @@ def test_3node_ha_kube_vip_scenario() -> None:
     )
 
     assert len(errors_3) == 0, f"Join node 3 should succeed, got {errors_3}"
-    assert len(write_files_3) == 1, "Join should render same manifest"
-    assert write_files_1[0]["content"] == write_files_3[0]["content"], "All manifests should be identical"
+    assert len(write_files_3) == 1, "Join should render kube-vip manifest only"
+
+    join3_manifest = next((wf for wf in write_files_3 if "kube-vip" in wf["path"]), None)
+    assert join3_manifest is not None
+    assert bootstrap_manifest["content"] == join3_manifest["content"], "All manifests should be identical"
 
     # Check VIP IP appears in manifests (port is in endpoint string, but manifest only stores IP)
     vip_ip = endpoint.split(":")[0]
-    assert vip_ip in write_files_1[0]["content"], "VIP should appear in all manifests"
-    assert vip_ip in write_files_2[0]["content"]
-    assert vip_ip in write_files_3[0]["content"]
+    assert vip_ip in bootstrap_manifest["content"], "VIP should appear in all manifests"
+    assert vip_ip in join2_manifest["content"]
+    assert vip_ip in join3_manifest["content"]
+
+
+# ---------------------------------------------------------------------------
+# Test: CNI integration (Cilium)
+# ---------------------------------------------------------------------------
+
+
+def test_kube_vip_bootstrap_installs_cilium() -> None:
+    """Bootstrap with cilium: renders CRD pre-apply, helm install, wait commands."""
+    params = {
+        "mode": "kube-vip",
+        "endpoint": "10.2.0.10:6443",
+        "cni": "cilium",
+        "cni_params": {"version": "1.19.1"},
+    }
+    write_files, runcmds, joiner_secrets, errors = _render_control_plane_frontend(
+        params=params,
+        biome_name="k8s-primary",
+        node_name="cp-1",
+        cluster_id="test-cluster",
+        joiner_secrets_existing=[],
+    )
+
+    assert len(errors) == 0, f"Expected no errors: {errors}"
+
+    # Check cilium-values.yaml written
+    values_files = [wf for wf in write_files if "cilium-values.yaml" in wf["path"]]
+    assert len(values_files) == 1, "Should write cilium-values.yaml"
+    assert "kubeProxyReplacement: true" in values_files[0]["content"]
+    assert "10.2.0.10" in values_files[0]["content"]  # templated VIP
+
+    # Check critical CRD pre-apply (dal2-beta deadlock prevention)
+    assert any("ciliumenvoyconfigs.yaml" in cmd for cmd in runcmds), \
+        "Should pre-apply ciliumenvoyconfigs CRD"
+    assert any("ciliumclusterwideenvoyconfigs.yaml" in cmd for cmd in runcmds), \
+        "Should pre-apply ciliumclusterwideenvoyconfigs CRD (dal2-beta fix)"
+
+    # Check helm install
+    assert any("helm install cilium" in cmd for cmd in runcmds), \
+        "Should install Cilium via helm"
+    assert any("--version 1.19.1" in cmd for cmd in runcmds), \
+        "Should pin Cilium chart version to 1.19.1"
+
+    # Check readiness waits
+    assert any("cilium-operator" in cmd and "wait" in cmd for cmd in runcmds), \
+        "Should wait for Cilium Operator Ready"
+    assert any("rollout status" in cmd and "cilium" in cmd for cmd in runcmds), \
+        "Should wait for Cilium DaemonSet rollout"
+
+    # Check final CRD verification
+    assert any("ciliumenvoyconfigs.cilium.io" in cmd and "kubectl get crd" in cmd for cmd in runcmds), \
+        "Should verify ciliumenvoyconfigs CRD present"
+
+
+def test_kube_vip_bootstrap_skips_kube_proxy() -> None:
+    """Bootstrap kubeadm init should skip kube-proxy (Cilium replaces it)."""
+    params = {
+        "mode": "kube-vip",
+        "endpoint": "10.2.0.10:6443",
+        "cni": "cilium",
+    }
+    write_files, runcmds, joiner_secrets, errors = _render_control_plane_frontend(
+        params=params,
+        biome_name="k8s-primary",
+        node_name="cp-1",
+        cluster_id="test-cluster",
+        joiner_secrets_existing=[],
+    )
+
+    assert len(errors) == 0
+
+    init_cmd = next((cmd for cmd in runcmds if "kubeadm init" in cmd), "")
+    assert "--skip-phases=addon/kube-proxy" in init_cmd, \
+        "kubeadm init should skip kube-proxy addon (Cilium replaces it)"
+    assert "--skip-phases=addon/coredns" in init_cmd, \
+        "kubeadm init should skip coredns (install after CNI ready)"
+
+
+def test_kube_vip_join_waits_for_local_cilium() -> None:
+    """Join node: should wait for local cilium pod to be Ready on this node."""
+    params = {
+        "mode": "kube-vip",
+        "endpoint": "10.2.0.10:6443",
+        "cni": "cilium",
+    }
+    joiner_secrets_existing = [
+        {"extractor_name": "kubeadm_join_token", "value": "token123"},
+        {"extractor_name": "kubeadm_ca_hash", "value": "sha256:abc"},
+        {"extractor_name": "kubeadm_certificate_key", "value": "certkey"},
+    ]
+    write_files, runcmds, joiner_secrets, errors = _render_control_plane_frontend(
+        params=params,
+        biome_name="k8s-primary",
+        node_name="cp-2",
+        cluster_id="test-cluster",
+        joiner_secrets_existing=joiner_secrets_existing,
+    )
+
+    assert len(errors) == 0
+
+    cilium_wait_cmds = [cmd for cmd in runcmds if "cilium" in cmd and "wait" in cmd]
+    assert len(cilium_wait_cmds) > 0, "Join should wait for local cilium pod"
+    assert any("hostname" in cmd for cmd in cilium_wait_cmds), \
+        "Join should wait for cilium pod on this specific node (hostname filter)"
+
+
+def test_external_bootstrap_installs_cilium() -> None:
+    """External endpoint mode: also installs Cilium with pre-apply CRDs."""
+    params = {
+        "mode": "external",
+        "endpoint": "api.example.com:6443",
+        "cni": "cilium",
+        "cni_params": {"version": "1.19.1"},
+    }
+    write_files, runcmds, joiner_secrets, errors = _render_control_plane_frontend(
+        params=params,
+        biome_name="k8s-primary",
+        node_name="cp-1",
+        cluster_id="test-cluster",
+        joiner_secrets_existing=[],
+    )
+
+    assert len(errors) == 0
+    assert any("helm install cilium" in cmd for cmd in runcmds), \
+        "External mode should also install Cilium"
+    assert any("ciliumenvoyconfigs.yaml" in cmd for cmd in runcmds), \
+        "External mode should pre-apply Cilium CRDs"
+
+
+def test_cni_none_skips_cilium() -> None:
+    """mode=none should skip Cilium install, enable coredns in kubeadm."""
+    params = {
+        "mode": "none",
+        "cni": "none",
+    }
+    write_files, runcmds, joiner_secrets, errors = _render_control_plane_frontend(
+        params=params,
+        biome_name="k8s-primary",
+        node_name="cp-1",
+        cluster_id="test-cluster",
+        joiner_secrets_existing=[],
+    )
+
+    assert len(errors) == 0
+    # No Cilium commands
+    assert not any("helm install cilium" in cmd for cmd in runcmds), \
+        "mode=none (cni=none) should not install Cilium"
+    assert not any("kubectl apply" in cmd and "cilium" in cmd.lower() for cmd in runcmds), \
+        "mode=none (cni=none) should not apply Cilium CRDs"
+
+
+def test_cni_unknown_value_rejected() -> None:
+    """Unknown cni value should be rejected with validation error."""
+    params = {
+        "mode": "kube-vip",
+        "endpoint": "10.2.0.10:6443",
+        "cni": "flannel",  # unsupported
+    }
+    write_files, runcmds, joiner_secrets, errors = _render_control_plane_frontend(
+        params=params,
+        biome_name="k8s-primary",
+        node_name="cp-1",
+        cluster_id="test-cluster",
+        joiner_secrets_existing=[],
+    )
+
+    assert len(errors) > 0, "Should have validation error for unsupported CNI"
+    assert any("flannel" in e.message and "Unsupported CNI" in e.message for e in errors), \
+        "Error message should mention 'flannel' and 'Unsupported CNI'"
+
+
+# ---------------------------------------------------------------------------
+# NEW: Cilium hardening tests
+# ---------------------------------------------------------------------------
+
+
+def test_cilium_install_has_real_digests() -> None:
+    """Cilium install should use real image digests, no placeholders."""
+    params = {
+        "mode": "kube-vip",
+        "endpoint": "10.2.0.10:6443",
+    }
+    write_files, runcmds, joiner_secrets, errors = _render_control_plane_frontend(
+        params=params,
+        biome_name="k8s-primary",
+        node_name="cp-1",
+        cluster_id="test-cluster",
+        joiner_secrets_existing=[],
+    )
+
+    assert len(errors) == 0, f"Should succeed, got {errors}"
+    cilium_file = next((wf for wf in write_files if "cilium-values" in wf["path"]), None)
+    assert cilium_file is not None
+    # Should not have placeholder text or ghcr.io
+    assert "sha256:<resolved>" not in cilium_file["content"]
+    assert "placeholder" not in cilium_file["content"].lower()
+
+
+def test_cilium_install_includes_lb_ipam() -> None:
+    """Cilium install should include L2 announcements, externalIPs, and LB algorithm."""
+    params = {
+        "mode": "kube-vip",
+        "endpoint": "10.2.0.10:6443",
+    }
+    write_files, runcmds, joiner_secrets, errors = _render_control_plane_frontend(
+        params=params,
+        biome_name="k8s-primary",
+        node_name="cp-1",
+        cluster_id="test-cluster",
+        joiner_secrets_existing=[],
+    )
+
+    assert len(errors) == 0
+    cilium_file = next((wf for wf in write_files if "cilium-values" in wf["path"]), None)
+    assert cilium_file is not None
+    content = cilium_file["content"]
+    assert "l2announcements:" in content and "enabled: true" in content, "L2 announcements must be enabled"
+    assert "externalIPs:" in content, "externalIPs must be present"
+    assert "loadBalancer:" in content and "maglev" in content, "LoadBalancer must use maglev"
+
+    # Check LB pool is created
+    lb_pool_file = next((wf for wf in write_files if "cilium-lb-pool" in wf["path"]), None)
+    assert lb_pool_file is not None, "CiliumLoadBalancerIPPool must be written"
+    assert "CiliumLoadBalancerIPPool" in lb_pool_file["content"]
+
+
+def test_cilium_install_applies_gateway_api_crds_before_cilium_crds() -> None:
+    """Gateway API CRDs must be applied BEFORE Cilium CRDs."""
+    params = {
+        "mode": "kube-vip",
+        "endpoint": "10.2.0.10:6443",
+    }
+    write_files, runcmds, joiner_secrets, errors = _render_control_plane_frontend(
+        params=params,
+        biome_name="k8s-primary",
+        node_name="cp-1",
+        cluster_id="test-cluster",
+        joiner_secrets_existing=[],
+    )
+
+    assert len(errors) == 0
+    # Find indices of Gateway API and Cilium CRD commands
+    gw_api_idx = None
+    cilium_crd_idx = None
+    for i, cmd in enumerate(runcmds):
+        if "gateway-api" in cmd and "standard-install.yaml" in cmd:
+            gw_api_idx = i
+        if "cilium/cilium/crds" in cmd or "Pre-apply Cilium CRDs" in cmd:
+            cilium_crd_idx = i
+
+    assert gw_api_idx is not None, "Gateway API CRD apply must be present"
+    assert cilium_crd_idx is not None, "Cilium CRD apply must be present"
+    assert gw_api_idx < cilium_crd_idx, f"Gateway API (idx={gw_api_idx}) must come before Cilium CRDs (idx={cilium_crd_idx})"
+
+
+def test_tlsroute_v1alpha2_check_present() -> None:
+    """TLSRoute v1alpha2 availability check must be in cloud-init."""
+    params = {
+        "mode": "kube-vip",
+        "endpoint": "10.2.0.10:6443",
+    }
+    write_files, runcmds, joiner_secrets, errors = _render_control_plane_frontend(
+        params=params,
+        biome_name="k8s-primary",
+        node_name="cp-1",
+        cluster_id="test-cluster",
+        joiner_secrets_existing=[],
+    )
+
+    assert len(errors) == 0
+    runcmd_str = "\n".join(runcmds)
+    assert "v1alpha2" in runcmd_str, "TLSRoute v1alpha2 check must be present"
+    assert "tlsroutes.gateway.networking.k8s.io" in runcmd_str, "Must check TLSRoute CRD"
+
+
+def test_watchdog_cronjob_installed() -> None:
+    """Core-agents watchdog CronJob must be installed on bootstrap."""
+    params = {
+        "mode": "kube-vip",
+        "endpoint": "10.2.0.10:6443",
+    }
+    write_files, runcmds, joiner_secrets, errors = _render_control_plane_frontend(
+        params=params,
+        biome_name="k8s-primary",
+        node_name="cp-1",
+        cluster_id="test-cluster",
+        joiner_secrets_existing=[],
+    )
+
+    assert len(errors) == 0
+    watchdog_file = next((wf for wf in write_files if "core-agent-watchdog" in wf["path"]), None)
+    assert watchdog_file is not None, "Watchdog CronJob YAML must be written"
+    content = watchdog_file["content"]
+    assert "ServiceAccount" in content, "Must include ServiceAccount"
+    assert "ClusterRole" in content, "Must include ClusterRole"
+    assert "ClusterRoleBinding" in content, "Must include ClusterRoleBinding"
+    assert "CronJob" in content, "Must include CronJob"
+    assert "gough-core-agent-watchdog" in content
+    assert "*/5 * * * *" in content, "Must run every 5 minutes"
+    assert "cilium-operator" in content, "Must check cilium-operator"
+    assert "coredns" in content, "Must check coredns"
+
+
+def test_lb_pool_cidr_param() -> None:
+    """Providing lb_pool_cidr param should override default pool."""
+    params = {
+        "mode": "kube-vip",
+        "endpoint": "10.2.0.10:6443",
+        "cni_params": {"lb_pool_cidr": "10.3.0.100-10.3.0.200"},
+    }
+    write_files, runcmds, joiner_secrets, errors = _render_control_plane_frontend(
+        params=params,
+        biome_name="k8s-primary",
+        node_name="cp-1",
+        cluster_id="test-cluster",
+        joiner_secrets_existing=[],
+    )
+
+    assert len(errors) == 0
+    lb_pool_file = next((wf for wf in write_files if "cilium-lb-pool" in wf["path"]), None)
+    assert lb_pool_file is not None
+    assert "10.3.0.100-10.3.0.200" in lb_pool_file["content"], "Custom CIDR must be in pool"
