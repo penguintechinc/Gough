@@ -181,24 +181,18 @@ def test_cloud_provider(app, db):
 
 
 @pytest.fixture(scope="function")
-def test_egg(app, db):
-    """Create a test egg for provisioning."""
-    egg_id = db.eggs.insert(
-        name="test-nginx",
-        display_name="Test Nginx",
-        description="Test Nginx egg",
-        egg_type="snap",
-        version="1.0",
-        category="webserver",
-        snap_name="nginx",
-        snap_channel="stable",
-        snap_classic=False,
-        is_active=True,
-        is_default=False,
-        required_architecture="any"
+def test_biome(app, db):
+    """Create a test biome for provisioning."""
+    biome_id = db.biomes.insert(
+        name="test-k8s-worker",
+        biome_kind="k8s-worker",
+        workload_type="lxc",
+        phase="post_deploy",
+        registry_url="ghcr.io/penguintechinc/gough/k8s-worker:v1.0.0",
+        tenant_id="__default__"
     )
     db.commit()
-    return db.eggs(egg_id)
+    return db.biomes(biome_id)
 
 
 @pytest.fixture(scope="function")
@@ -307,17 +301,17 @@ def test_boot_config(app, db, test_image):
 
 
 @pytest.fixture(scope="function")
-def test_egg_group(app, db, test_egg):
-    """Create a test egg group."""
-    group_id = db.egg_groups.insert(
+def test_biome_group(app, db, test_biome):
+    """Create a test biome group."""
+    group_id = db.biome_groups.insert(
         name="test-group",
         display_name="Test Group",
-        description="Test egg group",
-        eggs=json.dumps([{"egg_id": test_egg.id, "order": 1}]),
+        description="Test biome group",
+        biomes=json.dumps([{"biome_id": test_biome.id, "order": 1}]),
         is_default=False
     )
     db.commit()
-    return db.egg_groups(group_id)
+    return db.biome_groups(group_id)
 
 
 @pytest.fixture(scope="function")
