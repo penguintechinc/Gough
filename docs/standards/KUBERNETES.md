@@ -362,7 +362,36 @@ spec:
 
 ### Ingress - Route External Traffic
 
+> ⚠️ **PenguinTech clusters use Cilium's embedded Envoy with Gateway API — not nginx-ingress.** Use `HTTPRoute` (Gateway API), not `Ingress` (networking.k8s.io). The `ingressClassName: nginx` pattern below is wrong for our clusters.
+
+**Correct — Gateway API `HTTPRoute`:**
+
 ```yaml
+apiVersion: gateway.networking.k8s.io/v1
+kind: HTTPRoute
+metadata:
+  name: myapp
+  namespace: myapp
+spec:
+  parentRefs:
+    - name: cilium-gateway
+      namespace: kube-system
+  hostnames:
+    - myapp.penguintech.cloud
+  rules:
+    - matches:
+        - path:
+            type: PathPrefix
+            value: /
+      backendRefs:
+        - name: myapp
+          port: 80
+```
+
+**Wrong for PenguinTech clusters (nginx-style):**
+
+```yaml
+# ❌ DO NOT USE — no nginx-ingress controller in dal2-beta or prod
 apiVersion: networking.k8s.io/v1
 kind: Ingress
 metadata:
@@ -371,16 +400,10 @@ spec:
   ingressClassName: nginx
   rules:
   - host: myapp.penguintech.cloud
-    http:
-      paths:
-      - path: /
-        pathType: Prefix
-        backend:
-          service:
-            name: myapp
-            port:
-              number: 80
+    ...
 ```
+
+**Alpha (local dev):** Use `NodePort` services — Gateway API is not required for local development.
 
 ## 🌐 Production Domains & Routing
 
@@ -554,6 +577,196 @@ spec:
 ```
 
 Cilium will compile these policies into BPF programs and enforce them in the kernel.
+
+### ⚠️ Cilium Edge Cases & Known Gotchas
+
+Real-world issues found in dal2-beta. Read before writing NetworkPolicies on Cilium clusters.
+
+---
+
+#### 1. DNS egress is silently blocked by default-deny
+
+When a namespace has a `default-deny-all` NetworkPolicy, pods cannot resolve service names because UDP 53 to CoreDNS is blocked. This manifests as `i/o timeout` (not `no such host`) because the DNS query is dropped, not rejected.
+
+**Every pod that needs DNS must include this egress rule:**
+
+```yaml
+egress:
+  - to:
+      - namespaceSelector:
+          matchLabels:
+            kubernetes.io/metadata.name: kube-system
+    ports:
+      - protocol: UDP
+        port: 53
+      - protocol: TCP
+        port: 53
+```
+
+Symptom: `dial tcp 10.96.0.1:443: i/o timeout` — misleading because the real failure is DNS, not the HTTPS connection.
+
+---
+
+#### 2. `namespaceSelector: kube-system` does NOT reach the kube-apiserver
+
+The kube-apiserver runs as a static pod with `hostNetwork: true`. Cilium classifies traffic to host-network endpoints as going to the **"world" identity** (external), not to a kube-system pod. A `namespaceSelector` rule only matches overlay pods — it silently misses static pods.
+
+**Broken (looks right, doesn't work):**
+
+```yaml
+egress:
+  - to:
+      - namespaceSelector:
+          matchLabels:
+            kubernetes.io/metadata.name: kube-system
+    ports:
+      - protocol: TCP
+        port: 6443   # ❌ Won't reach kube-apiserver — it's hostNetwork
+```
+
+**Correct — port 6443 must be unrestricted (no `to:`):**
+
+```yaml
+egress:
+  - to:
+      - namespaceSelector:
+          matchLabels:
+            kubernetes.io/metadata.name: kube-system
+    ports:
+      - protocol: UDP
+        port: 53
+      - protocol: TCP
+        port: 53
+  - ports:           # ✅ No 'to:' — reaches hostNetwork kube-apiserver
+      - protocol: TCP
+        port: 6443
+```
+
+Applies to: any static pod with `hostNetwork: true` (kube-apiserver, etcd, etc.).
+
+---
+
+#### 3. Cilium agent stopped modules after node reboot
+
+After rebooting a worker node, the Cilium agent may come back with "stopped modules" (commonly 20+). This causes intermittent `i/o timeout` on ClusterIPs even when NetworkPolicies are correct — the eBPF datapath for service translation is partially degraded.
+
+**Diagnose:**
+
+```bash
+CILIUM_POD=$(kubectl --context dal2-beta get pods -n kube-system -l k8s-app=cilium \
+  --field-selector spec.nodeName=<node-name> -o jsonpath='{.items[0].metadata.name}')
+kubectl --context dal2-beta exec -n kube-system $CILIUM_POD -- \
+  cilium-dbg status --all-controllers 2>&1 | grep -E "stopped|Failed"
+```
+
+**Fix — delete the DaemonSet pod to force restart (it will auto-recreate):**
+
+```bash
+kubectl --context dal2-beta delete pod -n kube-system $CILIUM_POD
+# Also delete the companion envoy pod on the same node
+ENVOY_POD=$(kubectl --context dal2-beta get pods -n kube-system -l k8s-app=cilium-envoy \
+  -o wide | grep <node-name> | awk '{print $1}')
+kubectl --context dal2-beta delete pod -n kube-system $ENVOY_POD
+```
+
+Wait ~60s for both to restart, then recheck connectivity. Do not use `--force --grace-period=0` unless the pod is stuck Terminating — a graceful delete allows Cilium to clean up eBPF maps.
+
+---
+
+#### 4. TLSRoute CRD version conflict (Cilium 1.19.x + GatewayAPI)
+
+Cilium 1.19.x operator looks for `TLSRoute` at `gateway.networking.k8s.io/v1alpha2`, but newer GatewayAPI CRD installations only serve `v1`. The operator crashes, which cascades: no Envoy CRDs registered → Cilium agents fail → all pods on that node lose network.
+
+**Diagnose:**
+
+```bash
+kubectl --context dal2-beta logs -n kube-system -l app.kubernetes.io/name=cilium-operator \
+  --tail=30 | grep -i "tlsroute\|no matches"
+```
+
+**Fix — patch the CRD to serve v1alpha2 alongside v1:**
+
+```bash
+kubectl --context dal2-beta patch crd tlsroutes.gateway.networking.k8s.io \
+  --type=json \
+  -p='[{"op":"replace","path":"/spec/versions/1/served","value":true}]'
+```
+
+Verify the operator pod restarts cleanly after the patch.
+
+---
+
+#### 6. cilium-operator ClusterRole missing Gateway API RBAC (installed after Cilium)
+
+When Gateway API CRDs are installed after Cilium, or when Cilium is upgraded without re-applying RBAC manifests, the `cilium-operator` ClusterRole is missing the required API groups. Symptom: all Gateways stay `Programmed=False`; operator logs contain cascading `forbidden` errors.
+
+**Always audit ALL forbidden errors before patching — fix in one pass, not one-at-a-time:**
+
+```bash
+kubectl --context dal2-beta logs -n kube-system \
+  -l app.kubernetes.io/name=cilium-operator --tail=100 \
+  | grep -i "forbidden\|cannot\|RBAC" | sort -u
+```
+
+**Required rules (apply all if Gateway API was installed after Cilium):**
+
+```yaml
+# 1. Core Gateway API resources
+- apiGroups: ["gateway.networking.k8s.io"]
+  resources:
+    - gateways
+    - gatewayclasses
+    - httproutes
+    - grpcroutes
+    - tlsroutes
+    - referencegrants
+    - gateways/status
+    - gatewayclasses/status
+    - httproutes/status
+  verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
+
+# 2. Cilium's own Gateway config CRD
+- apiGroups: ["cilium.io"]
+  resources: ["ciliumgatewayclassconfigs"]
+  verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
+
+# 3. Services + endpoints (LoadBalancer Service reconciliation for Gateway)
+# Check first — only add if create/update/patch/delete are missing from existing rule
+- apiGroups: [""]
+  resources: ["services", "services/status", "endpoints"]
+  verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
+
+# 4. EndpointSlices
+- apiGroups: ["discovery.k8s.io"]
+  resources: ["endpointslices"]
+  verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
+```
+
+After patching, restart the operator and verify `kubectl get gateway -A` shows `Programmed=True`.
+
+**Prevention**: When installing Gateway API CRDs on an existing Cilium cluster, always re-apply the Cilium RBAC manifests afterwards:
+```bash
+helm upgrade cilium cilium/cilium --reuse-values --kube-context {context}
+```
+
+---
+
+#### 5. Cluster-wide storage providers need open ingress
+
+Services like Nest (storage) that must be reachable from **any namespace** in the cluster should not restrict ingress by `namespaceSelector`. Use an empty selector to allow all namespaces:
+
+```yaml
+ingress:
+  - from:
+      - namespaceSelector: {}   # Any namespace
+    ports:
+      - protocol: TCP
+        port: 8080
+```
+
+Restricting to specific namespaces (e.g., `ingress-nginx` only) breaks in-cluster consumers that bypass the ingress controller.
+
+---
 
 ## 🔧 Troubleshooting K8s (Common Fixes)
 
