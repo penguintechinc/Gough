@@ -69,7 +69,7 @@ services:
       - STORAGE_ACCESS_KEY=${STORAGE_ACCESS_KEY:-}
       - STORAGE_SECRET_KEY=${STORAGE_SECRET_KEY:-}
       - STORAGE_BUCKET_BOOT_IMAGES=${STORAGE_BUCKET_BOOT_IMAGES:-gough-boot-images}
-      - STORAGE_BUCKET_EGGS=${STORAGE_BUCKET_EGGS:-gough-eggs}
+      - STORAGE_BUCKET_BIOMES=${STORAGE_BUCKET_BIOMES:-gough-biomes}
       - STORAGE_BUCKET_LXD=${STORAGE_BUCKET_LXD:-gough-lxd-images}
       # Security
       - SECRET_KEY=${SECRET_KEY:-change-me-in-production}

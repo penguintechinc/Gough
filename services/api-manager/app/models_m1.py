@@ -1,0 +1,811 @@
+"""SQLAlchemy ORM classes for M1 tables created by Alembic migrations 20260427_0930
+through 20260427_1930. Importing this module registers all M1 classes on Base.metadata
+so Alembic autogenerate sees them and Base.metadata.create_all(checkfirst=True)
+creates them on fresh databases.
+"""
+
+import uuid
+from datetime import datetime, timezone
+from sqlalchemy import (
+    BigInteger,
+    Boolean,
+    Column,
+    DateTime,
+    Float,
+    ForeignKey,
+    Index,
+    Integer,
+    JSON,
+    LargeBinary,
+    String,
+    Text,
+    TypeDecorator,
+    UniqueConstraint,
+    Uuid,
+)
+from sqlalchemy.orm import relationship, synonym
+
+from .models_sqlalchemy import Base
+
+
+class UUID(TypeDecorator):
+    """Platform-agnostic UUID type that stores as STRING(36) and handles both UUID and string objects."""
+    impl = String(36)
+    cache_ok = True
+
+    def process_bind_param(self, value, dialect):
+        if value is None:
+            return None
+        if isinstance(value, uuid.UUID):
+            return str(value)
+        return value
+
+    def process_result_value(self, value, dialect):
+        if value is None:
+            return None
+        if isinstance(value, uuid.UUID):
+            return value
+        return uuid.UUID(value) if isinstance(value, str) else value
+
+
+# =============================================================================
+# Node & Infrastructure Tables
+# =============================================================================
+
+
+class Node(Base):
+    """Bare-metal node inventory with state machine and hardware discovery."""
+
+    __tablename__ = "nodes"
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    tenant_id = Column(String(255), nullable=False, server_default="__default__")
+    name = Column(String(255), nullable=False)
+    state = Column(String(32), nullable=False, server_default="new")
+    dmi_uuid = Column(String(64), nullable=True)
+    primary_nic_mac = Column(String(17), nullable=True)
+    ipv4 = Column(String(15), nullable=True)
+    ipv6 = Column(String(45), nullable=True)
+    boot_config_id = Column(Integer, nullable=True)
+    hardware_json = Column(JSON, nullable=True)
+    hardware_tags = Column(JSON, nullable=True)
+    posture = Column(String(32), nullable=False, server_default="compliant")
+    preferred_addr_family = Column(String(16), nullable=False, server_default="auto")
+    attestation_method = Column(String(32), nullable=False, server_default="discovery_agent")
+    discovered_at = Column(DateTime(timezone=True), nullable=True)
+    deployed_at = Column(DateTime(timezone=True), nullable=True)
+    created_at = Column(
+        DateTime(timezone=True),
+        nullable=False,
+        default=lambda: datetime.now(timezone.utc),
+    )
+    updated_at = Column(
+        DateTime(timezone=True),
+        nullable=False,
+        default=lambda: datetime.now(timezone.utc),
+    )
+
+    __table_args__ = (
+        UniqueConstraint("tenant_id", "name", name="uq_nodes_tenant_name"),
+        UniqueConstraint("tenant_id", "dmi_uuid", name="uq_nodes_tenant_dmi_uuid"),
+        Index("ix_nodes_state", "state"),
+        Index("ix_nodes_tenant_id", "tenant_id"),
+        Index("ix_nodes_primary_nic_mac", "primary_nic_mac"),
+        Index("ix_nodes_hardware_tags", "hardware_tags"),
+        {"extend_existing": True},
+    )
+
+    # Relationships
+    disks = relationship("Disk", back_populates="node", cascade="all, delete-orphan")
+    bmc = relationship("NodeBmc", back_populates="node", uselist=False)
+    firmware = relationship("HardwareFirmware", back_populates="node", cascade="all, delete-orphan")
+    tags_operator = relationship("NodeTagOperator", back_populates="node", cascade="all, delete-orphan")
+    biome_assignments = relationship("NodeBiomeAssignment", back_populates="node", cascade="all, delete-orphan")
+
+
+class Disk(Base):
+    """Disk inventory with SMART status and storage backend assignment."""
+
+    __tablename__ = "disks"
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    node_id = Column(Integer, ForeignKey("nodes.id", ondelete="CASCADE"), nullable=False)
+    tenant_id = Column(String(255), nullable=False, server_default="__default__")
+    device_path = Column(String(255), nullable=False)
+    serial = Column(String(64), nullable=True)
+    capacity_bytes = Column(BigInteger, nullable=False)
+    rotational = Column(Boolean, nullable=False, server_default='false')
+    smart_status = Column(String(16), nullable=False, server_default="unknown")
+    smart_attributes_json = Column(JSON, nullable=True)
+    reserved_for_storage = Column(Boolean, nullable=False, server_default='false')
+    storage_backend = Column(String(32), nullable=True)
+    tier = Column(String(16), nullable=False, server_default="bulk")
+    created_at = Column(
+        DateTime(timezone=True),
+        nullable=False,
+        default=lambda: datetime.now(timezone.utc),
+    )
+    updated_at = Column(
+        DateTime(timezone=True),
+        nullable=False,
+        default=lambda: datetime.now(timezone.utc),
+    )
+
+    __table_args__ = (
+        UniqueConstraint("node_id", "device_path", name="uq_disks_node_device_path"),
+        Index("ix_disks_node_id", "node_id"),
+        Index("ix_disks_tenant_id", "tenant_id"),
+        Index("ix_disks_serial", "serial"),
+        Index("ix_disks_storage_backend", "storage_backend"),
+        {"extend_existing": True},
+    )
+
+    # Relationships
+    node = relationship("Node", back_populates="disks")
+    disk_plans = relationship("DiskPlan", back_populates="disk", cascade="all, delete-orphan")
+
+
+class DiskPlan(Base):
+    """Disk partitioning and filesystem planning."""
+
+    __tablename__ = "disk_plans"
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    node_id = Column(Integer, ForeignKey("nodes.id", ondelete="CASCADE"), nullable=False)
+    disk_id = Column(Integer, ForeignKey("disks.id", ondelete="CASCADE"), nullable=False)
+    tenant_id = Column(String(255), nullable=False, server_default="__default__")
+    mount_point = Column(String(255), nullable=False)
+    size_bytes = Column(BigInteger, nullable=False)
+    fs_type = Column(String(16), nullable=False)
+    partition_index = Column(Integer, nullable=False)
+    raid_level = Column(String(8), nullable=True)
+    encryption = Column(String(8), nullable=False, server_default="none")
+    created_at = Column(
+        DateTime(timezone=True),
+        nullable=False,
+        default=lambda: datetime.now(timezone.utc),
+    )
+    updated_at = Column(
+        DateTime(timezone=True),
+        nullable=False,
+        default=lambda: datetime.now(timezone.utc),
+    )
+
+    __table_args__ = (
+        UniqueConstraint("node_id", "mount_point", name="uq_disk_plans_node_mount_point"),
+        Index("ix_disk_plans_node_id", "node_id"),
+        Index("ix_disk_plans_disk_id", "disk_id"),
+        Index("ix_disk_plans_tenant_id", "tenant_id"),
+        {"extend_existing": True},
+    )
+
+    # Relationships
+    disk = relationship("Disk", back_populates="disk_plans")
+
+
+class StorageBackend(Base):
+    """Distributed storage backend configuration and status."""
+
+    __tablename__ = "storage_backends"
+
+    id = Column(UUID(), primary_key=True)
+    cluster_id = Column(UUID(), nullable=False)
+    tenant_id = Column(String(255), nullable=False, server_default="__default__")
+    kind = Column(String(16), nullable=False)
+    name = Column(String(255), nullable=False)
+    is_default = Column(Boolean, nullable=False, server_default='false')
+    config_json = Column(JSON, nullable=True)
+    credentials_ref = Column(String(255), nullable=True)
+    status = Column(String(16), nullable=False, server_default="initializing")
+    capacity_total_bytes = Column(BigInteger, nullable=True)
+    capacity_used_bytes = Column(BigInteger, nullable=True)
+    health_check_at = Column(DateTime(timezone=True), nullable=True)
+    created_at = Column(
+        DateTime(timezone=True),
+        nullable=False,
+        default=lambda: datetime.now(timezone.utc),
+    )
+    updated_at = Column(
+        DateTime(timezone=True),
+        nullable=False,
+        default=lambda: datetime.now(timezone.utc),
+    )
+
+    __table_args__ = (
+        UniqueConstraint("cluster_id", "name", name="uq_storage_backends_cluster_name"),
+        Index("ix_storage_backends_cluster_id", "cluster_id"),
+        Index("ix_storage_backends_kind", "kind"),
+        Index("ix_storage_backends_tenant_id", "tenant_id"),
+        Index("ix_storage_backends_is_default", "is_default"),
+        {"extend_existing": True},
+    )
+
+
+# =============================================================================
+# Biome & Workload Tables
+# =============================================================================
+
+
+class Biome(Base):
+    """Biome definitions with deployment, packaging, and workload orchestration."""
+
+    __tablename__ = "biomes"
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    # Pre-M1 baseline columns
+    name = Column(String(255), nullable=False, server_default="")
+    display_name = Column(String(255), nullable=True)
+    description = Column(Text, nullable=True)
+    version = Column(String(64), nullable=True)
+    category = Column(String(64), nullable=True)
+    egg_kind = Column(String(64), nullable=True)
+    snap_name = Column(String(255), nullable=True)
+    snap_channel = Column(String(64), nullable=True, server_default="stable")
+    snap_classic = Column(Boolean, nullable=False, server_default='false')
+    cloud_init_content = Column(Text, nullable=True)
+    lxd_image_alias = Column(String(255), nullable=True)
+    lxd_profiles = Column(JSON, nullable=True)
+    is_hypervisor_config = Column(Boolean, nullable=False, server_default='false')
+    dependencies = Column(JSON, nullable=True)
+    min_ram_mb = Column(Integer, nullable=True)
+    min_disk_gb = Column(Integer, nullable=True)
+    required_architecture = Column(String(32), nullable=True, server_default="any")
+    is_active = Column(Boolean, nullable=False, server_default='true')
+    is_default = Column(Boolean, nullable=False, server_default='false')
+    checksum = Column(String(255), nullable=True)
+    size_bytes = Column(BigInteger, nullable=True)
+    signing_status = Column(String(32), nullable=True, server_default="unsigned")
+    created_at = Column(DateTime(timezone=True), nullable=True)
+    updated_at = Column(DateTime(timezone=True), nullable=True)
+
+    # M1 Extensions
+    biome_kind = Column(String(32), nullable=False, server_default="custom")
+    phase = Column(String(32), nullable=False, server_default="post_deploy")
+    workload_type = Column(String(8), nullable=False, server_default="lxc")
+    lock_to_host = Column(Boolean, nullable=False, server_default='false')
+    auto_join_cluster = Column(Boolean, nullable=False, server_default='false')
+    upgrade_strategy = Column(String(16), nullable=False, server_default="rolling")
+    storage_requirements_json = Column(JSON, nullable=True)
+    readiness_probe = Column(JSON, nullable=True)
+    signing_key_id = Column(String(255), nullable=True)
+    image_digest = Column(String(255), nullable=True)
+    signature_verified = Column(Boolean, nullable=False, server_default='false')
+    published_at = Column(DateTime(timezone=True), nullable=True)
+    sbom_url = Column(String(1024), nullable=True)
+    registry_url = Column(String(1024), nullable=True)
+    requires_hardware_tags = Column(JSON, nullable=True)
+    prefers_hardware_tags = Column(JSON, nullable=True)
+    forbids_hardware_tags = Column(JSON, nullable=True)
+    emits_joiner_secrets = Column(Boolean, nullable=False, server_default='false')
+    joiner_emit_spec = Column(JSON, nullable=True)
+    consumes_joiner_secrets_from = Column(JSON, nullable=True)
+    joiner_consume_spec = Column(JSON, nullable=True)
+    snapshot_schedule_json = Column(JSON, nullable=True)
+    required_interfaces = Column(JSON, nullable=True)
+    tenant_id = Column(String(255), nullable=False, server_default="__default__")
+
+    __table_args__ = (
+        Index("ix_biomes_biome_kind", "biome_kind"),
+        Index("ix_biomes_phase", "phase"),
+        Index("ix_biomes_workload_type", "workload_type"),
+        Index("ix_biomes_tenant_id", "tenant_id"),
+        Index("ix_biomes_lock_to_host", "lock_to_host"),
+        {"extend_existing": True},
+    )
+
+    # Relationships
+    assignments = relationship("NodeBiomeAssignment", back_populates="biome")
+
+
+class NodeBiomeAssignment(Base):
+    """Assignment of biome instances to nodes with dependency tracking."""
+
+    __tablename__ = "node_egg_assignments"
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    node_id = Column(Integer, ForeignKey("nodes.id", ondelete="CASCADE"), nullable=False)
+    egg_id = Column(Integer, ForeignKey("biomes.id", ondelete="RESTRICT"), nullable=False)
+    tenant_id = Column(String(255), nullable=False, server_default="__default__")
+    phase = Column(String(32), nullable=False)
+    status = Column(String(32), nullable=False, server_default="pending")
+    depends_on_egg_instance_id = Column(
+        Integer,
+        ForeignKey("node_egg_assignments.id", ondelete="SET NULL"),
+        nullable=True,
+    )
+    readiness_probe_state = Column(String(32), nullable=False, server_default="not_started")
+    last_event_at = Column(DateTime(timezone=True), nullable=True)
+    assigned_at = Column(
+        DateTime(timezone=True),
+        nullable=False,
+        default=lambda: datetime.now(timezone.utc),
+    )
+    deployed_at = Column(DateTime(timezone=True), nullable=True)
+    removed_at = Column(DateTime(timezone=True), nullable=True)
+    created_at = Column(
+        DateTime(timezone=True),
+        nullable=False,
+        default=lambda: datetime.now(timezone.utc),
+    )
+    updated_at = Column(
+        DateTime(timezone=True),
+        nullable=False,
+        default=lambda: datetime.now(timezone.utc),
+    )
+
+    __table_args__ = (
+        UniqueConstraint("node_id", "egg_id", name="uq_node_egg_assignments_node_egg"),
+        Index("ix_node_egg_assignments_node_id", "node_id"),
+        Index("ix_node_egg_assignments_egg_id", "egg_id"),
+        Index("ix_node_egg_assignments_status", "status"),
+        Index("ix_node_egg_assignments_tenant_id", "tenant_id"),
+        Index("ix_node_egg_assignments_phase", "phase"),
+        {"extend_existing": True},
+    )
+
+    # Relationships
+    node = relationship("Node", back_populates="biome_assignments")
+    biome = relationship("Biome", back_populates="assignments")
+
+    # Backward compatibility alias: biome_id -> egg_id
+    biome_id = synonym("egg_id")
+
+
+class Deployment(Base):
+    """Orchestration status and lifecycle for biome deployments to nodes."""
+
+    __tablename__ = "deployments"
+
+    id = Column(String(64), primary_key=True)
+    biome_id = Column(Integer, ForeignKey("biomes.id", ondelete="RESTRICT"), nullable=False)
+    node_id = Column(Integer, ForeignKey("nodes.id", ondelete="CASCADE"), nullable=False)
+    phase = Column(Integer, nullable=False, server_default="1")
+    status = Column(String(32), nullable=False, server_default="pending")
+    logs_url = Column(String(1024), nullable=True)
+    created_at = Column(
+        DateTime(timezone=True),
+        nullable=False,
+        default=lambda: datetime.now(timezone.utc),
+    )
+    updated_at = Column(
+        DateTime(timezone=True),
+        nullable=False,
+        default=lambda: datetime.now(timezone.utc),
+        onupdate=lambda: datetime.now(timezone.utc),
+    )
+
+    __table_args__ = (
+        Index("ix_deployments_status", "status"),
+        Index("ix_deployments_egg_node", "biome_id", "node_id"),
+        {"extend_existing": True},
+    )
+
+
+# =============================================================================
+# Hardware & Management Tables
+# =============================================================================
+
+
+class NodeBmc(Base):
+    """Baseboard management controller configuration for out-of-band access."""
+
+    __tablename__ = "node_bmc"
+
+    node_id = Column(Integer, ForeignKey("nodes.id", ondelete="CASCADE"), primary_key=True)
+    tenant_id = Column(String(255), nullable=False, server_default="__default__")
+    protocol = Column(String(16), nullable=False)
+    endpoint = Column(String(255), nullable=False)
+    username_ref = Column(String(255), nullable=False)
+    password_ref = Column(String(255), nullable=False)
+    cert_fingerprint = Column(String(95), nullable=True)
+    session_ttl_sec = Column(Integer, nullable=False, server_default='1800')
+    last_used_at = Column(DateTime(timezone=True), nullable=True)
+    capabilities = Column(JSON, nullable=True)
+    firmware_summary = Column(JSON, nullable=True)
+    factory_creds_detected = Column(Boolean, nullable=False, server_default='false')
+    created_at = Column(
+        DateTime(timezone=True),
+        nullable=False,
+        default=lambda: datetime.now(timezone.utc),
+    )
+    updated_at = Column(
+        DateTime(timezone=True),
+        nullable=False,
+        default=lambda: datetime.now(timezone.utc),
+    )
+
+    __table_args__ = (
+        Index("ix_node_bmc_tenant_id", "tenant_id"),
+        Index("ix_node_bmc_protocol", "protocol"),
+        {"extend_existing": True},
+    )
+
+    # Relationships
+    node = relationship("Node", back_populates="bmc")
+
+
+class HardwareFirmware(Base):
+    """Hardware firmware tracking with CVE monitoring."""
+
+    __tablename__ = "hardware_firmware"
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    node_id = Column(Integer, ForeignKey("nodes.id", ondelete="CASCADE"), nullable=False)
+    tenant_id = Column(String(255), nullable=False, server_default="__default__")
+    component = Column(String(32), nullable=False)
+    component_id = Column(String(255), nullable=False)
+    current_version = Column(String(255), nullable=False)
+    available_version = Column(String(255), nullable=True)
+    cve_list = Column(JSON, nullable=True)
+    last_checked_at = Column(DateTime(timezone=True), nullable=True)
+    last_updated_at = Column(DateTime(timezone=True), nullable=True)
+    created_at = Column(
+        DateTime(timezone=True),
+        nullable=False,
+        default=lambda: datetime.now(timezone.utc),
+    )
+    updated_at = Column(
+        DateTime(timezone=True),
+        nullable=False,
+        default=lambda: datetime.now(timezone.utc),
+    )
+
+    __table_args__ = (
+        UniqueConstraint("node_id", "component", "component_id", name="uq_hw_fw_node_comp_id"),
+        Index("ix_hardware_firmware_node_id", "node_id"),
+        Index("ix_hardware_firmware_component", "component"),
+        Index("ix_hardware_firmware_tenant_id", "tenant_id"),
+        {"extend_existing": True},
+    )
+
+    # Relationships
+    node = relationship("Node", back_populates="firmware")
+
+
+class NodeTagOperator(Base):
+    """Operator-defined node tags for workload affinity and placement."""
+
+    __tablename__ = "node_tags_operator"
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    node_id = Column(Integer, ForeignKey("nodes.id", ondelete="CASCADE"), nullable=False)
+    tenant_id = Column(String(255), nullable=False, server_default="__default__")
+    tag_key = Column(String(255), nullable=False)
+    tag_value = Column(String(255), nullable=False)
+    provenance = Column(String(32), nullable=False, server_default="operator")
+    set_by_actor_sub = Column(String(255), nullable=True)
+    set_at = Column(
+        DateTime(timezone=True),
+        nullable=False,
+        default=lambda: datetime.now(timezone.utc),
+    )
+
+    __table_args__ = (
+        UniqueConstraint("node_id", "tag_key", "tag_value", name="uq_node_tags_op_node_key_val"),
+        Index("ix_node_tags_operator_node_id", "node_id"),
+        Index("ix_node_tags_operator_tag_key", "tag_key"),
+        Index("ix_node_tags_operator_tenant_id", "tenant_id"),
+        {"extend_existing": True},
+    )
+
+    # Relationships
+    node = relationship("Node", back_populates="tags_operator")
+
+
+# =============================================================================
+# Security & Trust Tables
+# =============================================================================
+
+
+class SpiffeTrustEntry(Base):
+    """SPIFFE trust fabric for workload identity and mTLS."""
+
+    __tablename__ = "spiffe_trust_entries"
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    spiffe_id = Column(String(512), nullable=False, unique=True)
+    workload_class = Column(String(32), nullable=False)
+    trust_domain = Column(String(255), nullable=False)
+    parent_spiffe_id = Column(String(512), nullable=True)
+    selectors = Column(JSON, nullable=True)
+    ttl_seconds = Column(Integer, nullable=False, server_default='3600')
+    active = Column(Boolean, nullable=False, server_default='true')
+    created_at = Column(
+        DateTime(timezone=True),
+        nullable=False,
+        default=lambda: datetime.now(timezone.utc),
+    )
+    updated_at = Column(
+        DateTime(timezone=True),
+        nullable=False,
+        default=lambda: datetime.now(timezone.utc),
+    )
+
+    __table_args__ = (
+        Index("ix_spiffe_trust_entries_workload_class", "workload_class"),
+        Index("ix_spiffe_trust_entries_trust_domain", "trust_domain"),
+        Index("ix_spiffe_trust_entries_active", "active"),
+        {"extend_existing": True},
+    )
+
+
+class JoinerSecret(Base):
+    """Encrypted joiner secrets for cross-biome initialization and data sharing."""
+
+    __tablename__ = "joiner_secrets"
+
+    id = Column(UUID(), primary_key=True)
+    cluster_id = Column(UUID(), nullable=False)
+    tenant_id = Column(String(255), nullable=False, server_default="__default__")
+    biome_kind = Column(String(64), nullable=False)
+    egg_kind = synonym("biome_kind")
+    emitter_biome_id = Column(Integer, ForeignKey("biomes.id", ondelete="RESTRICT"), nullable=False)
+    emitter_node_id = Column(Integer, ForeignKey("nodes.id", ondelete="SET NULL"), nullable=True)
+    extractor_name = Column(String(255), nullable=False)
+    scope = Column(String(16), nullable=False)
+    ciphertext = Column(LargeBinary, nullable=False)
+    iv = Column(LargeBinary(length=12), nullable=False)
+    auth_tag = Column(LargeBinary(length=16), nullable=False)
+    dek_wrapped = Column(LargeBinary, nullable=False)
+    vault_kek_name = Column(String(255), nullable=False)
+    ttl_seconds = Column(Integer, nullable=True)
+    expires_at = Column(DateTime(timezone=True), nullable=True)
+    rotation_class = Column(String(64), nullable=True)
+    created_at = Column(
+        DateTime(timezone=True),
+        nullable=False,
+        default=lambda: datetime.now(timezone.utc),
+    )
+    rotated_at = Column(DateTime(timezone=True), nullable=True)
+    revoked_at = Column(DateTime(timezone=True), nullable=True)
+    audit_event_id = Column(UUID(), ForeignKey("audit_events.id", ondelete="SET NULL"), nullable=True)
+
+    __table_args__ = (
+        Index("ix_joiner_secrets_cluster_egg_extractor", "cluster_id", "biome_kind", "extractor_name"),
+        Index("ix_joiner_secrets_expires_at", "expires_at"),
+        Index("ix_joiner_secrets_tenant_id", "tenant_id"),
+        {"extend_existing": True},
+    )
+
+
+# =============================================================================
+# Audit & Observability Tables
+# =============================================================================
+
+
+class AuditEvent(Base):
+    """Audit log with hash-chain integrity for compliance."""
+
+    __tablename__ = "audit_events"
+
+    id = Column(UUID(), primary_key=True)
+    ts = Column(DateTime(timezone=True), nullable=False)
+    cluster_id = Column(String(255), nullable=False)
+    tenant_id = Column(String(255), nullable=True)
+    actor_sub = Column(String(512), nullable=False)
+    actor_scope = Column(JSON, nullable=True)
+    action = Column(String(255), nullable=False)
+    resource_kind = Column(String(64), nullable=False)
+    resource_id = Column(String(255), nullable=True)
+    before_json = Column(JSON, nullable=True)
+    after_json = Column(JSON, nullable=True)
+    request_id = Column(String(255), nullable=True)
+    source_ip = Column(String(45), nullable=True)
+    user_agent = Column(String(512), nullable=True)
+    prev_hash = Column(LargeBinary(length=32), nullable=False)
+    hash = Column(LargeBinary(length=32), nullable=False)
+    signature = Column(LargeBinary, nullable=True)
+
+    __table_args__ = (
+        Index("ix_audit_events_ts", "ts"),
+        Index("ix_audit_events_cluster_id_ts", "cluster_id", "ts"),
+        Index("ix_audit_events_tenant_id_ts", "tenant_id", "ts"),
+        Index("ix_audit_events_actor_sub", "actor_sub"),
+        Index("ix_audit_events_action", "action"),
+        Index("ix_audit_events_request_id", "request_id"),
+        {"extend_existing": True},
+    )
+
+
+class MigrationEvent(Base):
+    """Biome migration tracking with safety checks and outcomes."""
+
+    __tablename__ = "migration_events"
+
+    id = Column(UUID(), primary_key=True)
+    tenant_id = Column(String(255), nullable=False, server_default="__default__")
+    biome_instance_id = Column(Integer, ForeignKey("node_egg_assignments.id", ondelete="SET NULL"), nullable=True)
+    biome_id = Column(Integer, nullable=True)
+    biome_kind = Column(String(64), nullable=True)
+    src_node_id = Column(Integer, ForeignKey("nodes.id", ondelete="SET NULL"), nullable=True)
+    dst_node_id = Column(Integer, ForeignKey("nodes.id", ondelete="SET NULL"), nullable=True)
+    reason = Column(String(512), nullable=True)
+    result = Column(String(32), nullable=False)
+    rejection_reason = Column(String(255), nullable=True)
+    safety_check_details_json = Column(JSON, nullable=True)
+    started_at = Column(
+        DateTime(timezone=True),
+        nullable=False,
+        default=lambda: datetime.now(timezone.utc),
+    )
+    completed_at = Column(DateTime(timezone=True), nullable=True)
+    duration_seconds = Column(Integer, nullable=True)
+
+    __table_args__ = (
+        Index("ix_migration_events_biome_instance_id", "biome_instance_id"),
+        Index("ix_migration_events_src_node_id", "src_node_id"),
+        Index("ix_migration_events_dst_node_id", "dst_node_id"),
+        Index("ix_migration_events_tenant_id", "tenant_id"),
+        Index("ix_migration_events_started_at", "started_at"),
+        Index("ix_migration_events_result", "result"),
+        {"extend_existing": True},
+    )
+
+
+class MigrationPolicy(Base):
+    """Cluster-level migration policy for automated workload balancing."""
+
+    __tablename__ = "migration_policy"
+
+    id = Column(UUID(), primary_key=True)
+    cluster_id = Column(UUID(), nullable=False, unique=True)
+    enabled = Column(Boolean, nullable=False, server_default='false')
+    evaluation_interval_seconds = Column(Integer, nullable=False, server_default='300')
+    min_healthy_nodes = Column(Integer, nullable=False, server_default='3')
+    max_concurrent_migrations = Column(Integer, nullable=False, server_default='1')
+    require_target_capacity_headroom_cpu_pct = Column(Integer, nullable=False, server_default='20')
+    require_target_capacity_headroom_mem_pct = Column(Integer, nullable=False, server_default='20')
+    require_target_capacity_headroom_disk_pct = Column(Integer, nullable=False, server_default='15')
+    rollback_on_destination_failure = Column(Boolean, nullable=False, server_default='true')
+    rollback_window_seconds = Column(Integer, nullable=False, server_default='300')
+    forbid_migration_during_partition = Column(Boolean, nullable=False, server_default='true')
+    forbid_migration_during_maintenance = Column(Boolean, nullable=False, server_default='true')
+    waddleai_risk_threshold = Column(Float, nullable=False, server_default='0.75')
+    capacity_forecast_horizon_days = Column(Integer, nullable=False, server_default='7')
+    created_at = Column(
+        DateTime(timezone=True),
+        nullable=False,
+        default=lambda: datetime.now(timezone.utc),
+    )
+    updated_at = Column(
+        DateTime(timezone=True),
+        nullable=False,
+        default=lambda: datetime.now(timezone.utc),
+    )
+
+    __table_args__ = (
+        Index("ix_migration_policy_cluster_id", "cluster_id"),
+        {"extend_existing": True},
+    )
+
+
+class LeaderLease(Base):
+    """Distributed leader election lease for HA control plane."""
+
+    __tablename__ = "leader_leases"
+
+    lease_name = Column(String(255), primary_key=True)
+    holder_id = Column(String(255), nullable=True)
+    acquired_at = Column(DateTime(timezone=True), nullable=True)
+    expires_at = Column(DateTime(timezone=True), nullable=True)
+    version = Column(Integer, nullable=False, server_default='0')
+
+    __table_args__ = (
+        Index("ix_leader_leases_expires_at", "expires_at"),
+        {"extend_existing": True},
+    )
+
+
+class DrDrill(Base):
+    """Disaster recovery drill tracking with RTO/RPO measurement."""
+
+    __tablename__ = "dr_drills"
+
+    id = Column(UUID(), primary_key=True)
+    cluster_id = Column(UUID(), nullable=False)
+    tenant_id = Column(String(255), nullable=False, server_default="__default__")
+    started_at = Column(
+        DateTime(timezone=True),
+        nullable=False,
+        default=lambda: datetime.now(timezone.utc),
+    )
+    completed_at = Column(DateTime(timezone=True), nullable=True)
+    status = Column(String(16), nullable=False)
+    target = Column(String(64), nullable=False, server_default="staging-clone")
+    rpo_observed_seconds = Column(Integer, nullable=True)
+    rto_observed_seconds = Column(Integer, nullable=True)
+    error_message = Column(String(2048), nullable=True)
+    audit_ref = Column(UUID(), ForeignKey("audit_events.id", ondelete="SET NULL"), nullable=True)
+    triggered_by = Column(String(255), nullable=True)
+
+    __table_args__ = (
+        Index("ix_dr_drills_cluster_started", "cluster_id", "started_at"),
+        Index("ix_dr_drills_status", "status"),
+        Index("ix_dr_drills_tenant", "tenant_id"),
+        {"extend_existing": True},
+    )
+
+
+class SloDefinition(Base):
+    """Service-level objective definitions for SLO tracking and alerting."""
+
+    __tablename__ = "slo_definitions"
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    cluster_id = Column(UUID(), nullable=False)
+    tenant_id = Column(String(255), nullable=True)
+    slo_name = Column(String(128), nullable=False)
+    domain = Column(String(32), nullable=False)
+    target_value = Column(Float, nullable=False)
+    target_unit = Column(String(16), nullable=False)
+    window_seconds = Column(Integer, nullable=False, server_default='2592000')
+    error_budget_seconds = Column(Integer, nullable=True)
+    alert_threshold_burn_rate = Column(Float, nullable=False, server_default='2.0')
+    runbook_url = Column(String(1024), nullable=True)
+    created_at = Column(
+        DateTime(timezone=True),
+        nullable=False,
+        default=lambda: datetime.now(timezone.utc),
+    )
+    updated_at = Column(
+        DateTime(timezone=True),
+        nullable=False,
+        default=lambda: datetime.now(timezone.utc),
+    )
+
+    __table_args__ = (
+        UniqueConstraint("cluster_id", "tenant_id", "slo_name", name="uq_slo_cluster_tenant_name"),
+        Index("ix_slo_cluster", "cluster_id"),
+        Index("ix_slo_name", "slo_name"),
+        {"extend_existing": True},
+    )
+
+
+# =============================================================================
+# Node Progress Events Table
+# =============================================================================
+
+
+class NodeEvent(Base):
+    """Structured progress event from discovery agent or cloud-init runcmd.
+
+    Written by ``POST /api/v1/nodes/{id}/events`` and republished to the
+    NATS subject ``gough.node.{id}.events``.  The ``sequence_id`` field is
+    set by the agent to detect replay / gaps on tunnel resume.
+    """
+
+    __tablename__ = "node_events"
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    node_id = Column(Integer, ForeignKey("nodes.id", ondelete="CASCADE"), nullable=False)
+    tenant_id = Column(String(255), nullable=False, server_default="__default__")
+    ts = Column(
+        DateTime(timezone=True),
+        nullable=False,
+        default=lambda: datetime.now(timezone.utc),
+    )
+    stage = Column(String(255), nullable=False)
+    message = Column(String(4096), nullable=False)
+    progress_pct = Column(Integer, nullable=True)
+    sequence_id = Column(BigInteger, nullable=True)
+    raw_json = Column(JSON, nullable=True)
+    created_at = Column(
+        DateTime(timezone=True),
+        nullable=False,
+        default=lambda: datetime.now(timezone.utc),
+    )
+
+    __table_args__ = (
+        Index("ix_node_events_node_id", "node_id"),
+        Index("ix_node_events_tenant_id", "tenant_id"),
+        Index("ix_node_events_ts", "ts"),
+        Index("ix_node_events_stage", "stage"),
+        {"extend_existing": True},
+    )
+
+
+# =============================================================================
+# Backward-compat aliases
+# =============================================================================
+
+NodeEggAssignment = NodeBiomeAssignment

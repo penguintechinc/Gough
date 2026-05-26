@@ -101,7 +101,7 @@ async def list_enrollment_keys():
         200: List of enrollment keys
     """
     db = get_db()
-    include_used = (await request.args).get("include_used", "false").lower() == "true"
+    include_used = request.args.get("include_used", "false").lower() == "true"
 
     query = db.enrollment_keys.id > 0
     if not include_used:
@@ -186,7 +186,7 @@ async def enroll_agent():
         409: Enrollment key already used
     """
     # Get enrollment key from header
-    enrollment_key = (await request.headers).get("X-Enrollment-Key")
+    enrollment_key = request.headers.get("X-Enrollment-Key")
     if not enrollment_key:
         return jsonify({"error": "Enrollment key required"}), 401
 
@@ -300,7 +300,7 @@ async def refresh_agent_token():
         401: Invalid or expired refresh token
     """
     # Get refresh token from header
-    auth_header = (await request.headers).get("Authorization", "")
+    auth_header = request.headers.get("Authorization", "")
     if not auth_header.startswith("Bearer "):
         return jsonify({"error": "Authorization header required"}), 401
 
@@ -420,7 +420,7 @@ async def list_agents():
     """
     db = get_db()
 
-    status_filter = (await request.args).get("status")
+    status_filter = request.args.get("status")
 
     query = db.access_agents.id > 0
     if status_filter:
@@ -623,7 +623,7 @@ async def _validate_agent_token() -> Optional[str]:
     Returns:
         Agent ID if valid, None otherwise
     """
-    auth_header = (await request.headers).get("Authorization", "")
+    auth_header = request.headers.get("Authorization", "")
     if not auth_header.startswith("Bearer "):
         return None
 

@@ -137,6 +137,15 @@ test-integration: ## Testing - Run integration tests
 test-coverage: ## Testing - Generate coverage reports
 	@$(MAKE) test
 	@echo "$(GREEN)Coverage reports generated:$(RESET)"
+
+openapi: ## Other - Regenerate OpenAPI 3.1 spec from blueprints
+	@echo "$(BLUE)Regenerating OpenAPI spec...$(RESET)"
+	@cd services/api-manager && python -m app.openapi_export
+	@echo "$(GREEN)OpenAPI spec updated at docs/api/openapi.json$(RESET)"
+
+openapi-check: ## Other - Validate OpenAPI spec matches source (CI gate)
+	@echo "$(BLUE)Checking OpenAPI spec is up to date...$(RESET)"
+	@cd services/api-manager && python -m app.openapi_export --check
 	@echo "  Go: coverage-go.out"
 	@echo "  Python: coverage-python.xml, htmlcov-python/"
 	@echo "  Node.js: coverage/"
@@ -152,6 +161,10 @@ smoke-test-quick: ## Testing - Run alpha smoke tests (skip builds)
 smoke-test-beta: ## Testing - Run beta smoke tests against staging
 	@echo "$(BLUE)Running beta smoke tests against https://gough.penguintech.io...$(RESET)"
 	@./tests/smoke/run-smoke-tests.sh beta
+
+# Protocol Buffer Commands
+proto: ## Build - Regenerate gRPC stubs from proto/v1/
+	cd proto && buf generate
 
 # Build Commands
 build: ## Build - Build all applications
@@ -431,7 +444,14 @@ env: ## Info - Show environment variables
 
 # Missing Standard Targets (Standards Compliance)
 test-unit: ## Testing - Run unit tests
-	@$(MAKE) test
+	@echo "$(BLUE)Running unit tests...$(RESET)"
+	@cd services/api-manager && python3 -m pytest tests/unit/ --cov=app --cov-report=xml --cov-fail-under=90
+	@echo "$(GREEN)Unit tests completed$(RESET)"
+
+test-integration: ## Testing - Run integration tests
+	@echo "$(BLUE)Running integration tests...$(RESET)"
+	@cd services/api-manager && python3 -m pytest tests/integration/ --cov=app --cov-report=xml --cov-fail-under=90
+	@echo "$(GREEN)Integration tests completed$(RESET)"
 
 test-functional: ## Testing - Run functional tests
 	@echo "$(YELLOW)No functional tests defined$(RESET)"
@@ -445,6 +465,47 @@ test-security: ## Testing - Run security scans (full suite)
 	@npm audit 2>/dev/null || true
 	@cd services/webui && npm audit 2>/dev/null || true
 	@if command -v gitleaks >/dev/null 2>&1; then echo "$(YELLOW)-- gitleaks --$(RESET)"; gitleaks detect --source . --no-git 2>/dev/null || true; fi
+
+test-workers: ## Testing - Run worker tests
+	@echo "$(BLUE)Running worker tests...$(RESET)"
+	@cd services/api-manager && python3 -m pytest tests/workers/ --cov=app --cov-fail-under=90
+	@echo "$(GREEN)Worker tests completed$(RESET)"
+
+test-api: ## Testing - Run API tests
+	@echo "$(BLUE)Running API tests...$(RESET)"
+	@cd services/api-manager && python3 -m pytest tests/api/ -v
+	@echo "$(GREEN)API tests completed$(RESET)"
+
+test-e2e: ## Testing - Run E2E tests
+	@echo "$(BLUE)Running E2E tests...$(RESET)"
+	@python3 -m pytest tests/e2e/ -v
+	@echo "$(GREEN)E2E tests completed$(RESET)"
+
+test-e2e-sim: ## Testing - Run M1 E2E test suite (sim nodes)
+	@echo "$(BLUE)Running M1 E2E test suite...$(RESET)"
+	@python3 -m pytest tests/e2e/m1/ -v -m sim
+	@echo "$(GREEN)E2E sim tests completed$(RESET)"
+
+test-e2e-lab: ## Testing - Run E2E on lab cluster (requires self-hosted runner)
+	@echo "$(BLUE)Running E2E tests on lab cluster...$(RESET)"
+	@echo "$(YELLOW)Note: This requires self-hosted lab setup$(RESET)"
+	@python3 -m pytest tests/e2e/ -v -k "not real_hw" --tb=short -x
+
+test-discovery-agent: ## Testing - Run Go discovery-agent tests
+	@echo "$(BLUE)Running discovery-agent tests...$(RESET)"
+	@cd services/discovery-agent && go test -v -race -cover ./...
+	@echo "$(GREEN)Discovery-agent tests completed$(RESET)"
+
+deploy-alpha: ## Deploy - Deploy to local-alpha context (Kustomize)
+	@echo "$(BLUE)Deploying to alpha (local-alpha context)...$(RESET)"
+	@kubectl kustomize k8s/kustomize/overlays/alpha | kubectl apply --context local-alpha -f -
+	@echo "$(GREEN)Alpha deployment complete$(RESET)"
+
+deploy-alpha-clean: ## Deploy - Clean deploy to alpha (delete namespace first)
+	@echo "$(RED)Cleaning alpha namespace...$(RESET)"
+	@kubectl delete namespace gough --context local-alpha --ignore-not-found=true
+	@sleep 2
+	@$(MAKE) deploy-alpha
 
 deploy-dev: ## Deploy - Deploy to dev environment (alias to deploy-staging)
 	@$(MAKE) deploy-staging

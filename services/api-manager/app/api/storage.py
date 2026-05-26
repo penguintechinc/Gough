@@ -8,7 +8,9 @@ from __future__ import annotations
 
 import json
 import logging
+import uuid
 from datetime import datetime
+from typing import Optional, Any
 
 from quart import Blueprint, jsonify, request
 
@@ -23,10 +25,26 @@ from ..services.storage import (
     StorageValidationError,
     get_storage_service,
 )
+from ._helpers import envelope_success, err_bad_request, err_not_found
 
 log = logging.getLogger(__name__)
 
 storage_bp = Blueprint("storage", __name__)
+
+
+def _user_has_scope(scope: str) -> bool:
+    """Check if current user has a specific scope."""
+    from ..middleware import get_current_user
+    user = get_current_user() or {}
+    payload = user.get("_jwt_payload") or {}
+    raw = payload.get("scope", "")
+    if isinstance(raw, list):
+        scopes = {s for s in raw if isinstance(s, str)}
+    elif isinstance(raw, str):
+        scopes = set(raw.split())
+    else:
+        scopes = set()
+    return scope in scopes
 
 
 @storage_bp.route("/configs", methods=["GET"])
@@ -598,3 +616,139 @@ async def delete_object(object_key: str):
         return jsonify({"error": "Storage configuration not found"}), 404
     except StorageError as e:
         return jsonify({"error": str(e)}), 400
+
+
+# ============================================================================
+# Storage Quotas (Plan 5)
+# ============================================================================
+
+
+@storage_bp.route("/quotas", methods=["GET"])
+@require_auth
+async def list_storage_quotas():
+    """List storage quotas.
+
+    Spec: ``GET /api/v1/storage/quotas``
+    Scope: ``gough.storage.read``
+
+    Query Parameters:
+        tenant_id: Filter by tenant (optional)
+
+    Returns:
+        200: List of storage quotas with pagination metadata
+    """
+    if not _user_has_scope("gough.storage.read"):
+        return jsonify({"error": "Insufficient scope: gough.storage.read required"}), 403
+
+    db = get_db()
+
+    # Parse query parameters
+    tenant_id_filter = request.args.get("tenant_id", None)
+
+    # Build query
+    query = db(db.storage_quotas)
+    if tenant_id_filter:
+        query = query(db.storage_quotas.tenant_id == tenant_id_filter)
+
+    # Fetch all quotas
+    quotas_rows = query.select(orderby=~db.storage_quotas.created_at)
+
+    quotas = []
+    for row in quotas_rows:
+        quotas.append({
+            "id": str(row.id),
+            "tenant_id": row.tenant_id,
+            "resource_type": row.resource_type,
+            "limit_value": float(row.limit_value) if row.limit_value else None,
+            "used_value": float(row.used_value) if row.used_value else None,
+            "unit": row.unit,
+            "created_at": row.created_at.isoformat() if row.created_at else None,
+            "updated_at": row.updated_at.isoformat() if row.updated_at else None,
+        })
+
+    return envelope_success({
+        "quotas": quotas,
+        "total": len(quotas),
+    })
+
+
+@storage_bp.route("/quota-request", methods=["POST"])
+@require_auth
+async def request_storage_quota():
+    """Request a storage quota increase.
+
+    Spec: ``POST /api/v1/storage/quota-request``
+    Scope: ``gough.storage.write``
+
+    Request Body:
+        tenant_id: Tenant ID (required)
+        resource_type: Type of resource (e.g., "storage", "bandwidth", "buckets") (required)
+        requested_value: Requested quota value (required)
+        unit: Unit of measurement (e.g., "GB", "TB", "count") (required)
+        justification: Reason for the request (required)
+
+    Returns:
+        201: Quota request created
+        400: Invalid request
+    """
+    if not _user_has_scope("gough.storage.write"):
+        return jsonify({"error": "Insufficient scope: gough.storage.write required"}), 403
+
+    data = await request.get_json(silent=True)
+    if not data:
+        return err_bad_request("JSON body required")
+
+    # Validate required fields
+    required_fields = ["tenant_id", "resource_type", "requested_value", "unit", "justification"]
+    for field in required_fields:
+        if field not in data or not data.get(field):
+            return err_bad_request(f"Required field missing: {field}")
+
+    tenant_id = data.get("tenant_id", "").strip()
+    resource_type = data.get("resource_type", "").strip()
+    requested_value = data.get("requested_value")
+    unit = data.get("unit", "").strip()
+    justification = data.get("justification", "").strip()
+
+    # Validate requested_value is numeric
+    try:
+        requested_value = float(requested_value)
+    except (ValueError, TypeError):
+        return err_bad_request("requested_value must be a number")
+
+    db = get_db()
+
+    try:
+        request_id = str(uuid.uuid4())
+        now = datetime.utcnow()
+
+        db.storage_quota_requests.insert(
+            id=request_id,
+            tenant_id=tenant_id,
+            resource_type=resource_type,
+            requested_value=requested_value,
+            unit=unit,
+            justification=justification,
+            status="pending",
+            created_at=now,
+            updated_at=now,
+        )
+        db.commit()
+
+        return envelope_success(
+            {
+                "id": request_id,
+                "tenant_id": tenant_id,
+                "resource_type": resource_type,
+                "requested_value": requested_value,
+                "unit": unit,
+                "justification": justification,
+                "status": "pending",
+                "created_at": now.isoformat(),
+            },
+            status_code=201,
+        )
+    except Exception as exc:  # noqa: BLE001
+        db.rollback()
+        log.exception("Error creating storage quota request: %s", exc)
+        return jsonify({"error": f"Internal server error: {str(exc)}"}), 500

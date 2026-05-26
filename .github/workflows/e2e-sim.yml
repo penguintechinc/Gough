@@ -1,0 +1,118 @@
+name: M1 E2E Sim Tests
+
+on:
+  pull_request:
+    branches:
+      - main
+      - release/**
+  push:
+    branches:
+      - main
+  schedule:
+    - cron: '0 2 * * *'
+
+concurrency:
+  group: e2e-sim-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  m1-e2e-sim:
+    name: M1 E2E Test Suite (Sim Nodes)
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+
+    services:
+      postgres:
+        image: postgres:16-bookworm@sha256:eb4ac32d996dc71f9dd35a6e74cfa69f7c6ea1dd5d9db7e0d844c5d5f4f7c9a7
+        env:
+          POSTGRES_PASSWORD: test
+          POSTGRES_DB: gough_test
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+        ports:
+          - 5432:5432
+
+      redis:
+        image: redis:7-bookworm@sha256:7b0b7e4e56e7e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5
+        options: >-
+          --health-cmd "redis-cli ping"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+        ports:
+          - 6379:6379
+
+    env:
+      POSTGRES_HOST: localhost
+      POSTGRES_PORT: 5432
+      POSTGRES_DB: gough_test
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: test
+      REDIS_HOST: localhost
+      REDIS_PORT: 6379
+      GOUGH_TEST_ENV: ci
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@11bd71901afe3a723c28c3d6cea3592b4f39eb4d
+
+      - name: Setup Python
+        uses: actions/setup-python@0b93645e9adb9a8c94953d7b30eac1d4e5df78ea
+        with:
+          python-version: '3.13'
+          cache: 'pip'
+
+      - name: Setup Go
+        uses: actions/setup-go@3041bf56c941b39c61721a86cd11f3807dc6fea5
+        with:
+          go-version: '1.24.2'
+          cache: 'go'
+
+      - name: Install system dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            qemu-system-x86-64 \
+            qemu-utils \
+            libvirt-daemon \
+            libvirt-clients \
+            virt-manager \
+            lxd \
+            build-essential
+
+      - name: Initialize LXD
+        run: |
+          sudo lxd init --auto
+          sudo usermod -a -G lxd $USER
+          sg lxd -c 'lxc version'
+
+      - name: Install Python dependencies
+        run: |
+          pip install -q pytest pytest-timeout pytest-xdist requests
+          pip install -r tests/requirements.txt
+
+      - name: Run M1 E2E tests
+        run: |
+          python -m pytest tests/e2e/m1/ \
+            -v \
+            --tb=short \
+            --timeout=300 \
+            -x
+        env:
+          PYTEST_TIMEOUT: 300
+
+      - name: Cleanup sim nodes
+        if: always()
+        run: |
+          bash dev-tools/node-sim/cleanup.sh /tmp/gough-qemu || true
+
+      - name: Upload test results
+        if: always()
+        uses: actions/upload-artifact@4cec3d8aa96464d8d3ebed7a726ea9d3e90b5a13
+        with:
+          name: e2e-test-results
+          path: /tmp/e2e-results.log
+          retention-days: 7

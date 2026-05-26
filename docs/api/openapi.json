@@ -1,0 +1,116 @@
+{
+  "openapi": "3.1.0",
+  "info": {
+    "title": "Gough API Manager",
+    "version": "1.0.0",
+    "description": "Operator and SDK-facing REST API for the Gough platform. Cluster-internal RPCs use gRPC over mTLS on port 50051; this REST surface is reserved for human operators and SDK clients.",
+    "license": {
+      "name": "Proprietary"
+    }
+  },
+  "servers": [
+    {
+      "url": "https://{host}",
+      "variables": {
+        "host": {
+          "default": "gough.localhost.local"
+        }
+      }
+    }
+  ],
+  "paths": {},
+  "components": {
+    "securitySchemes": {
+      "bearerAuth": {
+        "type": "http",
+        "scheme": "bearer",
+        "bearerFormat": "JWT",
+        "description": "OIDC user/machine JWT. Tenant claim mandatory; scopes drive authorization decisions."
+      },
+      "mutualTLS": {
+        "type": "mutualTLS",
+        "description": "SPIFFE SVID over mTLS for service-to-service traffic on the internal gRPC plane (also accepted on REST for cluster-internal calls)."
+      },
+      "oneTimeToken": {
+        "type": "apiKey",
+        "in": "header",
+        "name": "X-Bootstrap-Token",
+        "description": "Vault-transit-signed JWT, 10-minute TTL, single-use Redis nonce. Used only during node joiner bootstrap before SVID issuance."
+      }
+    },
+    "schemas": {
+      "SuccessEnvelope": {
+        "type": "object",
+        "required": [
+          "status",
+          "data"
+        ],
+        "properties": {
+          "status": {
+            "type": "string",
+            "enum": [
+              "success",
+              "error"
+            ]
+          },
+          "data": {},
+          "meta": {
+            "type": "object",
+            "properties": {
+              "version": {
+                "type": "integer"
+              },
+              "timestamp": {
+                "type": "string",
+                "format": "date-time"
+              },
+              "request_id": {
+                "type": "string"
+              }
+            }
+          }
+        }
+      },
+      "Error": {
+        "type": "object",
+        "required": [
+          "status",
+          "error"
+        ],
+        "properties": {
+          "status": {
+            "type": "string",
+            "const": "error"
+          },
+          "error": {
+            "type": "string"
+          },
+          "code": {
+            "type": "string",
+            "enum": [
+              "invalid_request",
+              "unauthenticated",
+              "tenant_claim_missing",
+              "forbidden_scope",
+              "not_found",
+              "conflict",
+              "locked",
+              "rate_limited",
+              "internal_error",
+              "dependency_unavailable"
+            ]
+          },
+          "detail": {
+            "type": "string"
+          }
+        }
+      }
+    }
+  },
+  "security": [
+    {
+      "bearerAuth": []
+    }
+  ],
+  "tags": []
+}

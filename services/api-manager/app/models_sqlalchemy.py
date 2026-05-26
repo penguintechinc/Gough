@@ -147,6 +147,27 @@ class EncryptedSecret(Base):
     updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
 
 
+class BootstrapNonce(Base):
+    """One-time iPXE bootstrap JWT nonce store (Redis fallback).
+
+    Populated by `app.api.ipxe._register_bootstrap_nonce` whenever the runtime
+    Redis client is unavailable; consumed by
+    `app.security.credentials.validate_one_time_bootstrap_token` for replay
+    rejection. Rows are short-lived (TTL = JWT exp).
+    """
+
+    __tablename__ = "bootstrap_nonces"
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    nonce = Column(String(128), unique=True, nullable=False)
+    mac = Column(String(17), nullable=False, index=True)
+    phase = Column(String(16), nullable=False)
+    used = Column(Boolean, default=False, nullable=False)
+    issued_at = Column(DateTime, default=datetime.utcnow, nullable=False)
+    expires_at = Column(DateTime, nullable=False, index=True)
+    used_at = Column(DateTime, nullable=True)
+
+
 # =============================================================================
 # Storage Configuration Tables
 # =============================================================================
@@ -741,6 +762,9 @@ def create_all_tables(db_uri: str):
     from sqlalchemy.orm import sessionmaker
     import uuid
     import bcrypt
+
+    # Register M1 ORM classes on Base.metadata
+    from . import models_m1  # noqa: E402,F401
 
     engine = get_sqlalchemy_engine(db_uri)
     Base.metadata.create_all(engine)

@@ -118,13 +118,46 @@ def get_db() -> DB:
     return g.db
 
 
+def get_user_by_id(user_id: int) -> dict | None:
+    """Look up a user by primary key; returns dict or None."""
+    db = get_db()
+    if db is None:
+        return None
+    try:
+        row = db.auth_user(user_id)
+        if not row:
+            return None
+        return {
+            "id": int(row.id),
+            "email": str(row.email),
+            "full_name": str(row.full_name) if hasattr(row, "full_name") else None,
+            "active": bool(row.active),
+            "role": _get_user_role(db, int(row.id)),
+        }
+    except Exception:
+        return None
+
+
+def _get_user_role(db: DB, user_id: int) -> str:
+    """Return the first role name for a user, defaulting to 'viewer'."""
+    try:
+        join = db(db.auth_user_roles.user_id == user_id).select().first()
+        if join:
+            role = db.auth_role(join.role_id)
+            if role:
+                return str(role.name)
+    except Exception:
+        pass
+    return "viewer"
+
+
 # Export iPXE constants
 from .ipxe import (
     DHCP_MODES,
     BOOT_MODES,
     ARCHITECTURES,
     POWER_TYPES,
-    EGG_TYPES,
+    BIOME_TYPES,
     IMAGE_TYPES,
     DEPLOYMENT_STATUSES,
     BOOT_EVENT_TYPES,
@@ -134,6 +167,7 @@ from .ipxe import (
 __all__ = [
     "init_db",
     "get_db",
+    "get_user_by_id",
     "VALID_ROLES",
     "CLOUD_PROVIDER_TYPES",
     "SECRETS_BACKEND_TYPES",
@@ -143,7 +177,7 @@ __all__ = [
     "BOOT_MODES",
     "ARCHITECTURES",
     "POWER_TYPES",
-    "EGG_TYPES",
+    "BIOME_TYPES",
     "IMAGE_TYPES",
     "DEPLOYMENT_STATUSES",
     "BOOT_EVENT_TYPES",

@@ -26,8 +26,8 @@ ingress:
 
 httproute:
   enabled: true
-  gatewayName: shared
-  gatewayNamespace: gateway
+  gatewayName: dal2-gateway
+  gatewayNamespace: cilium-gateway
   host: "gough.penguintech.cloud"
   rules:
     - path: /

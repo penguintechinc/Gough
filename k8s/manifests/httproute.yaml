@@ -5,8 +5,8 @@ metadata:
   namespace: gough
 spec:
   parentRefs:
-    - name: shared
-      namespace: gateway
+    - name: dal2-gateway
+      namespace: cilium-gateway
       sectionName: https
   hostnames:
     - "gough.penguintech.cloud"

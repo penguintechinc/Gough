@@ -1,0 +1,549 @@
+"""Tests for ``app.api.audit`` blueprint.
+
+Covers:
+- list events with tenant + filter scoping (since/until/actor/action/etc)
+- format=json vs format=jsonl
+- cursor pagination + invalid cursor
+- cluster_id filter requires gough.cluster.superadmin
+- verify endpoint: clean chain returns 0 breaks; tampered chain
+  triggers Prometheus counter increment
+- export endpoint: scope + MFA enforcement, JSONL stream format,
+  Vault-transit footer signature, ``audit.log.export`` self-audit, and
+  ``gough.audit.exported`` NATS publish
+"""
+
+from __future__ import annotations
+
+import base64
+import importlib
+import json
+import uuid
+from dataclasses import dataclass, field
+from datetime import datetime, timezone
+from typing import Any, Optional
+from unittest.mock import MagicMock
+
+import pytest
+from quart import Quart, g
+
+from app.api import audit as audit_module
+from app.api.audit import (
+    DEFAULT_MFA_REQUIRED_LANES,
+    _serialize_audit_event,
+    _stream_audit_events_jsonl,
+    audit_bp,
+    audit_chain_break_total,
+)
+from app.security.credentials import CredentialType, Principal
+from app.security.tenant import TenantContext
+
+
+# =============================================================================
+# Fixtures
+# =============================================================================
+
+
+@dataclass
+class FakeAuditRow:
+    """Stand-in for SQLAlchemy AuditEvent ORM row."""
+
+    id: uuid.UUID
+    ts: datetime
+    cluster_id: str
+    tenant_id: Optional[str]
+    actor_sub: str
+    actor_scope: list[str]
+    action: str
+    resource_kind: str
+    resource_id: Optional[str] = None
+    before_json: Optional[dict] = None
+    after_json: Optional[dict] = None
+    request_id: Optional[str] = None
+    source_ip: Optional[str] = None
+    user_agent: Optional[str] = None
+    prev_hash: bytes = field(default=b"\x00" * 32)
+    hash: bytes = field(default=b"\x11" * 32)
+    signature: Optional[bytes] = None
+
+
+def _make_row(**overrides: Any) -> FakeAuditRow:
+    base = dict(
+        id=uuid.uuid4(),
+        ts=datetime.now(timezone.utc),
+        cluster_id="test-cluster",
+        tenant_id="acme",
+        actor_sub="alice@acme",
+        actor_scope=["gough.audit.read"],
+        action="joiner.secret.emit",
+        resource_kind="joiner_secret",
+        resource_id=str(uuid.uuid4()),
+    )
+    base.update(overrides)
+    return FakeAuditRow(**base)
+
+
+class FakeQuery:
+    def __init__(self, rows: list[Any]) -> None:
+        self._rows = list(rows)
+
+    def filter(self, *_: Any) -> "FakeQuery":
+        return self
+
+    def order_by(self, *_: Any) -> "FakeQuery":
+        return self
+
+    def limit(self, n: int) -> "FakeQuery":
+        self._rows = self._rows[:n]
+        return self
+
+    def yield_per(self, _n: int) -> "FakeQuery":
+        return self
+
+    def all(self) -> list[Any]:
+        return list(self._rows)
+
+    def __iter__(self):
+        return iter(self._rows)
+
+
+class FakeSession:
+    def __init__(self, rows: list[Any]) -> None:
+        self.rows = rows
+
+    def execute(self, *_: Any, **__: Any) -> Any:
+        return MagicMock()
+
+    def query(self, _model: Any) -> FakeQuery:
+        return FakeQuery(self.rows)
+
+    def add(self, _obj: Any) -> None:
+        pass
+
+    def flush(self) -> None:
+        pass
+
+
+def _principal(
+    *,
+    tenant: str = "acme",
+    scopes: Optional[set[str]] = None,
+    mfa: bool = False,
+    sub: str = "alice@acme",
+) -> Principal:
+    claims: dict[str, Any] = {"sub": sub, "tenant": tenant}
+    if mfa:
+        claims["amr"] = ["mfa"]
+    return Principal(
+        cred_type=CredentialType.USER_JWT,
+        sub=sub,
+        tenant_id=tenant,
+        scopes=frozenset(scopes or set()),
+        claims=claims,
+    )
+
+
+def _passthrough_decorator(*dargs, **dkwargs):
+    """Stub that replaces require_scopes with a no-op."""
+    if len(dargs) == 1 and callable(dargs[0]) and not dkwargs:
+        return dargs[0]
+
+    def _wrap(fn):
+        return fn
+
+    return _wrap
+
+
+def _build_app(
+    *,
+    rows: list[Any],
+    principal: Principal,
+    verify_result: Optional[dict[str, Any]] = None,
+    mfa_lane: Optional[str] = None,
+    nats_client: Optional[Any] = None,
+) -> Quart:
+    app = Quart(__name__)
+    app.register_blueprint(audit_bp, url_prefix="/api/v1/audit")
+
+    session = FakeSession(rows)
+
+    vault_client = MagicMock()
+    vault_client.transit_sign.return_value = "vault:v1:export-signature"
+
+    app.config["DB_SESSION_FACTORY"] = lambda: session
+    app.config["VAULT_CLIENT"] = vault_client
+    app.config["CLUSTER_ID"] = "test-cluster"
+    app.config["AUDIT_EXPORT_SIGNING_KEY"] = "gough-audit-export"
+    if mfa_lane is not None:
+        app.config["TENANT_COMPLIANCE_LANE"] = {principal.tenant_id: mfa_lane}
+    if nats_client is not None:
+        app.config["NATS_CLIENT"] = nats_client
+
+    @app.before_request
+    async def _inject_ctx() -> None:
+        g.principal = principal
+        g.current_user = {
+            "_jwt_payload": {
+                "tenant": principal.tenant_id,
+                "scope": " ".join(principal.scopes) if principal.scopes else "",
+                "sub": principal.sub,
+            }
+        }
+        g.tenant_context = TenantContext(tenant_id=principal.tenant_id)
+        g.db_session = session
+
+    if verify_result is not None:
+        # Patch verify_chain at module level for the duration of the app
+        app.config["_verify_result"] = verify_result
+
+    app.config["_session"] = session
+    app.config["_vault"] = vault_client
+    return app
+
+
+# =============================================================================
+# Pure serializer
+# =============================================================================
+
+
+class TestSerializerAuditEvent:
+    def test_serializer_renders_hash_as_b64(self) -> None:
+        row = _make_row(hash=b"\xab" * 32, prev_hash=b"\xcd" * 32)
+        out = _serialize_audit_event(row)
+        assert out["hash_b64"] == base64.b64encode(b"\xab" * 32).decode("ascii")
+        assert out["prev_hash_b64"] == base64.b64encode(b"\xcd" * 32).decode(
+            "ascii"
+        )
+        assert out["signature_b64"] is None
+
+    def test_serializer_includes_actor_scope(self) -> None:
+        row = _make_row(actor_scope=["gough.audit.read", "gough.cluster.read"])
+        out = _serialize_audit_event(row)
+        assert "gough.audit.read" in out["actor_scope"]
+
+
+# =============================================================================
+# GET /events
+# =============================================================================
+
+
+@pytest.mark.asyncio
+class TestListAuditEvents:
+    async def test_list_happy_path(self) -> None:
+        rows = [_make_row(), _make_row(action="cluster_init")]
+        app = _build_app(
+            rows=rows, principal=_principal(scopes={"gough.audit.read"})
+        )
+        client = app.test_client()
+        resp = await client.get("/api/v1/audit/events")
+        assert resp.status_code == 200
+        body = await resp.get_json()
+        assert body["count"] == 2
+
+    async def test_list_format_jsonl(self) -> None:
+        rows = [_make_row(), _make_row()]
+        app = _build_app(
+            rows=rows, principal=_principal(scopes={"gough.audit.read"})
+        )
+        client = app.test_client()
+        resp = await client.get("/api/v1/audit/events?format=jsonl")
+        assert resp.status_code == 200
+        text = (await resp.get_data()).decode("utf-8").strip().splitlines()
+        assert len(text) == 2
+        for line in text:
+            json.loads(line)  # each line must be valid JSON
+
+    async def test_list_invalid_format(self) -> None:
+        app = _build_app(rows=[], principal=_principal(scopes={"gough.audit.read"}))
+        client = app.test_client()
+        resp = await client.get("/api/v1/audit/events?format=xml")
+        assert resp.status_code == 400
+
+    async def test_list_requires_scope(self) -> None:
+        app = _build_app(rows=[], principal=_principal(scopes=set()))
+        client = app.test_client()
+        resp = await client.get("/api/v1/audit/events")
+        assert resp.status_code == 403
+
+    async def test_list_cluster_id_filter_requires_superadmin(self) -> None:
+        app = _build_app(
+            rows=[], principal=_principal(scopes={"gough.audit.read"})
+        )
+        client = app.test_client()
+        resp = await client.get(
+            "/api/v1/audit/events?cluster_id=other-cluster"
+        )
+        assert resp.status_code == 403
+
+    async def test_list_cluster_id_filter_with_superadmin(self) -> None:
+        rows = [_make_row(cluster_id="other-cluster")]
+        app = _build_app(
+            rows=rows,
+            principal=_principal(
+                scopes={"gough.audit.read", "gough.cluster.superadmin"}
+            ),
+        )
+        client = app.test_client()
+        resp = await client.get(
+            "/api/v1/audit/events?cluster_id=other-cluster"
+        )
+        assert resp.status_code == 200
+
+    async def test_list_invalid_cursor(self) -> None:
+        app = _build_app(
+            rows=[], principal=_principal(scopes={"gough.audit.read"})
+        )
+        client = app.test_client()
+        resp = await client.get("/api/v1/audit/events?cursor=not-a-uuid")
+        assert resp.status_code == 400
+
+    async def test_list_filters_dont_500(self) -> None:
+        rows = [_make_row(action="x", actor_sub="bob@acme")]
+        app = _build_app(
+            rows=rows, principal=_principal(scopes={"gough.audit.read"})
+        )
+        client = app.test_client()
+        resp = await client.get(
+            "/api/v1/audit/events?since=2020-01-01T00:00:00Z"
+            "&until=2099-01-01T00:00:00Z"
+            "&actor_sub=bob@acme&action=x"
+            "&resource_kind=joiner_secret&resource_id=abc"
+            "&request_id=req-1"
+        )
+        assert resp.status_code == 200
+
+
+# =============================================================================
+# POST /verify
+# =============================================================================
+
+
+@pytest.mark.asyncio
+class TestVerifyAuditChain:
+    async def test_verify_clean_chain(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setattr(
+            audit_module,
+            "verify_chain",
+            lambda *a, **k: {
+                "rows_checked": 5,
+                "breaks": 0,
+                "first_break_id": None,
+                "last_break_id": None,
+            },
+        )
+        # Reset counter
+        audit_chain_break_total._metrics.clear()
+        app = _build_app(
+            rows=[], principal=_principal(scopes={"gough.audit.read"})
+        )
+        client = app.test_client()
+        resp = await client.post("/api/v1/audit/verify", json={})
+        assert resp.status_code == 200
+        body = await resp.get_json()
+        assert body == {
+            "rows_checked": 5,
+            "breaks": 0,
+            "first_break_id": None,
+            "last_break_id": None,
+        }
+
+    async def test_verify_tampered_increments_counter(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        broken_id = uuid.uuid4()
+        monkeypatch.setattr(
+            audit_module,
+            "verify_chain",
+            lambda *a, **k: {
+                "rows_checked": 10,
+                "breaks": 3,
+                "first_break_id": broken_id,
+                "last_break_id": broken_id,
+            },
+        )
+        audit_chain_break_total._metrics.clear()
+        app = _build_app(
+            rows=[], principal=_principal(scopes={"gough.audit.read"})
+        )
+        client = app.test_client()
+        resp = await client.post(
+            "/api/v1/audit/verify",
+            json={"since": "2020-01-01T00:00:00Z", "to": "2099-01-01T00:00:00Z"},
+        )
+        assert resp.status_code == 200
+        body = await resp.get_json()
+        assert body["breaks"] == 3
+        assert body["first_break_id"] == str(broken_id)
+
+        # Counter must have been incremented (3 increments) for our cluster
+        labelled = audit_chain_break_total.labels(cluster_id="test-cluster")
+        assert labelled._value.get() == 3
+
+    async def test_verify_requires_scope(self) -> None:
+        app = _build_app(rows=[], principal=_principal(scopes=set()))
+        client = app.test_client()
+        resp = await client.post("/api/v1/audit/verify", json={})
+        assert resp.status_code == 403
+
+
+# =============================================================================
+# Streaming export internals
+# =============================================================================
+
+
+class TestStreamAuditEventsJsonl:
+    def test_stream_yields_one_line_per_row_plus_signature(self) -> None:
+        rows = [_make_row(), _make_row()]
+        session = FakeSession(rows)
+        vault = MagicMock()
+        vault.transit_sign.return_value = "vault:v1:sig"
+
+        chunks = list(
+            _stream_audit_events_jsonl(
+                session,
+                cluster_id_label="test-cluster",
+                target_sub="auditor@acme",
+                vault_client=vault,
+                signing_key="gough-audit-export",
+            )
+        )
+        # Last chunk is the footer JSON
+        body = b"".join(chunks).decode("utf-8").strip().splitlines()
+        assert len(body) == 3  # 2 rows + 1 footer
+        for line in body[:-1]:
+            obj = json.loads(line)
+            # rows must serialize hash but never reveal envelope material
+            assert "hash_b64" in obj
+        footer = json.loads(body[-1])
+        assert footer["_signature"] is True
+        assert footer["rows_exported"] == 2
+        assert footer["signature"] == "vault:v1:sig"
+        assert footer["target_sub"] == "auditor@acme"
+
+    def test_stream_with_no_vault_emits_unsigned(self) -> None:
+        rows = [_make_row()]
+        session = FakeSession(rows)
+        chunks = list(
+            _stream_audit_events_jsonl(
+                session,
+                cluster_id_label="test-cluster",
+                target_sub=None,
+                vault_client=None,
+                signing_key="gough-audit-export",
+            )
+        )
+        body = b"".join(chunks).decode("utf-8").strip().splitlines()
+        footer = json.loads(body[-1])
+        assert footer["signature"] == "unsigned"
+
+    def test_stream_handles_vault_error_gracefully(self) -> None:
+        rows = [_make_row()]
+        session = FakeSession(rows)
+        vault = MagicMock()
+        vault.transit_sign.side_effect = RuntimeError("vault sealed")
+        chunks = list(
+            _stream_audit_events_jsonl(
+                session,
+                cluster_id_label="test-cluster",
+                target_sub=None,
+                vault_client=vault,
+                signing_key="gough-audit-export",
+            )
+        )
+        footer = json.loads(b"".join(chunks).decode("utf-8").strip().splitlines()[-1])
+        assert footer["signature"].startswith("vault-sign-error:")
+
+
+# =============================================================================
+# GET /export
+# =============================================================================
+
+
+@pytest.mark.asyncio
+class TestExportAuditLog:
+    async def test_export_requires_superadmin(self) -> None:
+        app = _build_app(
+            rows=[], principal=_principal(scopes={"gough.audit.read"})
+        )
+        client = app.test_client()
+        resp = await client.get("/api/v1/audit/export")
+        assert resp.status_code == 403
+
+    async def test_export_mfa_required_in_compliance_lane(self) -> None:
+        app = _build_app(
+            rows=[],
+            principal=_principal(
+                scopes={"gough.cluster.superadmin"}, mfa=False
+            ),
+            mfa_lane="fedramp",
+        )
+        client = app.test_client()
+        resp = await client.get("/api/v1/audit/export")
+        assert resp.status_code == 401
+
+    async def test_export_streams_jsonl_and_signs(self) -> None:
+        rows = [_make_row(), _make_row()]
+        nats_client = MagicMock()
+        nats_client.publish = MagicMock()
+        app = _build_app(
+            rows=rows,
+            principal=_principal(
+                scopes={"gough.cluster.superadmin"}, mfa=True
+            ),
+            mfa_lane="fedramp",
+            nats_client=nats_client,
+        )
+        client = app.test_client()
+        resp = await client.get(
+            "/api/v1/audit/export?target_sub=auditor@acme"
+        )
+        assert resp.status_code == 200
+        body = (await resp.get_data()).decode("utf-8").strip().splitlines()
+        assert len(body) == 3  # 2 rows + footer
+        footer = json.loads(body[-1])
+        assert footer["_signature"] is True
+        assert footer["target_sub"] == "auditor@acme"
+        assert footer["signature"] == "vault:v1:export-signature"
+        # NATS publish was called with the right subject
+        assert nats_client.publish.call_count == 1
+        subject, payload = nats_client.publish.call_args[0]
+        assert subject == "gough.audit.exported"
+        ev = json.loads(payload.decode("utf-8"))
+        assert ev["target_sub"] == "auditor@acme"
+        # Content-Disposition for download
+        assert "attachment" in resp.headers["Content-Disposition"]
+        assert "gough-audit-test-cluster.jsonl" in resp.headers[
+            "Content-Disposition"
+        ]
+
+    async def test_export_no_nats_client_does_not_fail(self) -> None:
+        rows = [_make_row()]
+        app = _build_app(
+            rows=rows,
+            principal=_principal(scopes={"gough.cluster.superadmin"}, mfa=True),
+        )
+        client = app.test_client()
+        resp = await client.get("/api/v1/audit/export")
+        assert resp.status_code == 200
+
+    async def test_export_nats_publish_failure_does_not_break_export(self) -> None:
+        rows = [_make_row()]
+        nats_client = MagicMock()
+        nats_client.publish.side_effect = RuntimeError("nats down")
+        app = _build_app(
+            rows=rows,
+            principal=_principal(scopes={"gough.cluster.superadmin"}, mfa=True),
+            nats_client=nats_client,
+        )
+        client = app.test_client()
+        resp = await client.get("/api/v1/audit/export")
+        assert resp.status_code == 200
+
+
+# =============================================================================
+# Compliance defaults
+# =============================================================================
+
+
+class TestComplianceLaneConfig:
+    def test_default_lanes(self) -> None:
+        assert {"fedramp", "hipaa", "pci"} <= set(DEFAULT_MFA_REQUIRED_LANES)

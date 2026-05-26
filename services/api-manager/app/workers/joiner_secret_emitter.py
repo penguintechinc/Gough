@@ -1,0 +1,765 @@
+"""Joiner secret emitter — post-deploy extractor flow.
+
+Implements the Emit -> Store flow from the Gough spec
+(Biome Model -> Joiner / Enrollment Secrets -> Emit -> Store Flow):
+
+1. Emitter biome reaches ``ready`` on its target node.
+2. api-manager opens a control-tunnel session to the node's agent.
+3. For each ``joiner_emit_spec.extractors[]``:
+   - Run extractor inside the LXD instance via control tunnel
+   - Stream output back over mTLS as opaque bytes (never logged)
+   - Generate per-row DEK, AES-256-GCM encrypt, wrap DEK via Vault transit
+   - Insert ``joiner_secrets`` row inside a SERIALIZABLE Postgres tx
+   - Append audit-chain row with action ``joiner.secret.emit``
+   - Memory-zero raw bytes + DEK after persist
+4. Publish NATS event ``gough.joiner.<cluster-id>.emitted`` with metadata only.
+
+Four-layer protection (KEK, per-row DEK envelope, Postgres TDE row-encrypt
+at rest, RLS) is enforced collectively by this module (Layers 1+2),
+infrastructure (Layer 3), and migrations (Layer 4).
+"""
+
+from __future__ import annotations
+
+import logging
+import uuid
+from dataclasses import dataclass
+from datetime import datetime, timedelta, timezone
+from typing import Any, Iterable, Optional, Protocol
+
+from pydantic import BaseModel
+from sqlalchemy import text
+from sqlalchemy.orm import Session
+
+from app.clients.vault import VaultClient
+from app.models_m1 import Biome, JoinerSecret, Node, NodeBiomeAssignment
+from app.security.audit_chain import AuditEventWriter
+from app.security.joiner_envelope import (
+    encrypt_envelope,
+    zero_bytes,
+)
+
+
+VAULT_KEK_NAME = "gough-joiner-dek-wrap"
+
+SOURCE_EXEC = "exec"
+SOURCE_FILE = "file"
+SOURCE_HTTP = "http_api"
+SOURCE_LXD = "lxd_config"
+VALID_SOURCES = frozenset({SOURCE_EXEC, SOURCE_FILE, SOURCE_HTTP, SOURCE_LXD})
+VALID_SCOPES = frozenset({"cluster", "node", "tenant"})
+
+
+def _mask(value: Any) -> str:
+    """Render a non-sensitive reference for logs (length only, no bytes)."""
+    if value is None:
+        return "<none>"
+    if isinstance(value, (bytes, bytearray)):
+        return f"<bytes len={len(value)}>"
+    if isinstance(value, str):
+        return f"<str len={len(value)}>"
+    return f"<{type(value).__name__}>"
+
+
+class ExtractorSpecError(ValueError):
+    """Raised when a joiner_emit_spec extractor is malformed or unsupported."""
+
+
+class ControlTunnelExtractionError(RuntimeError):
+    """Raised when a control-tunnel extractor invocation fails."""
+
+
+class EmitterStateError(RuntimeError):
+    """Raised when the emitter is invoked against an invalid biome-instance state."""
+
+
+class ControlTunnelClient(Protocol):
+    """Duck-typed interface for the per-node control tunnel.
+
+    A real implementation establishes an mTLS gRPC session to the node's
+    discovery-agent. For unit tests this is mocked.
+    """
+
+    def run_command(
+        self,
+        node_id: int,
+        lxd_instance: str,
+        command: list[str],
+        timeout_seconds: int = 60,
+    ) -> bytes: ...
+
+    def read_file(
+        self,
+        node_id: int,
+        lxd_instance: str,
+        path: str,
+        max_bytes: int = 65536,
+    ) -> bytes: ...
+
+    def http_api(
+        self,
+        node_id: int,
+        lxd_instance: str,
+        url: str,
+        method: str = "GET",
+        headers: Optional[dict[str, str]] = None,
+        body: Optional[bytes] = None,
+        timeout_seconds: int = 30,
+    ) -> bytes: ...
+
+    def lxd_config(
+        self,
+        node_id: int,
+        lxd_instance: str,
+        config_key: str,
+    ) -> bytes: ...
+
+
+class NatsPublisher(Protocol):
+    """Duck-typed interface for the NATS publisher used by the emitter."""
+
+    def publish(self, subject: str, payload: bytes) -> None: ...
+
+
+@dataclass(slots=True)
+class JoinerSecretMetadata:
+    """Non-sensitive metadata returned to callers after a successful emit.
+
+    Carries no ciphertext, no DEK, no plaintext bytes.
+    """
+
+    joiner_secret_id: str
+    cluster_id: str
+    biome_kind: str
+    extractor_name: str
+    scope: str
+    rotation_class: Optional[str]
+    ttl_seconds: Optional[int]
+    expires_at: Optional[datetime]
+    audit_event_id: str
+    emitter_biome_id: int
+    emitter_node_id: int
+
+
+@dataclass(slots=True)
+class ExtractedMaterial:
+    """Plaintext material returned by a rotation provider callback."""
+
+    extractor_name: str
+    plaintext: bytes
+    ttl_seconds: int = 0
+    rotation_class: Optional[str] = None
+
+
+@dataclass(slots=True)
+class EmitResult:
+    """Result of a successful joiner secret emission."""
+
+    joiner_secret_id: object  # uuid.UUID
+    audit_event_id: object    # uuid.UUID
+    expires_at: object        # datetime
+
+
+class _ExtractorSpec(BaseModel):
+    """Validated extractor entry from joiner_emit_spec.extractors[]."""
+
+    name: str
+    source: str
+    command: Optional[list[str]] = None
+    path: Optional[str] = None
+    url: Optional[str] = None
+    method: Optional[str] = None
+    config_key: Optional[str] = None
+    ttl_seconds: int = 0
+    rotation: Optional[str] = None
+    scope: str = "cluster"
+
+
+class JoinerSecretEmitter:
+    """Emits encrypted joiner secrets when a biome_instance reaches ready.
+
+    Each ``emit(biome_instance_id)`` call:
+      * Loads the emitter biome + node + assignment.
+      * Validates the assignment's status is ``ready``.
+      * Iterates ``joiner_emit_spec.extractors[]``, running the extractor
+        inside the LXD instance via the injected control tunnel.
+      * Envelope-encrypts each output, wraps the DEK via Vault transit,
+        inserts a ``joiner_secrets`` row inside a SERIALIZABLE transaction,
+        and appends a hash-chained audit-event row.
+      * Publishes a metadata-only NATS notification per extractor.
+      * Memory-zeros raw bytes after persist.
+
+    The emitter never logs ciphertext, DEK, or raw extractor output.
+    """
+
+    def __init__(
+        self,
+        db_session: Session,
+        vault_client: VaultClient,
+        control_tunnel_client: ControlTunnelClient,
+        nats_client: Optional[NatsPublisher] = None,
+        cluster_id: Optional[str] = None,
+        actor_sub: str = "system:api-manager",
+        vault_kek_name: str = VAULT_KEK_NAME,
+        logger: Optional[logging.Logger] = None,
+    ) -> None:
+        """Initialize the emitter.
+
+        Args:
+            db_session: SQLAlchemy session bound to the api-manager-rw role.
+            vault_client: Vault client used to wrap per-row DEKs.
+            control_tunnel_client: mTLS control-tunnel client used to run
+                extractors inside the biome's LXD instance.
+            nats_client: Optional NATS publisher for ``gough.joiner.*`` events.
+            cluster_id: Cluster UUID to scope joiner secrets to. If ``None``,
+                the emitter resolves it lazily per-node.
+            actor_sub: Subject for the audit chain (``system:api-manager``).
+            vault_kek_name: Vault transit key name used to wrap each DEK.
+            logger: Logger instance; defaults to module logger.
+        """
+        self.db_session = db_session
+        self.vault_client = vault_client
+        self.control_tunnel = control_tunnel_client
+        self.nats = nats_client
+        self._cluster_id = cluster_id
+        self.actor_sub = actor_sub
+        self.vault_kek_name = vault_kek_name
+        self.logger = logger or logging.getLogger(__name__)
+
+    # ------------------------------------------------------------------ #
+    # Public entry point                                                 #
+    # ------------------------------------------------------------------ #
+
+    def emit(self, biome_instance_id: int) -> list[JoinerSecretMetadata]:
+        """Run the post-deploy extractor flow for one biome_instance.
+
+        Args:
+            biome_instance_id: Primary key of the ``node_biome_assignments``
+                row whose status has just transitioned to ``ready``.
+
+        Returns:
+            List of ``JoinerSecretMetadata`` (one per extractor, metadata only).
+
+        Raises:
+            EmitterStateError: When the assignment, biome, or node cannot be
+                resolved, or the assignment is not in ``ready`` state.
+            ExtractorSpecError: When ``joiner_emit_spec`` is malformed.
+            ControlTunnelExtractionError: When a control-tunnel call fails.
+        """
+        assignment, biome, node = self._load_context(biome_instance_id)
+        cluster_id = self._resolve_cluster_id(node)
+        spec_extractors = self._validate_spec(biome)
+
+        if not spec_extractors:
+            self.logger.info(
+                "Biome has emits_joiner_secrets=true but no extractors; skipping",
+                extra={"biome_id": biome.id, "biome_instance_id": biome_instance_id},
+            )
+            return []
+
+        lxd_instance = self._derive_lxd_instance(node, biome, assignment)
+
+        results: list[JoinerSecretMetadata] = []
+        for extractor in spec_extractors:
+            metadata = self._emit_one(
+                cluster_id=cluster_id,
+                biome=biome,
+                node=node,
+                lxd_instance=lxd_instance,
+                extractor=extractor,
+            )
+            results.append(metadata)
+
+        return results
+
+    # ------------------------------------------------------------------ #
+    # Per-extractor pipeline                                             #
+    # ------------------------------------------------------------------ #
+
+    def _emit_one(
+        self,
+        *,
+        cluster_id: str,
+        biome: Biome,
+        node: Node,
+        lxd_instance: str,
+        extractor: _ExtractorSpec,
+    ) -> JoinerSecretMetadata:
+        """Run extractor + persist + audit + notify for a single extractor."""
+        self.logger.info(
+            "Joiner secret emit starting",
+            extra={
+                "cluster_id": cluster_id,
+                "biome_kind": biome.biome_kind,
+                "extractor": extractor.name,
+                "scope": extractor.scope,
+                "node_id": node.id,
+            },
+        )
+
+        # Step 1: run extractor inside the biome's LXD instance.
+        raw_bytes = self._extract_secret(
+            node_id=node.id,
+            lxd_instance=lxd_instance,
+            extractor_spec=extractor,
+        )
+        if not raw_bytes:
+            raise ControlTunnelExtractionError(
+                f"Extractor {extractor.name!r} returned empty output"
+            )
+
+        # Step 2-4: envelope-encrypt + persist + audit (within SERIALIZABLE tx).
+        try:
+            joiner_secret_id, audit_event_id, expires_at = self._persist(
+                extractor_name=extractor.name,
+                scope=extractor.scope,
+                raw_bytes=raw_bytes,
+                ttl_seconds=extractor.ttl_seconds,
+                rotation_class=extractor.rotation,
+                emitter_biome_id=biome.id,
+                emitter_node_id=node.id,
+                biome_kind=biome.biome_kind,
+                cluster_id=cluster_id,
+                tenant_id=biome.tenant_id,
+            )
+        finally:
+            # Step 5: zero raw bytes regardless of persist outcome.
+            try:
+                zero_bytes(raw_bytes)
+            except Exception:  # pragma: no cover - best-effort
+                self.logger.debug("zero_bytes(raw) failed; bytes will be GC'd")
+
+        # Step 6: publish NATS metadata-only notification.
+        self._publish_emitted_event(
+            cluster_id=cluster_id,
+            joiner_secret_id=joiner_secret_id,
+            biome_kind=biome.biome_kind,
+            extractor_name=extractor.name,
+            scope=extractor.scope,
+        )
+
+        self.logger.info(
+            "Joiner secret emit completed",
+            extra={
+                "cluster_id": cluster_id,
+                "biome_kind": biome.biome_kind,
+                "extractor": extractor.name,
+                "joiner_secret_id": joiner_secret_id,
+                "audit_event_id": audit_event_id,
+                "raw_bytes_ref": _mask(raw_bytes),
+            },
+        )
+
+        return JoinerSecretMetadata(
+            joiner_secret_id=joiner_secret_id,
+            cluster_id=cluster_id,
+            biome_kind=biome.biome_kind,
+            extractor_name=extractor.name,
+            scope=extractor.scope,
+            rotation_class=extractor.rotation,
+            ttl_seconds=extractor.ttl_seconds if extractor.ttl_seconds else None,
+            expires_at=expires_at,
+            audit_event_id=audit_event_id,
+            emitter_biome_id=biome.id,
+            emitter_node_id=node.id,
+        )
+
+    # ------------------------------------------------------------------ #
+    # Extractor invocation                                               #
+    # ------------------------------------------------------------------ #
+
+    def _extract_secret(
+        self,
+        node_id: int,
+        lxd_instance: str,
+        extractor_spec: _ExtractorSpec,
+    ) -> bytes:
+        """Run the extractor inside the LXD instance via the control tunnel.
+
+        The control-tunnel adapter routes the call to one of four sources
+        declared in ``joiner_emit_spec.extractors[].source``:
+
+        * ``exec``       -> ``control_tunnel.run_command(...)``
+        * ``file``       -> ``control_tunnel.read_file(...)``
+        * ``http_api``   -> ``control_tunnel.http_api(...)``
+        * ``lxd_config`` -> ``control_tunnel.lxd_config(...)``
+
+        Args:
+            node_id: Target node primary key.
+            lxd_instance: LXD instance name hosting the biome.
+            extractor_spec: Validated extractor spec.
+
+        Returns:
+            Raw extractor output bytes (caller must zero after use).
+
+        Raises:
+            ControlTunnelExtractionError: On any control-tunnel failure.
+            ExtractorSpecError: When the spec lacks required fields.
+        """
+        try:
+            if extractor_spec.source == SOURCE_EXEC:
+                if not extractor_spec.command:
+                    raise ExtractorSpecError(
+                        f"Extractor {extractor_spec.name!r} source={SOURCE_EXEC} requires command"
+                    )
+                output = self.control_tunnel.run_command(
+                    node_id=node_id,
+                    lxd_instance=lxd_instance,
+                    command=list(extractor_spec.command),
+                )
+            elif extractor_spec.source == SOURCE_FILE:
+                if not extractor_spec.path:
+                    raise ExtractorSpecError(
+                        f"Extractor {extractor_spec.name!r} source={SOURCE_FILE} requires path"
+                    )
+                output = self.control_tunnel.read_file(
+                    node_id=node_id,
+                    lxd_instance=lxd_instance,
+                    path=extractor_spec.path,
+                )
+            elif extractor_spec.source == SOURCE_HTTP:
+                if not extractor_spec.url:
+                    raise ExtractorSpecError(
+                        f"Extractor {extractor_spec.name!r} source={SOURCE_HTTP} requires url"
+                    )
+                output = self.control_tunnel.http_api(
+                    node_id=node_id,
+                    lxd_instance=lxd_instance,
+                    url=extractor_spec.url,
+                    method=extractor_spec.method or "GET",
+                )
+            elif extractor_spec.source == SOURCE_LXD:
+                if not extractor_spec.config_key:
+                    raise ExtractorSpecError(
+                        f"Extractor {extractor_spec.name!r} source={SOURCE_LXD} requires config_key"
+                    )
+                output = self.control_tunnel.lxd_config(
+                    node_id=node_id,
+                    lxd_instance=lxd_instance,
+                    config_key=extractor_spec.config_key,
+                )
+            else:
+                raise ExtractorSpecError(
+                    f"Extractor {extractor_spec.name!r} unsupported source: {extractor_spec.source}"
+                )
+        except ExtractorSpecError:
+            raise
+        except Exception as e:
+            # Sanitized: never log raw bytes / output / inner data.
+            self.logger.error(
+                "Control tunnel extractor failed",
+                extra={
+                    "node_id": node_id,
+                    "extractor": extractor_spec.name,
+                    "source": extractor_spec.source,
+                    "error_type": type(e).__name__,
+                },
+            )
+            raise ControlTunnelExtractionError(
+                f"Extractor {extractor_spec.name!r} ({extractor_spec.source}) failed"
+            ) from e
+
+        if not isinstance(output, (bytes, bytearray)):
+            raise ControlTunnelExtractionError(
+                f"Extractor {extractor_spec.name!r} returned non-bytes output"
+            )
+        # Normalize to bytes so caller can zero deterministically.
+        return bytes(output)
+
+    # ------------------------------------------------------------------ #
+    # Persistence                                                        #
+    # ------------------------------------------------------------------ #
+
+    def _persist(
+        self,
+        *,
+        extractor_name: str,
+        scope: str,
+        raw_bytes: bytes,
+        ttl_seconds: Optional[int],
+        rotation_class: Optional[str],
+        emitter_biome_id: int,
+        emitter_node_id: int,
+        biome_kind: str,
+        cluster_id: str,
+        tenant_id: str,
+    ) -> tuple[str, str, Optional[datetime]]:
+        """Encrypt + insert + audit inside a SERIALIZABLE transaction.
+
+        Returns:
+            ``(joiner_secret_id, audit_event_id, expires_at)``.
+        """
+        if scope not in VALID_SCOPES:
+            raise ExtractorSpecError(f"Invalid scope: {scope!r}")
+
+        # Envelope-encrypt: generates DEK internally, encrypts plaintext,
+        # wraps DEK via Vault transit, and zeros the DEK in memory.
+        envelope = encrypt_envelope(
+            plaintext=raw_bytes,
+            vault_client=self.vault_client,
+            vault_kek_name=self.vault_kek_name,
+        )
+
+        joiner_secret_id = uuid.uuid4()
+        now = datetime.now(timezone.utc)
+        expires_at: Optional[datetime] = None
+        if ttl_seconds and ttl_seconds > 0:
+            expires_at = now + timedelta(seconds=ttl_seconds)
+
+        # SERIALIZABLE isolation for the entire emit (insert + audit).
+        # ``connection()`` with execution_options requests serializable
+        # isolation for the connection backing this session.
+        connection = self.db_session.connection(
+            execution_options={"isolation_level": "SERIALIZABLE"}
+        )
+
+        # Append audit-chain row first so resource_id links the joiner_secret
+        # row to its hash-chained event. Both writes share the same session
+        # and commit atomically.
+        audit_writer = AuditEventWriter(
+            db_session=self.db_session,
+            cluster_id=cluster_id,
+        )
+        audit_event = audit_writer.append(
+            actor_sub=self.actor_sub,
+            actor_scope=["system:api-manager"],
+            action="joiner.secret.emit",
+            resource_kind="joiner_secret",
+            resource_id=str(joiner_secret_id),
+            tenant_id=tenant_id,
+            # NEVER include secret bytes in before/after.
+            before=None,
+            after={
+                "biome_kind": biome_kind,
+                "extractor_name": extractor_name,
+                "scope": scope,
+                "rotation_class": rotation_class,
+                "ttl_seconds": ttl_seconds if ttl_seconds else None,
+                "vault_kek_name": self.vault_kek_name,
+                "emitter_biome_id": emitter_biome_id,
+                "emitter_node_id": emitter_node_id,
+            },
+        )
+
+        # Insert the joiner_secrets row using the SERIALIZABLE connection.
+        insert_stmt = text(
+            """
+            INSERT INTO joiner_secrets
+              (id, cluster_id, tenant_id, biome_kind, emitter_biome_id,
+               emitter_node_id, extractor_name, scope, ciphertext, iv,
+               auth_tag, dek_wrapped, vault_kek_name, ttl_seconds,
+               expires_at, rotation_class, created_at, audit_event_id)
+            VALUES
+              (:id, :cluster_id, :tenant_id, :biome_kind, :emitter_biome_id,
+               :emitter_node_id, :extractor_name, :scope, :ciphertext, :iv,
+               :auth_tag, :dek_wrapped, :vault_kek_name, :ttl_seconds,
+               :expires_at, :rotation_class, :created_at, :audit_event_id)
+            """
+        )
+        connection.execute(
+            insert_stmt,
+            {
+                "id": str(joiner_secret_id),
+                "cluster_id": str(cluster_id),
+                "tenant_id": tenant_id,
+                "biome_kind": biome_kind,
+                "emitter_biome_id": emitter_biome_id,
+                "emitter_node_id": emitter_node_id,
+                "extractor_name": extractor_name,
+                "scope": scope,
+                "ciphertext": envelope.ciphertext,
+                "iv": envelope.iv,
+                "auth_tag": envelope.auth_tag,
+                "dek_wrapped": envelope.dek_wrapped,
+                "vault_kek_name": envelope.vault_kek_name,
+                "ttl_seconds": ttl_seconds if ttl_seconds else None,
+                "expires_at": expires_at,
+                "rotation_class": rotation_class,
+                "created_at": now,
+                "audit_event_id": str(audit_event.id),
+            },
+        )
+
+        return str(joiner_secret_id), str(audit_event.id), expires_at
+
+    # ------------------------------------------------------------------ #
+    # NATS                                                               #
+    # ------------------------------------------------------------------ #
+
+    def _publish_emitted_event(
+        self,
+        *,
+        cluster_id: str,
+        joiner_secret_id: str,
+        biome_kind: str,
+        extractor_name: str,
+        scope: str,
+    ) -> None:
+        """Publish ``gough.joiner.<cluster-id>.emitted`` with metadata only."""
+        if self.nats is None:
+            return
+        subject = f"gough.joiner.{cluster_id}.emitted"
+        # Spec: NATS payload contains NO secret data — metadata only.
+        payload = (
+            "{"
+            f'"joiner_secret_id":"{joiner_secret_id}",'
+            f'"biome_kind":"{biome_kind}",'
+            f'"extractor_name":"{extractor_name}",'
+            f'"scope":"{scope}"'
+            "}"
+        ).encode("utf-8")
+        try:
+            self.nats.publish(subject, payload)
+        except Exception as e:  # pragma: no cover - publisher errors logged, not raised
+            self.logger.warning(
+                "NATS publish failed; emit succeeded but downstream notify dropped",
+                extra={
+                    "subject": subject,
+                    "error_type": type(e).__name__,
+                },
+            )
+
+    # ------------------------------------------------------------------ #
+    # Helpers                                                            #
+    # ------------------------------------------------------------------ #
+
+    def _load_context(
+        self, biome_instance_id: int
+    ) -> tuple[NodeBiomeAssignment, Biome, Node]:
+        """Load assignment + biome + node and validate ready state."""
+        assignment = (
+            self.db_session.query(NodeBiomeAssignment)
+            .filter(NodeBiomeAssignment.id == biome_instance_id)
+            .one_or_none()
+        )
+        if assignment is None:
+            raise EmitterStateError(
+                f"biome_instance {biome_instance_id} not found"
+            )
+        if assignment.status != "ready":
+            raise EmitterStateError(
+                f"biome_instance {biome_instance_id} status is "
+                f"{assignment.status!r}, expected 'ready'"
+            )
+
+        biome = (
+            self.db_session.query(Biome)
+            .filter(Biome.id == assignment.biome_id)
+            .one_or_none()
+        )
+        if biome is None:
+            raise EmitterStateError(
+                f"biome {assignment.biome_id} for biome_instance {biome_instance_id} not found"
+            )
+        if not biome.emits_joiner_secrets:
+            raise EmitterStateError(
+                f"biome {biome.id} (kind={biome.biome_kind!r}) has emits_joiner_secrets=false"
+            )
+
+        node = (
+            self.db_session.query(Node)
+            .filter(Node.id == assignment.node_id)
+            .one_or_none()
+        )
+        if node is None:
+            raise EmitterStateError(
+                f"node {assignment.node_id} for biome_instance {biome_instance_id} not found"
+            )
+
+        return assignment, biome, node
+
+    def _resolve_cluster_id(self, node: Node) -> str:
+        """Resolve cluster UUID (constructor override or per-node lookup).
+
+        The Node model in M1 does not carry a direct cluster_id column;
+        callers either inject a cluster_id at construction time (typical
+        when the emitter runs inside a per-cluster worker) or fall back
+        to a lookup via storage_backends in the same tenant.
+        """
+        if self._cluster_id is not None:
+            return self._cluster_id
+
+        row = self.db_session.execute(
+            text(
+                """
+                SELECT sb.cluster_id
+                  FROM storage_backends sb
+                 WHERE sb.tenant_id = :tenant_id
+                 LIMIT 1
+                """
+            ),
+            {"tenant_id": node.tenant_id},
+        ).first()
+        if row is None or row[0] is None:
+            raise EmitterStateError(
+                f"cluster_id not resolvable for node {node.id}; "
+                "construct JoinerSecretEmitter with cluster_id=..."
+            )
+        return str(row[0])
+
+    @staticmethod
+    def _derive_lxd_instance(
+        node: Node, biome: Biome, assignment: NodeBiomeAssignment
+    ) -> str:
+        """Derive the LXD instance name for the biome's workload.
+
+        Spec convention: workloads run in an LXD instance named
+        ``<biome.biome_kind>-<assignment.id>`` on the target node; for
+        ``host`` workloads the ``node.name`` is used directly.
+        """
+        if biome.workload_type == "host":
+            return node.name
+        return f"{biome.biome_kind}-{assignment.id}"
+
+    def _validate_spec(self, biome: Biome) -> list[_ExtractorSpec]:
+        """Parse + validate ``joiner_emit_spec.extractors[]``."""
+        spec = biome.joiner_emit_spec or {}
+        if not isinstance(spec, dict):
+            raise ExtractorSpecError(
+                f"biome {biome.id}: joiner_emit_spec must be an object"
+            )
+        raw_extractors: Iterable[Any] = spec.get("extractors") or []
+        if not isinstance(raw_extractors, list):
+            raise ExtractorSpecError(
+                f"biome {biome.id}: joiner_emit_spec.extractors must be a list"
+            )
+
+        validated: list[_ExtractorSpec] = []
+        for entry in raw_extractors:
+            if not isinstance(entry, dict):
+                raise ExtractorSpecError(
+                    f"biome {biome.id}: each extractor must be an object"
+                )
+            try:
+                ex = _ExtractorSpec.model_validate(entry)
+            except Exception as e:
+                raise ExtractorSpecError(
+                    f"biome {biome.id}: invalid extractor: {e}"
+                ) from e
+            if ex.source not in VALID_SOURCES:
+                raise ExtractorSpecError(
+                    f"biome {biome.id}: extractor {ex.name!r} unsupported source {ex.source!r}"
+                )
+            if ex.scope not in VALID_SCOPES:
+                raise ExtractorSpecError(
+                    f"biome {biome.id}: extractor {ex.name!r} unsupported scope {ex.scope!r}"
+                )
+            if ex.ttl_seconds < 0:
+                raise ExtractorSpecError(
+                    f"biome {biome.id}: extractor {ex.name!r} ttl_seconds must be >= 0"
+                )
+            validated.append(ex)
+        return validated
+
+
+__all__ = [
+    "ControlTunnelClient",
+    "ControlTunnelExtractionError",
+    "EmitterStateError",
+    "ExtractorSpecError",
+    "JoinerSecret",
+    "JoinerSecretEmitter",
+    "JoinerSecretMetadata",
+    "NatsPublisher",
+    "VAULT_KEK_NAME",
+]

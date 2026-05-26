@@ -332,7 +332,7 @@ async def list_machines(provider_id: int):
     if not provider:
         return jsonify({"error": "Provider not found"}), 404
 
-    refresh = (await request.args).get("refresh", "").lower() == "true"
+    refresh = request.args.get("refresh", "").lower() == "true"
 
     if refresh:
         # Fetch from cloud API
