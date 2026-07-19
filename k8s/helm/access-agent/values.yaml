@@ -154,5 +154,7 @@ configMapData:
   log-level: "INFO"
   capabilities: "ssh"
 
-secretData:
-  enrollment-key: "changeme-in-production"
+# Secrets are NOT rendered by this chart. The Deployment references the Secret
+# named "<release>-access-agent-secret", which MUST be provisioned out-of-band by
+# Vault, the External Secrets Operator, or Sealed Secrets (see devops standards).
+# Required keys: enrollment-key.

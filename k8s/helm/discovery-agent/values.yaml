@@ -126,4 +126,6 @@ volumes: []
 
 configMapData: {}
 
-secretData: {}
+# Secrets are NOT rendered by this chart. If this agent is ever deployed as a
+# Deployment (see chart notes), provision any referenced Secret out-of-band via
+# Vault, the External Secrets Operator, or Sealed Secrets (see devops standards).

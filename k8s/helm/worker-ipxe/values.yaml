@@ -240,7 +240,7 @@ configMapData:
   metrics-enabled: "true"
   metrics-port: "9090"
 
-secretData:
-  worker-api-key: "changeme-in-production"
-  storage-access-key: "changeme-in-production"
-  storage-secret-key: "changeme-in-production"
+# Secrets are NOT rendered by this chart. The Deployment references the Secret
+# named "<release>-worker-ipxe-secret", which MUST be provisioned out-of-band by
+# Vault, the External Secrets Operator, or Sealed Secrets (see devops standards).
+# Required keys: worker-api-key, storage-access-key, storage-secret-key.
