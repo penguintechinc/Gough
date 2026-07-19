@@ -34,8 +34,6 @@ from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from typing import Any, Optional, Protocol, Sequence
 
-import numpy as np
-
 from ..clients.waddleai import (
     ALLOWED_HORIZON_DAYS,
     ClusterAggregate,
@@ -264,8 +262,12 @@ class CapacityPredictor:
                 snap.node_id, "disk_used_pct", snap.disk_used_pct, horizon_days
             )
 
-            # Use lowest confidence across metrics
-            confidence = min(cpu_conf, ram_conf, disk_conf) if [cpu_conf, ram_conf, disk_conf] else "low"
+            # Use lowest confidence across metrics (map to numeric, compare, map back)
+            confidence_ranks = {"low": 0, "medium": 1, "high": 2}
+            confs = [cpu_conf, ram_conf, disk_conf]
+            min_rank = min(confidence_ranks.get(c, 0) for c in confs)
+            rank_to_conf = {0: "low", 1: "medium", 2: "high"}
+            confidence = rank_to_conf.get(min_rank, "low")
 
             per_node.append(
                 NodeForecast(

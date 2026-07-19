@@ -62,8 +62,6 @@ def _scope_required(*required_scopes: str) -> Callable:
     scopes.
     """
     required = frozenset(required_scopes)
-    read_only = required.issubset({"gough.capacity.read", "gough.cluster.read",
-                                   "gough.storage.read"})
 
     def decorator(fn: Callable) -> Callable:
         @wraps(fn)
@@ -80,11 +78,9 @@ def _scope_required(*required_scopes: str) -> Callable:
 
             user = getattr(g, "current_user", None)
             if user is not None:
-                role = user.get("role") if isinstance(user, dict) else getattr(
-                    user, "role", None)
-                if role == "admin":
-                    return await fn(*args, **kwargs)
-                if read_only and role == "maintainer":
+                from ..security.scope_enforcement import extract_scopes_from_jwt
+                granted = extract_scopes_from_jwt(user.get("_jwt_payload") or {})
+                if required.issubset(granted):
                     return await fn(*args, **kwargs)
 
             return jsonify({
@@ -355,22 +351,26 @@ def _principal_sub() -> str:
 
 
 def _principal_scopes() -> frozenset[str]:
+    """Return scopes from the current principal (FIX #16).
+
+    Authorization must be scope-based ONLY. Do NOT auto-grant scopes based on
+    role names — roles are informational/audit only. The JWT itself must carry
+    the required scopes, issued by the auth service at token creation time.
+    This enforces the principle that override capabilities (e.g.
+    ``gough.migration.override-lock``) must be explicitly granted, not derived
+    from a role name.
+    """
     principal = getattr(g, "principal", None)
     if principal is not None:
         return frozenset(getattr(principal, "scopes", frozenset()))
     user = getattr(g, "current_user", None)
     if user is not None:
-        role = user.get("role") if isinstance(user, dict) else getattr(
-            user, "role", None)
-        if role == "admin":
-            return frozenset({
-                "gough.capacity.read",
-                "gough.migration.policy",
-                "gough.migration.trigger",
-                "gough.migration.override-lock",
-            })
-        if role == "maintainer":
-            return frozenset({"gough.capacity.read"})
+        payload = user.get("_jwt_payload") or {}
+        raw = payload.get("scope", "")
+        if isinstance(raw, list):
+            return frozenset(s for s in raw if isinstance(s, str))
+        elif isinstance(raw, str):
+            return frozenset(raw.split())
     return frozenset()
 
 
@@ -580,6 +580,16 @@ async def trigger_migration(instance_id: int):
                 live=True,
                 reason=reason,
             )
+            # Check execution status
+            if exec_result.get("status") == "not_implemented":
+                return jsonify({
+                    "status": "error",
+                    "error": {
+                        "code": "not_implemented",
+                        "message": "Execution not implemented (Phase 3)",
+                    },
+                    "execution_result": exec_result,
+                }), 501
             response_data["execution_result"] = exec_result
 
         return jsonify({"status": "success", "data": response_data}), 202

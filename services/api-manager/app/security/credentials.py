@@ -17,10 +17,21 @@ from cryptography import x509
 from cryptography.hazmat.backends import default_backend
 from cryptography.x509.oid import ExtensionOID, NameOID
 from pydantic import BaseModel, Field
+import base64
+import json
 import jwt
 import logging
 
 log = logging.getLogger(__name__)
+
+# Vault transit key used to sign bootstrap JWTs (must match ipxe._BOOTSTRAP_VAULT_KEY).
+# Pinned here so verification never trusts an attacker-controlled ``kid`` header.
+_BOOTSTRAP_VAULT_KEY = "gough-bootstrap-jwt"
+
+
+def _b64url_decode(data: str) -> bytes:
+    """Decode a base64url segment that may have had its ``=`` padding stripped."""
+    return base64.urlsafe_b64decode(data + "=" * (-len(data) % 4))
 
 
 # ==============================================================================
@@ -265,6 +276,58 @@ def validate_machine_jwt(
 # ==============================================================================
 
 
+def _verify_x509_signature(cert: x509.Certificate, ca_public_key: Any) -> None:
+    """Verify ``cert`` was signed by ``ca_public_key`` (RSA / ECDSA / Ed25519).
+
+    Raises InvalidCredentialError if the signature is invalid or the CA key type
+    is unsupported. Broadens the previous RSA-only check so ECDSA/Ed25519 SPIRE
+    CAs are handled rather than silently rejected.
+    """
+    from cryptography.hazmat.primitives.asymmetric import ec, padding
+    from cryptography.hazmat.primitives.asymmetric.ec import EllipticCurvePublicKey
+    from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PublicKey
+    from cryptography.hazmat.primitives.asymmetric.rsa import RSAPublicKey
+
+    try:
+        if isinstance(ca_public_key, RSAPublicKey):
+            ca_public_key.verify(
+                cert.signature,
+                cert.tbs_certificate_bytes,
+                padding.PKCS1v15(),
+                cert.signature_hash_algorithm,
+            )
+        elif isinstance(ca_public_key, EllipticCurvePublicKey):
+            ca_public_key.verify(
+                cert.signature,
+                cert.tbs_certificate_bytes,
+                ec.ECDSA(cert.signature_hash_algorithm),
+            )
+        elif isinstance(ca_public_key, Ed25519PublicKey):
+            ca_public_key.verify(cert.signature, cert.tbs_certificate_bytes)
+        else:
+            raise InvalidCredentialError(
+                f"Unsupported CA key type: {type(ca_public_key).__name__}"
+            )
+    except InvalidCredentialError:
+        raise
+    except Exception as e:  # noqa: BLE001 - cryptography.exceptions.InvalidSignature etc.
+        raise InvalidCredentialError(f"Certificate signature verification failed: {e}")
+
+
+def _cert_validity_window(cert: x509.Certificate) -> tuple[datetime, datetime]:
+    """Return the cert's (not_before, not_after) as tz-aware UTC datetimes.
+
+    Supports both cryptography>=42 (``*_utc``) and older naive attributes.
+    """
+    not_before = getattr(cert, "not_valid_before_utc", None)
+    not_after = getattr(cert, "not_valid_after_utc", None)
+    if not_before is None:
+        not_before = cert.not_valid_before.replace(tzinfo=timezone.utc)
+    if not_after is None:
+        not_after = cert.not_valid_after.replace(tzinfo=timezone.utc)
+    return not_before, not_after
+
+
 def validate_service_svid(
     peer_cert_pem: str,
     trust_bundle_pem: str,
@@ -319,28 +382,36 @@ def validate_service_svid(
         ca_cert = x509.load_pem_x509_certificate(
             trust_bundle_pem.encode(), default_backend()
         )
-        # Verify that the cert was signed by the CA by checking the issuer matches
-        # and validating signature using the CA's public key
+
+        # The trust anchor must actually be a CA.
+        try:
+            basic_constraints = ca_cert.extensions.get_extension_for_oid(
+                ExtensionOID.BASIC_CONSTRAINTS
+            ).value
+            if not getattr(basic_constraints, "ca", False):
+                raise InvalidCredentialError("Trust bundle certificate is not a CA")
+        except x509.ExtensionNotFound:
+            raise InvalidCredentialError(
+                "Trust bundle certificate lacks BasicConstraints"
+            )
+
+        # The SVID must be issued by the CA.
         if cert.issuer != ca_cert.subject:
             raise InvalidCredentialError(
-                f"Certificate issuer does not match CA subject"
+                "Certificate issuer does not match CA subject"
             )
 
-        # Verify the signature using the CA's public key
-        ca_public_key = ca_cert.public_key()
-        from cryptography.hazmat.primitives import hashes
-        from cryptography.hazmat.primitives.asymmetric import padding
-        from cryptography.hazmat.primitives.asymmetric.rsa import RSAPublicKey
+        # Both the SVID and the CA must currently be within their validity window.
+        now = datetime.now(timezone.utc)
+        for label, candidate in (("SVID", cert), ("CA", ca_cert)):
+            not_before, not_after = _cert_validity_window(candidate)
+            if now < not_before or now > not_after:
+                raise InvalidCredentialError(
+                    f"{label} certificate is expired or not yet valid"
+                )
 
-        if isinstance(ca_public_key, RSAPublicKey):
-            ca_public_key.verify(
-                cert.signature,
-                cert.tbs_certificate_bytes,
-                padding.PKCS1v15(),
-                cert.signature_hash_algorithm,
-            )
-        else:
-            raise InvalidCredentialError(f"Unsupported CA key type: {type(ca_public_key)}")
+        # Cryptographically verify the CA signed the SVID (RSA / ECDSA / Ed25519).
+        _verify_x509_signature(cert, ca_cert.public_key())
 
         log.info("Service SVID chain validation passed for %s", spiffe_id)
     except InvalidCredentialError:
@@ -368,6 +439,7 @@ def validate_one_time_bootstrap_token(
     vault_client: Any,
     redis_client: Any,
     expected_mac: str | None = None,
+    signing_secret: str | None = None,
 ) -> Principal:
     """Validate one-time bootstrap token (Vault-transit-signed JWT).
 
@@ -378,21 +450,75 @@ def validate_one_time_bootstrap_token(
         vault_client: Vault client instance (for transit verification in M2).
         redis_client: Redis client instance (for nonce storage).
         expected_mac: Optional MAC to validate against token mac claim.
+        signing_secret: HS256 signing secret; if provided, signature is verified.
 
     Returns:
         Principal with cred_type=ONE_TIME_BOOTSTRAP, sub=bootstrap:<mac>.
 
     Raises:
-        InvalidCredentialError: On signature/format error.
+        InvalidCredentialError: On signature/format/verification error.
         ExpiredCredentialError: On TTL violation or exp claim.
         OneTimeTokenReplayError: If nonce already used.
     """
+    # Select verification path from the token's declared algorithm and VERIFY the
+    # signature before trusting any claim. There is deliberately no unverified
+    # decode path: a token we cannot cryptographically verify is rejected (fail
+    # closed). Bootstrap tokens are minted either via Vault transit ("vault-transit")
+    # or HS256 (see ipxe._mint_bootstrap_jwt); both are verified here.
+    segments = token.split(".")
+    if len(segments) != 3:
+        raise InvalidCredentialError("Malformed bootstrap token (expected 3 segments)")
+    h_b64, p_b64, sig_b64 = segments
+
     try:
-        # M1: Basic JWT decode without signature verification (HMAC fallback)
-        # M2: Use vault_client.verify_signature() for transit verification
-        payload = jwt.decode(token, options={"verify_signature": False})
-    except jwt.DecodeError as e:
-        raise InvalidCredentialError(f"Cannot decode bootstrap token: {e}")
+        header = json.loads(_b64url_decode(h_b64))
+    except Exception as e:  # noqa: BLE001
+        raise InvalidCredentialError(f"Cannot decode bootstrap token header: {e}")
+    alg = header.get("alg")
+
+    if alg == "HS256":
+        if not signing_secret:
+            raise InvalidCredentialError(
+                "Bootstrap token verification unavailable: no HS256 signing secret configured"
+            )
+        try:
+            payload = jwt.decode(
+                token,
+                signing_secret,
+                algorithms=["HS256"],
+                options={"verify_signature": True},
+            )
+        except jwt.InvalidAlgorithmError as e:
+            raise InvalidCredentialError(f"Unsupported JWT algorithm: {e}")
+        except jwt.InvalidSignatureError as e:
+            raise InvalidCredentialError(f"Bootstrap token signature invalid: {e}")
+        except jwt.DecodeError as e:
+            raise InvalidCredentialError(f"Cannot decode bootstrap token: {e}")
+    elif alg == "vault-transit":
+        verify = getattr(vault_client, "transit_verify_signature", None)
+        if verify is None:
+            raise InvalidCredentialError(
+                "Bootstrap token verification unavailable: Vault transit client required"
+            )
+        signing_input = f"{h_b64}.{p_b64}".encode()
+        try:
+            vault_signature = _b64url_decode(sig_b64).decode()
+        except Exception as e:  # noqa: BLE001
+            raise InvalidCredentialError(f"Cannot decode bootstrap token signature: {e}")
+        try:
+            # Key name is pinned (not read from the attacker-controlled header).
+            valid = verify(_BOOTSTRAP_VAULT_KEY, signing_input, vault_signature)
+        except Exception as e:  # noqa: BLE001
+            raise InvalidCredentialError(f"Bootstrap token Vault verification error: {e}")
+        if not valid:
+            raise InvalidCredentialError("Bootstrap token signature invalid (Vault transit)")
+        try:
+            payload = json.loads(_b64url_decode(p_b64))
+        except Exception as e:  # noqa: BLE001
+            raise InvalidCredentialError(f"Cannot decode bootstrap token payload: {e}")
+    else:
+        # alg=none and every other unsupported/unsigned algorithm is rejected.
+        raise InvalidCredentialError(f"Unsupported bootstrap token algorithm: {alg!r}")
 
     nonce = payload.get("nonce")
     if not nonce or not isinstance(nonce, str):
@@ -500,8 +626,14 @@ async def credentials_middleware(
     elif cred_type == CredentialType.ONE_TIME_BOOTSTRAP:
         auth_header = headers.get("Authorization") or headers.get("authorization") or ""
         token = auth_header[7:]
+        # Use JWT_SECRET_KEY or BOOTSTRAP_JWT_SECRET from config for signature verification
+        from quart import current_app
+        signing_secret = (
+            current_app.config.get("JWT_SECRET_KEY")
+            or current_app.config.get("BOOTSTRAP_JWT_SECRET")
+        )
         principal = validate_one_time_bootstrap_token(
-            token, vault_client, redis_client
+            token, vault_client, redis_client, signing_secret=signing_secret
         )
     elif cred_type == CredentialType.MACHINE_JWT:
         auth_header = headers.get("Authorization") or headers.get("authorization") or ""

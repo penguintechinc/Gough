@@ -49,7 +49,6 @@ primary_bp = Blueprint("primary", __name__)
 def _scope_required(*required_scopes: str) -> Callable:
     """Enforce OIDC scope membership on the request principal."""
     required = frozenset(required_scopes)
-    is_read = required.issubset({"gough.cluster.read", "gough.capacity.read"})
 
     def decorator(fn: Callable) -> Callable:
         @wraps(fn)
@@ -70,11 +69,9 @@ def _scope_required(*required_scopes: str) -> Callable:
 
             user = getattr(g, "current_user", None)
             if user is not None:
-                role = user.get("role") if isinstance(user, dict) else getattr(
-                    user, "role", None)
-                if role == "admin":
-                    return await fn(*args, **kwargs)
-                if is_read and role == "maintainer":
+                from ..security.scope_enforcement import extract_scopes_from_jwt
+                granted = extract_scopes_from_jwt(user.get("_jwt_payload") or {})
+                if required.issubset(granted):
                     return await fn(*args, **kwargs)
 
             return jsonify({

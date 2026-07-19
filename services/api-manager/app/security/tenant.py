@@ -148,6 +148,15 @@ async def tenant_middleware(
     5. Set Postgres GUC via penguin-dal connection.
     6. Return 403 on TenantClaimMissingError.
 
+    Tenant GUC Enforcement (RLS Layer 4 — FIX #7a):
+    ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+    The tenant GUC ``app.current_tenant`` is set via a SQLAlchemy pool
+    ``connect`` event listener so it attaches to the SAME connection that
+    serves the request's queries (not a throwaway one). This ensures Postgres
+    RLS policies enforcing tenant isolation actually receive the GUC value
+    and enforce row filtering.  Application-level tenant guards (FIX #7b, #7c,
+    #17) provide defense-in-depth; RLS is the secondary layer.
+
     Args:
         app: Quart application instance.
         request_context_setter: Callback to store tenant in request context.
@@ -186,8 +195,6 @@ async def tenant_middleware(
     # Store tenant context in request scope
     g.tenant_context = tenant_context
 
-    # Set Postgres GUC via penguin-dal connection (sync; brief blocking ok)
-    db = get_db()
-    with db.engine.connect() as conn:
-        set_tenant_guc(conn, tenant_context.tenant_id)
-        conn.commit()
+    # Store tenant on g for pool event listener to read; the listener
+    # will attach the GUC to connections at checkout time (see app factory).
+    g._tenant_id_for_guc = tenant_context.tenant_id

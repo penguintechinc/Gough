@@ -888,3 +888,76 @@ class TestPinCallback:
             )
             client.first_connect()
             captured.assert_called_once_with(_DEFAULT_FP)
+
+
+class TestTOFUEnvGating:
+    """Tests for BMC_ALLOW_INSECURE_TLS env flag gating TOFU first-connect."""
+
+    def test_tofu_without_env_flag_raises(
+        self, patch_tls_handshake, vault, node_bmc, monkeypatch
+    ) -> None:
+        """TOFU (no pre-existing pin) should raise if env flag not set."""
+        node_bmc.cert_fingerprint = None  # TOFU scenario
+        monkeypatch.delenv("BMC_ALLOW_INSECURE_TLS", raising=False)
+
+        with rm_module.Mocker():
+            client = RedfishClient("https://bmc.test", vault, node_bmc)
+            with pytest.raises(BMCUnreachable) as exc_info:
+                client.first_connect()
+            assert "BMC_ALLOW_INSECURE_TLS" in str(exc_info.value)
+
+    def test_tofu_with_env_flag_true_succeeds(
+        self, patch_tls_handshake, vault, node_bmc, audit, monkeypatch
+    ) -> None:
+        """TOFU should succeed and warn when BMC_ALLOW_INSECURE_TLS=true."""
+        node_bmc.cert_fingerprint = None  # TOFU scenario
+        monkeypatch.setenv("BMC_ALLOW_INSECURE_TLS", "true")
+
+        with rm_module.Mocker() as m:
+            m.post("https://bmc.test/redfish/v1/SessionService/Sessions", status_code=401)
+            m.get("https://bmc.test/redfish/v1/", status_code=200, json={})
+            client = RedfishClient("https://bmc.test", vault, node_bmc, audit_writer=audit)
+            fp = client.first_connect()
+            assert fp == _DEFAULT_FP
+            assert node_bmc.cert_fingerprint == _DEFAULT_FP
+
+    def test_tofu_with_env_flag_1_succeeds(
+        self, patch_tls_handshake, vault, node_bmc, audit, monkeypatch
+    ) -> None:
+        """TOFU should succeed when BMC_ALLOW_INSECURE_TLS=1."""
+        node_bmc.cert_fingerprint = None
+        monkeypatch.setenv("BMC_ALLOW_INSECURE_TLS", "1")
+
+        with rm_module.Mocker() as m:
+            m.post("https://bmc.test/redfish/v1/SessionService/Sessions", status_code=401)
+            m.get("https://bmc.test/redfish/v1/", status_code=200, json={})
+            client = RedfishClient("https://bmc.test", vault, node_bmc, audit_writer=audit)
+            fp = client.first_connect()
+            assert fp == _DEFAULT_FP
+
+    def test_existing_pin_bypasses_env_flag(
+        self, patch_tls_handshake, vault, node_bmc, audit, monkeypatch
+    ) -> None:
+        """When cert_fingerprint already exists, env flag not needed."""
+        node_bmc.cert_fingerprint = _DEFAULT_FP
+        monkeypatch.delenv("BMC_ALLOW_INSECURE_TLS", raising=False)
+
+        with rm_module.Mocker() as m:
+            m.post("https://bmc.test/redfish/v1/SessionService/Sessions", status_code=401)
+            m.get("https://bmc.test/redfish/v1/", status_code=200, json={})
+            client = RedfishClient("https://bmc.test", vault, node_bmc, audit_writer=audit)
+            fp = client.first_connect()
+            assert fp == _DEFAULT_FP  # Succeeds without env flag
+
+    def test_pin_mismatch_rejected_regardless_of_env(
+        self, patch_tls_handshake, vault, node_bmc, monkeypatch
+    ) -> None:
+        """Pinned cert mismatch always rejected, env flag irrelevant."""
+        node_bmc.cert_fingerprint = _OTHER_FP  # Different pin
+        monkeypatch.setenv("BMC_ALLOW_INSECURE_TLS", "true")
+
+        with rm_module.Mocker():
+            client = RedfishClient("https://bmc.test", vault, node_bmc)
+            with pytest.raises(BMCCertPinMismatch) as exc_info:
+                client.first_connect()
+            assert "mismatch" in str(exc_info.value).lower()

@@ -58,7 +58,6 @@ _READ_ONLY_SCOPES = frozenset({
 
 def _scope_required(*required_scopes: str) -> Callable:
     required = frozenset(required_scopes)
-    is_read = required.issubset(_READ_ONLY_SCOPES)
 
     def decorator(fn: Callable) -> Callable:
         @wraps(fn)
@@ -75,13 +74,9 @@ def _scope_required(*required_scopes: str) -> Callable:
 
             user = getattr(g, "current_user", None)
             if user is not None:
-                role = user.get("role") if isinstance(user, dict) else getattr(
-                    user, "role", None)
-                if role == "admin":
-                    if "gough.cluster.superadmin" in required:
-                        return await fn(*args, **kwargs)
-                    return await fn(*args, **kwargs)
-                if is_read and role == "maintainer":
+                from ..security.scope_enforcement import extract_scopes_from_jwt
+                granted = extract_scopes_from_jwt(user.get("_jwt_payload") or {})
+                if required.issubset(granted):
                     return await fn(*args, **kwargs)
 
             return jsonify({
@@ -111,6 +106,55 @@ def _mfa_required(fn: Callable) -> Callable:
         return await fn(*args, **kwargs)
 
     return wrapper
+
+
+# =============================================================================
+# Tenant helpers (FIX #17)
+# =============================================================================
+
+
+def _current_tenant_id() -> str:
+    """Return the tenant_id from the current request context."""
+    tc = getattr(g, "tenant_context", None)
+    if tc is not None:
+        return getattr(tc, "tenant_id", "__default__")
+    user = getattr(g, "current_user", None) or {}
+    payload = user.get("_jwt_payload") or {}
+    return payload.get("tenant", "__default__")
+
+
+def _is_cross_tenant() -> bool:
+    """True iff the JWT carries cross_tenant=true (super-admin only)."""
+    tc = getattr(g, "tenant_context", None)
+    if tc is not None:
+        return bool(getattr(tc, "cross_tenant", False))
+    user = getattr(g, "current_user", None) or {}
+    payload = user.get("_jwt_payload") or {}
+    return bool(payload.get("cross_tenant", False))
+
+
+def _require_cluster_tenant(fn: Callable) -> Callable:
+    """Reject requests whose validated tenant does not own the URL's cluster.
+
+    Closes cross-tenant IDOR on ``/<cluster_id>/*`` routes (FIX #17). Runs after
+    auth/scope decorators; cross-tenant (super-admin) tokens bypass the check.
+    Returns 404 (not 403) on mismatch so cluster existence is not confirmed across
+    tenants.
+    """
+
+    @wraps(fn)
+    async def _wrapper(cluster_id: str, *args: Any, **kwargs: Any):
+        if not _is_cross_tenant():
+            db = get_db()
+            if hasattr(db, "clusters"):
+                cluster = db(db.clusters.id == cluster_id).select().first()
+                if cluster is None or getattr(
+                    cluster, "tenant_id", "__default__"
+                ) != _current_tenant_id():
+                    return jsonify({"error": "Cluster not found"}), 404
+        return await fn(cluster_id, *args, **kwargs)
+
+    return _wrapper
 
 
 # =============================================================================
@@ -267,6 +311,17 @@ def _serialise_storage_backend(row: Any) -> dict:
 async def list_storage_backends(cluster_id: str):
     """List the cluster's storage backends with credentials redacted."""
     db = get_db()
+
+    # Tenant isolation (FIX #17): verify cluster ownership before listing
+    if not _is_cross_tenant():
+        if hasattr(db, "clusters"):
+            cluster = db(db.clusters.id == cluster_id).select().first()
+            if cluster is None:
+                return jsonify({"error": "Cluster not found"}), 404
+            cluster_tenant = getattr(cluster, "tenant_id", "__default__")
+            if cluster_tenant != _current_tenant_id():
+                return jsonify({"error": "Cluster not found"}), 404
+
     if "storage_backends" not in getattr(db, "tables", []):
         return jsonify({"status": "success", "data": {"cluster_id": cluster_id, "backends": []}}), 200
     rows = db(db.storage_backends.cluster_id == cluster_id).select(
@@ -282,6 +337,7 @@ async def list_storage_backends(cluster_id: str):
 @clusters_bp.route("/<cluster_id>/storage", methods=["PATCH"])
 @auth_required
 @_scope_required("gough.storage.configure")
+@_require_cluster_tenant
 async def patch_storage_backend(cluster_id: str):
     """Create or update a storage backend.
 
@@ -395,6 +451,7 @@ async def patch_storage_backend(cluster_id: str):
 @clusters_bp.route("/<cluster_id>/storage/switch-primary", methods=["POST"])
 @auth_required
 @_scope_required("gough.cluster.admin")
+@_require_cluster_tenant
 async def switch_primary_storage(cluster_id: str):
     """Preview a primary-storage switch (M1) — full execution lands in M2."""
     body = await request.get_json(silent=True) or {}
@@ -463,6 +520,7 @@ async def switch_primary_storage(cluster_id: str):
 @clusters_bp.route("/<cluster_id>/lxd/members", methods=["GET"])
 @auth_required
 @_scope_required("gough.cluster.read")
+@_require_cluster_tenant
 async def lxd_members(cluster_id: str):
     """Return the LXD cluster member roster."""
     try:
@@ -486,6 +544,7 @@ async def lxd_members(cluster_id: str):
 @clusters_bp.route("/<cluster_id>/lxd/status", methods=["GET"])
 @auth_required
 @_scope_required("gough.cluster.read")
+@_require_cluster_tenant
 async def lxd_status(cluster_id: str):
     """Return a health summary for the LXD cluster."""
     try:
@@ -512,6 +571,7 @@ async def lxd_status(cluster_id: str):
 @clusters_bp.route("/<cluster_id>/lxd/join", methods=["POST"])
 @auth_required
 @_scope_required("gough.cluster.admin")
+@_require_cluster_tenant
 async def lxd_join(cluster_id: str):
     """Mint a join token + orchestrate a new LXD member join."""
     body = await request.get_json(silent=True) or {}
@@ -578,6 +638,7 @@ def _save_cluster_doc(cluster_id: str, key: str, value: Any) -> bool:
 @clusters_bp.route("/<cluster_id>/network-pools", methods=["GET"])
 @auth_required
 @_scope_required("gough.cluster.read")
+@_require_cluster_tenant
 async def get_network_pools(cluster_id: str):
     pools = _load_cluster_doc(cluster_id, "network_pools", _DEFAULT_NETWORK_POOLS)
     return jsonify({"status": "success", "data": {"cluster_id": cluster_id, "pools": pools}}), 200
@@ -586,6 +647,7 @@ async def get_network_pools(cluster_id: str):
 @clusters_bp.route("/<cluster_id>/network-pools", methods=["PATCH"])
 @auth_required
 @_scope_required("gough.cluster.admin")
+@_require_cluster_tenant
 async def patch_network_pools(cluster_id: str):
     body = await request.get_json(silent=True) or {}
     pools = body.get("pools") or body.get("add_pools") or []
@@ -659,6 +721,7 @@ def _validate_baseline_topology(doc: Any) -> list[dict]:
 @clusters_bp.route("/<cluster_id>/network-baseline-topology", methods=["GET"])
 @auth_required
 @_scope_required("gough.cluster.read")
+@_require_cluster_tenant
 async def get_baseline_topology(cluster_id: str):
     doc = _load_cluster_doc(
         cluster_id, "network_baseline_topology", _DEFAULT_BASELINE_TOPOLOGY
@@ -670,6 +733,7 @@ async def get_baseline_topology(cluster_id: str):
 @clusters_bp.route("/<cluster_id>/network-baseline-topology", methods=["PATCH"])
 @auth_required
 @_scope_required("gough.cluster.admin")
+@_require_cluster_tenant
 async def patch_baseline_topology(cluster_id: str):
     body = await request.get_json(silent=True) or {}
     topology = body.get("topology") if isinstance(body, dict) else None
@@ -694,6 +758,7 @@ async def patch_baseline_topology(cluster_id: str):
 @clusters_bp.route("/<cluster_id>/identity-plane", methods=["GET"])
 @auth_required
 @_scope_required("gough.cluster.read")
+@_require_cluster_tenant
 async def get_identity_plane(cluster_id: str):
     doc = _load_cluster_doc(
         cluster_id, "identity_plane", _DEFAULT_IDENTITY_PLANE
@@ -704,6 +769,7 @@ async def get_identity_plane(cluster_id: str):
 @clusters_bp.route("/<cluster_id>/identity-plane", methods=["PATCH"])
 @auth_required
 @_scope_required("gough.cluster.admin")
+@_require_cluster_tenant
 async def patch_identity_plane(cluster_id: str):
     body = await request.get_json(silent=True) or {}
     if not isinstance(body, dict):
@@ -777,6 +843,7 @@ async def adopt_cluster(cluster_id: str):
 @clusters_bp.route("/<cluster_id>/config", methods=["GET"])
 @auth_required
 @_scope_required("gough.cluster.read")
+@_require_cluster_tenant
 async def get_config(cluster_id: str):
     doc = _load_cluster_doc(cluster_id, "feature_flags", _DEFAULT_CONFIG)
     return jsonify({"status": "success", "data": {"cluster_id": cluster_id, "config": doc}}), 200
@@ -785,6 +852,7 @@ async def get_config(cluster_id: str):
 @clusters_bp.route("/<cluster_id>/config", methods=["PATCH"])
 @auth_required
 @_scope_required("gough.cluster.admin")
+@_require_cluster_tenant
 async def patch_config(cluster_id: str):
     body = await request.get_json(silent=True) or {}
     if not isinstance(body, dict):

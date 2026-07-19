@@ -1749,24 +1749,26 @@ class PlanCompiler:
     ) -> list[PlanValidationError]:
         """Detect cross-phase dependency violations.
 
-        ``phase1_helper`` cannot depend on ``phase2_initial`` or ``post_deploy``.
+        A biome of rank X cannot depend on a biome of rank > X.
+        For example: phase1_helper (rank 0) cannot depend on phase2_initial (rank 1)
+        or post_deploy (rank 2); phase2_initial (rank 1) cannot depend on post_deploy (rank 2).
         """
         errors: list[PlanValidationError] = []
         for eid, node in biome_nodes.items():
-            if _phase_rank(node.phase) != _phase_rank("phase1_helper"):
-                continue
+            node_rank = _phase_rank(node.phase)
             for dep_id in node.deps:
                 dep = biome_nodes.get(dep_id)
                 if dep is None:
                     continue
-                if _phase_rank(dep.phase) > _phase_rank("phase1_helper"):
+                dep_rank = _phase_rank(dep.phase)
+                if dep_rank > node_rank:
                     errors.append(
                         PlanValidationError(
                             code="phase_dependency_violation",
                             message=(
-                                f"Biome {node.biome_name!r} (phase={node.phase}) depends on "
-                                f"{dep.biome_name!r} (phase={dep.phase}); "
-                                f"phase1_helper cannot depend on later phases"
+                                f"Biome {node.biome_name!r} (phase={node.phase}, rank={node_rank}) "
+                                f"depends on {dep.biome_name!r} (phase={dep.phase}, rank={dep_rank}); "
+                                f"cannot depend on later phases"
                             ),
                             details={
                                 "biome_id": eid,
@@ -1775,6 +1777,8 @@ class PlanCompiler:
                                 "dep_biome_name": dep.biome_name,
                                 "egg_phase": node.phase,
                                 "dep_phase": dep.phase,
+                                "node_rank": node_rank,
+                                "dep_rank": dep_rank,
                             },
                         )
                     )
@@ -1902,7 +1906,7 @@ class PlanCompiler:
             except (json.JSONDecodeError, TypeError):
                 hw = {}
 
-        # TPM2 available → tpm2 tier; cloud VM → cloud-kms; else dev
+        # TPM2 available → tpm2 tier; cloud VM → dev (cloud KMS not yet implemented); else dev
         hw_tags_raw = getattr(node, "hardware_tags", None) or []
         if isinstance(hw_tags_raw, str):
             try:
@@ -1914,7 +1918,9 @@ class PlanCompiler:
         if "tpm:2.0" in hw_tags:
             return "tpm2"
         if hw.get("platform") in ("cloud-vm", "cloud"):
-            return "cloud-kms"
+            # Cloud VMs lack TPM; fall back to dev tier (universal, no hardware deps).
+            # TODO: Implement cloud-kms sealing via AWS KMS / GCP Cloud KMS / Azure Key Vault
+            return "dev"
         return "dev"
 
 

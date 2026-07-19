@@ -1314,7 +1314,7 @@ async def get_elder_status():
 # JWT payload: {mac, dmi_uuid_hint, nonce, iat, exp, phase: "helper"|"deploy"}
 # TTL: 600s. Nonces tracked Redis-first, DB (bootstrap_nonces) as fallback.
 
-_BOOTSTRAP_JWT_TTL_SECONDS = 3600
+_BOOTSTRAP_JWT_TTL_SECONDS = 300  # 5 minutes, must be ≤600s per validator
 _BOOTSTRAP_VAULT_KEY = "gough-bootstrap-jwt"
 _BOOTSTRAP_NONCE_REDIS_PREFIX = "bootstrap:nonce:"
 
@@ -1548,8 +1548,12 @@ def _mint_bootstrap_jwt(
 
     if token is None:
         secret = current_app.config.get("JWT_SECRET_KEY") or current_app.config.get(
-            "BOOTSTRAP_JWT_SECRET", "gough-bootstrap-dev-secret"
+            "BOOTSTRAP_JWT_SECRET"
         )
+        if not secret:
+            raise RuntimeError(
+                "Bootstrap JWT secret not configured: set JWT_SECRET_KEY or BOOTSTRAP_JWT_SECRET"
+            )
         token = jwt.encode(payload, secret, algorithm="HS256")
         log.info(f"Bootstrap JWT minted via HS256 fallback for mac={mac} phase={phase}")
 
@@ -1801,10 +1805,13 @@ def _scope_required(*required_scopes: str) -> Callable:
                     }), 403
                 return await f(*args, **kwargs)
 
-            # Legacy test/dev harness: accept maintainer/admin role as proxy.
+            # Authorization is scope-only: read scopes from the validated JWT.
             user = getattr(g, "current_user", None)
-            if user and user.get("role") in {"admin", "maintainer"}:
-                return await f(*args, **kwargs)
+            if user is not None:
+                from ..security.scope_enforcement import extract_scopes_from_jwt
+                granted = extract_scopes_from_jwt(user.get("_jwt_payload") or {})
+                if required.issubset(granted):
+                    return await f(*args, **kwargs)
 
             return jsonify({"error": "Insufficient scope"}), 403
 

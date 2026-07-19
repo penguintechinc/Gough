@@ -13,7 +13,7 @@ in ``SafetyResult.violations`` with a structured reason and offending node id.
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import Iterable, Optional
+from typing import Any, Iterable, Optional
 
 
 # =============================================================================
@@ -209,12 +209,20 @@ def validate_policy_patch(patch: dict) -> list[Violation]:
             continue
 
         if key == "capacity_forecast_horizon_days":
+            # Explicitly reject bool (True == 1 in Python)
+            if isinstance(value, bool) or not isinstance(value, int):
+                violations.append(Violation(
+                    code="type_error",
+                    message="capacity_forecast_horizon_days must be integer",
+                    field=key,
+                ))
+                continue
             if value not in _ALLOWED_HORIZON_DAYS:
                 violations.append(Violation(
                     code="out_of_range",
                     message="capacity_forecast_horizon_days must be one of {1, 7, 30}",
                     field=key,
-                    actual=float(value) if isinstance(value, (int, float)) else None,
+                    actual=float(value),
                 ))
 
     return violations
@@ -549,10 +557,10 @@ async def evaluate_safety(node_id: int) -> dict[str, Any]:
         {"safe": bool, "note": str, "violations": list[dict]}
     """
     # TODO(Phase 3): Load cluster state, node, biome instances from DB
-    # For now, return a safe result with empty violations
+    # Fail closed: return unsafe until implemented
     return {
-        "safe": True,
-        "note": "Safety envelope check evaluated.",
+        "safe": False,
+        "note": "safety evaluation not implemented (Phase 3)",
         "violations": [],
     }
 
@@ -577,12 +585,12 @@ async def execute_migration(
         reason: human-readable reason for the migration
 
     Returns:
-        {"status": "completed"|"failed", "duration_ms": int, "verdict": str}
+        {"status": "completed"|"failed"|"not_implemented", "duration_ms": int, "verdict": str}
     """
     # TODO(Phase 3): Call lxd_extra.live_migrate() or equivalent
-    # Return structured result
+    # Not implemented yet — return not_implemented status
     return {
-        "status": "completed",
+        "status": "not_implemented",
         "duration_ms": 0,
         "verdict": "execution_deferred_to_m2",
     }

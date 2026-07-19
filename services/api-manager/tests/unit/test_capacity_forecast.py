@@ -93,3 +93,25 @@ async def test_compute_risks_returns_empty_on_unavailable(predictor, waddleai_mo
 
     assert risks == []
     assert confidence == "low"
+
+
+@pytest.mark.asyncio
+async def test_confidence_aggregation_returns_minimum(predictor):
+    """Test that confidence aggregation returns the minimum confidence across metrics."""
+    # Mock _forecast_metric to return different confidences for each metric
+    async def mock_forecast_metric(node_id, metric, current_value, horizon_days):
+        if metric == "cpu_used_pct":
+            return current_value, "high"
+        elif metric == "ram_used_pct":
+            return current_value, "medium"
+        elif metric == "disk_used_pct":
+            return current_value, "low"
+        return current_value, "low"
+
+    predictor._forecast_metric = mock_forecast_metric
+
+    result = await predictor._synthesize_forecast(horizon_days=7, node_ids=None)
+
+    # Should return the minimum confidence level (low)
+    assert result.confidence == "low"
+    assert result.per_node[0].confidence == "low"

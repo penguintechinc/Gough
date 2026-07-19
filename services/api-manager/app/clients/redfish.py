@@ -13,6 +13,8 @@ Key behaviors
   every subsequent connect validates the pin and raises
   :class:`BMCCertPinMismatch` on mismatch with no fallback. Pin rotation is the
   caller's responsibility (operator-approved API in ``api/v1/nodes.py``).
+  TOFU (first connect without existing pin) requires BMC_ALLOW_INSECURE_TLS=true
+  to explicitly allow unverified TLS handshake.
 * **Default-credential refusal.** On first connect we probe whether well-known
   factory credential pairs (``root/calvin``, ``admin/admin``) authenticate; if
   any do, the binding is refused — :class:`BMCDefaultCredentialsDetected` is
@@ -34,6 +36,7 @@ from __future__ import annotations
 
 import hashlib
 import logging
+import os
 import socket
 import ssl
 import time
@@ -444,6 +447,9 @@ class RedfishClient:
         Returns the captured fingerprint. Mutates ``node_bmc_record``:
         ``cert_fingerprint`` is set on success; ``factory_creds_detected`` is
         set if any default credential pair authenticates.
+
+        TOFU (capturing cert without pre-existing pin) requires
+        BMC_ALLOW_INSECURE_TLS=true to be explicitly set.
         """
         # Capture the cert fingerprint via a direct raw TLS connection so that
         # the capture is reliable even when the requests session is intercepted
@@ -454,6 +460,23 @@ class RedfishClient:
         timeout = (
             self._timeout[0] if isinstance(self._timeout, tuple) else float(self._timeout)
         )
+
+        # Gate TOFU behind explicit env flag when no pin is pre-configured
+        if not getattr(self._node_bmc, "cert_fingerprint", None):
+            if os.getenv("BMC_ALLOW_INSECURE_TLS", "").lower() not in ("true", "1", "yes"):
+                raise BMCUnreachable(
+                    f"BMC {host}:{port} has no certificate pin configured and "
+                    "BMC_ALLOW_INSECURE_TLS is not enabled. Set BMC_ALLOW_INSECURE_TLS=true "
+                    "to allow TOFU (Trust On First Use) certificate capture (NOT RECOMMENDED). "
+                    "Operator should manually configure the BMC certificate fingerprint instead."
+                )
+            logger.warning(
+                "BMC TOFU unverified certificate capture: node_id=%s endpoint=%s "
+                "(set cert_fingerprint to pin the certificate for future connections)",
+                self._node_bmc.node_id,
+                self.endpoint,
+            )
+
         captured = _fetch_cert_fingerprint(host, port, timeout)
         self._adapter.captured_fingerprint = captured
 

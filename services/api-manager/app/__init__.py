@@ -37,6 +37,9 @@ async def create_app(config_class: type = Config) -> Quart:
     app = Quart(__name__, static_folder=None)  # Disable static files initially
     app.config.from_object(config_class)
 
+    # Validate secrets at startup to prevent production with dev defaults
+    config_class.validate_secrets()
+
     # Initialize CORS
     app = cors(app, allow_origin=app.config.get("CORS_ORIGINS", "*"),
                allow_methods=["GET", "POST", "PUT", "DELETE", "OPTIONS"],
@@ -111,7 +114,7 @@ async def create_app(config_class: type = Config) -> Quart:
                 app.logger.warning("Redis connection failed; caching disabled: %s", e)
 
         predictor = CapacityPredictor(
-            db_session=db,
+            db_session=app.config["db"],
             prometheus_client=prometheus,
             waddleai_client=waddleai,
             redis_client=redis_client,
