@@ -92,9 +92,10 @@ jobs:
 
       - name: Install Python dependencies
         run: |
-          # Python 3.13 no longer bundles setuptools/pkg_resources; several test
-          # deps still import pkg_resources, so install setuptools explicitly.
-          pip install -q setuptools
+          # Python 3.13 no longer bundles setuptools/pkg_resources, and
+          # setuptools>=81 removed pkg_resources entirely. Several test deps still
+          # import pkg_resources, so install a setuptools that still provides it.
+          pip install -q "setuptools<81"
           pip install -q pytest pytest-timeout pytest-xdist requests
           pip install -r tests/requirements.txt
 
