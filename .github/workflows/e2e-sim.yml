@@ -75,13 +75,14 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y \
-            qemu-system-x86-64 \
+            qemu-system-x86 \
             qemu-utils \
             libvirt-daemon \
             libvirt-clients \
             virt-manager \
-            lxd \
             build-essential
+          # LXD ships as a snap on ubuntu-latest (no apt package); ensure it is present.
+          sudo snap install lxd 2>/dev/null || sudo snap refresh lxd || true
 
       - name: Initialize LXD
         run: |
