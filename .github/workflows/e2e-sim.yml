@@ -57,16 +57,16 @@ jobs:
 
     steps:
       - name: Checkout code
-        uses: actions/checkout@11bd71901afe3a723c28c3d6cea3592b4f39eb4d
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd
 
       - name: Setup Python
-        uses: actions/setup-python@0b93645e9adb9a8c94953d7b30eac1d4e5df78ea
+        uses: actions/setup-python@42375524c64b4a2f71e0a3c5f03cb4b1cac8f5b
         with:
           python-version: '3.13'
           cache: 'pip'
 
       - name: Setup Go
-        uses: actions/setup-go@3041bf56c941b39c61721a86cd11f3807dc6fea5
+        uses: actions/setup-go@d35c59abb061a4a6fb18e82ac0862c26744d6ab5
         with:
           go-version: '1.24.2'
           cache: 'go'
@@ -111,7 +111,7 @@ jobs:
 
       - name: Upload test results
         if: always()
-        uses: actions/upload-artifact@4cec3d8aa96464d8d3ebed7a726ea9d3e90b5a13
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
         with:
           name: e2e-test-results
           path: /tmp/e2e-results.log
