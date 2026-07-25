@@ -23,7 +23,7 @@ jobs:
 
     services:
       postgres:
-        image: postgres:16-bookworm@sha256:eb4ac32d996dc71f9dd35a6e74cfa69f7c6ea1dd5d9db7e0d844c5d5f4f7c9a7
+        image: postgres:16-bookworm@sha256:92620daddcd947f8d5ab5ba66e848702fe443d87fed30c4cea8e389fd78dfc55
         env:
           POSTGRES_PASSWORD: test
           POSTGRES_DB: gough_test
@@ -36,7 +36,7 @@ jobs:
           - 5432:5432
 
       redis:
-        image: redis:7-bookworm@sha256:7b0b7e4e56e7e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5
+        image: redis:7-bookworm@sha256:a8f08480e1f88f2647fed492d1178c06abb0d0c1fbf02c682a61e2f483fb3954
         options: >-
           --health-cmd "redis-cli ping"
           --health-interval 10s
