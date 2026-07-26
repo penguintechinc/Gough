@@ -100,9 +100,10 @@ jobs:
           pip install -r tests/requirements.txt
           # Install api-manager dependencies for E2E bootstrap
           pip install -r services/api-manager/requirements.txt
-          # penguin-aaa is imported by the api-manager but intentionally excluded from
-          # its pinned requirements (CI/deployment provides it); install it for the E2E.
-          pip install -q penguin-aaa==0.1.0
+          # penguin-aaa and penguin-utils (provides the penguintechinc_utils module) are
+          # imported by the api-manager but intentionally excluded from its pinned
+          # requirements (CI/deployment provides them); install them for the E2E.
+          pip install -q penguin-aaa==0.1.0 penguin-utils==0.1.0
 
       - name: Run M1 E2E tests
         run: |

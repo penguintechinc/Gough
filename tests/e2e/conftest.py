@@ -88,7 +88,7 @@ def primary_cluster() -> Generator[Dict[str, Any], None, None]:
             stdout_text = proc.stdout.read() if proc.stdout else "(no stdout)"
             raise RuntimeError(
                 f"api-manager process died (exit code {proc.returncode}). "
-                f"stdout: {stdout_text[:500]} stderr: {stderr_text[:500]}"
+                f"stdout:\n{stdout_text[-4000:]}\nstderr:\n{stderr_text[-4000:]}"
             )
 
         try:
