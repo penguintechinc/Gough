@@ -51,7 +51,7 @@ def primary_cluster() -> Generator[Dict[str, Any], None, None]:
     print(f"[primary_cluster] Starting api-manager (hypercorn) from services/api-manager...")
 
     # Start api-manager as subprocess using hypercorn
-    api_manager_dir = Path(__file__).resolve().parents[3] / "services" / "api-manager"
+    api_manager_dir = Path(__file__).resolve().parents[2] / "services" / "api-manager"
     proc = subprocess.Popen(
         [
             "python3", "-m", "hypercorn",
