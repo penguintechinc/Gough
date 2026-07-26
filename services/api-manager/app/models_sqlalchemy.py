@@ -743,18 +743,49 @@ class SystemLog(Base):
     created_at = Column(DateTime, default=datetime.utcnow)
 
 
-def get_sqlalchemy_engine(db_uri: str):
-    """Create SQLAlchemy engine from database URI."""
-    # Convert PyDAL URI to SQLAlchemy URI format
-    if db_uri.startswith("postgres://"):
-        # SQLAlchemy requires postgresql:// not postgres://
-        db_uri = db_uri.replace("postgres://", "postgresql://", 1)
-    elif db_uri.startswith("sqlite:"):
-        # SQLAlchemy uses sqlite:/// for files
-        if "memory" not in db_uri:
-            db_uri = db_uri.replace("sqlite://", "sqlite:///", 1)
+def convert_pydal_to_sqlalchemy_uri(db_uri: str) -> str:
+    """Convert PyDAL database URI to SQLAlchemy format.
 
-    return create_engine(db_uri, echo=False)
+    Handles:
+    - postgres:// → postgresql://
+    - sqlite:memory → sqlite:///:memory:?check_same_thread=false
+    - sqlite://filename.db → sqlite:///filename.db
+    """
+    # Convert PostgreSQL dialect
+    if db_uri.startswith("postgres://"):
+        return db_uri.replace("postgres://", "postgresql://", 1)
+
+    # Convert SQLite dialect
+    if db_uri.startswith("sqlite:"):
+        if db_uri == "sqlite:memory":
+            # Add query param for check_same_thread (required for StaticPool + in-memory)
+            return "sqlite:///:memory:?check_same_thread=false"
+        elif db_uri.startswith("sqlite://"):
+            return db_uri.replace("sqlite://", "sqlite:///", 1)
+
+    return db_uri
+
+
+def get_sqlalchemy_engine(db_uri: str):
+    """Create SQLAlchemy engine from database URI.
+
+    Converts PyDAL format URIs to SQLAlchemy format.
+    For in-memory SQLite, disables pooling to maintain single connection.
+    """
+    from sqlalchemy.pool import StaticPool
+
+    sa_uri = convert_pydal_to_sqlalchemy_uri(db_uri)
+
+    # For in-memory SQLite, disable pooling and set check_same_thread=False
+    if sa_uri == "sqlite:///:memory:":
+        return create_engine(
+            sa_uri,
+            echo=False,
+            poolclass=StaticPool,
+            connect_args={"check_same_thread": False},
+        )
+
+    return create_engine(sa_uri, echo=False)
 
 
 def create_all_tables(db_uri: str):
