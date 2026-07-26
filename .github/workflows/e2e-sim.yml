@@ -98,6 +98,8 @@ jobs:
           pip install -q "setuptools<81"
           pip install -q pytest pytest-timeout pytest-xdist requests
           pip install -r tests/requirements.txt
+          # Install api-manager dependencies for E2E bootstrap
+          pip install -r services/api-manager/requirements.txt
 
       - name: Run M1 E2E tests
         run: |
