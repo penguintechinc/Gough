@@ -45,6 +45,10 @@ def primary_cluster() -> Generator[Dict[str, Any], None, None]:
         "SECRET_KEY": "e2e-test-secret-key-not-for-production-0000000000",
         "JWT_SECRET_KEY": "e2e-test-jwt-secret-not-for-production-0000000000",
         "SECURITY_PASSWORD_SALT": "e2e-test-salt-not-for-production-0000000000",
+        # run.py reads QUART_HOST/QUART_PORT; bind where this fixture polls.
+        "QUART_HOST": "127.0.0.1",
+        "QUART_PORT": "8080",
+        "DB_TYPE": "postgres",
     })
 
     print(f"[primary_cluster] Cluster ID: {cluster_id}")
@@ -52,15 +56,10 @@ def primary_cluster() -> Generator[Dict[str, Any], None, None]:
 
     # Start api-manager as subprocess using hypercorn
     api_manager_dir = Path(__file__).resolve().parents[2] / "services" / "api-manager"
+    # Launch via the app's own entrypoint (run.py): it awaits the async
+    # create_app() factory, waits for the DB, and serves on QUART_HOST/QUART_PORT.
     proc = subprocess.Popen(
-        [
-            "python3", "-m", "hypercorn",
-            "app:create_app",
-            "--bind", "127.0.0.1:8080",
-            "--log-level", "error",
-            "--workers", "1",
-            "--factory"
-        ],
+        ["python3", "run.py"],
         cwd=str(api_manager_dir),
         env=api_env,
         stdout=subprocess.PIPE,
