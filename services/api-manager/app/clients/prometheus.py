@@ -120,8 +120,23 @@ class PrometheusClient(PrometheusClientProtocol):
 
             for instance in sorted(instances):
                 try:
-                    node_id = int(instance.split(":")[-1])
-                except (ValueError, IndexError):
+                    # Extract hostname/IP (before colon), not port (after colon).
+                    # instance format: "hostname:port" or "IP:port"
+                    host_part = instance.split(":")[0]
+                    # TODO: Implement host-to-node-id mapping from cluster metadata.
+                    # For now, parse numeric IP octets as fallback (brittle but functional).
+                    # Ideally use a cluster node registry lookup table.
+                    if host_part.replace(".", "").isdigit():
+                        # IP address: use last octet as node_id (e.g., 192.168.1.42 → 42)
+                        node_id = int(host_part.split(".")[-1])
+                    else:
+                        # Hostname: try to extract trailing digits (e.g., "node-42" → 42)
+                        import re
+                        match = re.search(r"(\d+)$", host_part)
+                        node_id = int(match.group(1)) if match else 0
+                    if node_id == 0:
+                        continue
+                except (ValueError, IndexError, AttributeError):
                     continue
 
                 if node_ids and node_id not in node_ids:
@@ -223,15 +238,32 @@ class PrometheusClient(PrometheusClientProtocol):
             return {}
 
     def _extract_scalar(self, resp: httpx.Response) -> float:
-        """Extract scalar value from Prometheus /api/v1/query response."""
+        """Extract scalar value from Prometheus /api/v1/query response.
+
+        Handles both 'scalar' result type (direct value) and 'vector' result type
+        (single vector result with [timestamp, value] pair).
+        """
         try:
             data = resp.json()
             if data.get("status") != "success":
                 return 0.0
             result = data.get("data", {})
-            if result.get("type") == "scalar":
+            result_type = result.get("type", "")
+
+            if result_type == "scalar":
+                # Scalar response: value is [timestamp, value_string]
                 value = result.get("value", [0, 0])
-                return float(value[1]) if value else 0.0
+                return float(value[1]) if value and len(value) > 1 else 0.0
+
+            if result_type == "vector":
+                # Vector response: take first result's [timestamp, value_string]
+                results = result.get("result", [])
+                if results and len(results) > 0:
+                    value = results[0].get("value", [0, 0])
+                    return float(value[1]) if value and len(value) > 1 else 0.0
+                return 0.0
+
+            # Unknown result type; no data
             return 0.0
         except Exception as exc:
             log.warning("Failed to extract scalar from Prometheus response: %s", exc)

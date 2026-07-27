@@ -9,6 +9,7 @@ import signal
 import sys
 from penguintechinc_utils import get_logger
 from prometheus_client import start_http_server
+import structlog
 
 from worker.config import WorkerConfig
 from worker.enrollment import EnrollmentManager

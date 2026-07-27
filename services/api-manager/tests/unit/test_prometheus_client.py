@@ -31,7 +31,7 @@ async def test_snapshot_node_usage_success(prometheus_client):
                 "data": {
                     "result": [
                         {
-                            "metric": {"instance": "node1:9100"},
+                            "metric": {"instance": "192.168.1.42:9100"},
                             "value": [1234567890, "25.5"],
                         },
                     ]
@@ -43,7 +43,7 @@ async def test_snapshot_node_usage_success(prometheus_client):
                 "data": {
                     "result": [
                         {
-                            "metric": {"instance": "node1:9100"},
+                            "metric": {"instance": "192.168.1.42:9100"},
                             "value": [1234567890, "50.0"],
                         },
                     ]
@@ -55,7 +55,7 @@ async def test_snapshot_node_usage_success(prometheus_client):
                 "data": {
                     "result": [
                         {
-                            "metric": {"instance": "node1:9100"},
+                            "metric": {"instance": "192.168.1.42:9100"},
                             "value": [1234567890, "60.0"],
                         },
                     ]
@@ -67,7 +67,7 @@ async def test_snapshot_node_usage_success(prometheus_client):
                 "data": {
                     "result": [
                         {
-                            "metric": {"instance": "node1:9100"},
+                            "metric": {"instance": "192.168.1.42:9100"},
                             "value": [1234567890, "1000000"],
                         },
                     ]
@@ -78,7 +78,8 @@ async def test_snapshot_node_usage_success(prometheus_client):
         mock_client_class.return_value = mock_client
         result = await prometheus_client.snapshot_node_usage()
         assert len(result) == 1
-        # node_id is extracted from "node1:9100" -> "9100" (last segment)
+        # node_id extracted from IP "192.168.1.42" -> last octet 42
+        assert result[0].node_id == 42
         assert result[0].cpu_used_pct == 25.5
 
 
@@ -158,5 +159,38 @@ def test_extract_scalar_failure(prometheus_client):
     """Test extracting scalar from failed response."""
     resp = MagicMock()
     resp.json.return_value = {"status": "error"}
+    result = prometheus_client._extract_scalar(resp)
+    assert result == 0.0
+
+
+def test_extract_scalar_vector_type(prometheus_client):
+    """Test extracting scalar value from vector result type (common for aggregates)."""
+    resp = MagicMock()
+    resp.json.return_value = {
+        "status": "success",
+        "data": {
+            "type": "vector",
+            "result": [
+                {
+                    "metric": {},
+                    "value": [1234567890, "35.7"],
+                }
+            ],
+        },
+    }
+    result = prometheus_client._extract_scalar(resp)
+    assert result == 35.7
+
+
+def test_extract_scalar_vector_empty(prometheus_client):
+    """Test extracting scalar from empty vector result."""
+    resp = MagicMock()
+    resp.json.return_value = {
+        "status": "success",
+        "data": {
+            "type": "vector",
+            "result": [],
+        },
+    }
     result = prometheus_client._extract_scalar(resp)
     assert result == 0.0

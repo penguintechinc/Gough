@@ -20,12 +20,12 @@ class TestEvaluateSafety:
         assert "violations" in result
 
     @pytest.mark.asyncio
-    async def test_evaluate_safety_default_safe(self) -> None:
-        """By default, evaluate_safety returns safe=True (no violations)."""
+    async def test_evaluate_safety_not_implemented(self) -> None:
+        """evaluate_safety returns safe=False until Phase 3 implementation."""
         result = await evaluate_safety(node_id=1)
-        assert result["safe"] is True
+        assert result["safe"] is False
+        assert "Phase 3" in result["note"] or "not implemented" in result["note"]
         assert isinstance(result["violations"], list)
-        assert len(result["violations"]) == 0
 
 
 class TestExecuteMigration:
@@ -47,8 +47,8 @@ class TestExecuteMigration:
         assert "verdict" in result
 
     @pytest.mark.asyncio
-    async def test_execute_migration_status_values(self) -> None:
-        """execute_migration() status is one of 'completed', 'failed', etc."""
+    async def test_execute_migration_not_implemented(self) -> None:
+        """execute_migration() returns not_implemented status until Phase 3."""
         result = await execute_migration(
             biome_instance_id=1,
             src_node_id=1,
@@ -56,7 +56,8 @@ class TestExecuteMigration:
             live=False,
             reason="test",
         )
-        assert result["status"] in ("completed", "failed")
+        # Should return not_implemented until Phase 3 implementation
+        assert result["status"] == "not_implemented"
         assert isinstance(result["duration_ms"], int)
         assert result["duration_ms"] >= 0
 

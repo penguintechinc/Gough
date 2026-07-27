@@ -48,5 +48,3 @@ pexpect==4.8.0
 ansible-lint==6.22.1
 molecule==6.0.3
 
-# Load testing
-artillery==1.7.9

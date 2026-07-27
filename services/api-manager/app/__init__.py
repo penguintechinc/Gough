@@ -37,6 +37,9 @@ async def create_app(config_class: type = Config) -> Quart:
     app = Quart(__name__, static_folder=None)  # Disable static files initially
     app.config.from_object(config_class)
 
+    # Validate secrets at startup to prevent production with dev defaults
+    config_class.validate_secrets()
+
     # Initialize CORS
     app = cors(app, allow_origin=app.config.get("CORS_ORIGINS", "*"),
                allow_methods=["GET", "POST", "PUT", "DELETE", "OPTIONS"],
@@ -54,13 +57,23 @@ async def create_app(config_class: type = Config) -> Quart:
         # Store datastore in app for access in blueprints
         app.user_datastore = user_datastore
 
-        # Initialize audit logger
+        # Initialize audit logger (graceful degradation if fails)
         if app.config.get("AUDIT_ENABLED", True):
-            init_audit_logger(app)
+            try:
+                init_audit_logger(app)
+            except Exception as e:
+                import sys
+                print(f"WARNING: Audit logger initialization failed: {e}", file=sys.stderr)
+                print("Continuing without audit logger", file=sys.stderr)
 
-        # Initialize rate limiter
+        # Initialize rate limiter (graceful degradation if fails)
         if app.config.get("RATE_LIMIT_ENABLED", True):
-            init_rate_limiter(app)
+            try:
+                init_rate_limiter(app)
+            except Exception as e:
+                import sys
+                print(f"WARNING: Rate limiter initialization failed: {e}", file=sys.stderr)
+                print("Continuing without rate limiter", file=sys.stderr)
 
         # Initialize SSH Certificate Authority
         ssh_ca = SSHCertificateAuthority(app)
@@ -70,53 +83,62 @@ async def create_app(config_class: type = Config) -> Quart:
         socketio = init_websocket(app)
         app.socketio = socketio
 
-        # Seed built-in biomes (idempotent)
-        seed_builtin_biomes(db)
+        # Seed built-in biomes (idempotent, only if DB available)
+        if db is not None:
+            try:
+                seed_builtin_biomes(db)
+            except Exception as e:
+                import sys
+                print(f"WARNING: Failed to seed built-in biomes: {e}", file=sys.stderr)
 
         # Note: Default admin is created by SQLAlchemy during schema initialization
 
     # Initialize capacity predictor (used by /capacity/* endpoints)
     @app.before_serving
     async def _init_capacity_predictor():
-        """Initialize WaddleAI client and capacity predictor."""
-        from .clients.vault import VaultClient
-        from .clients.waddleai import WaddleAIClient
-        from .clients.prometheus import PrometheusClient
-        from .workers.capacity_predictor import CapacityPredictor
-        import redis.asyncio as redis
+        """Initialize WaddleAI client and capacity predictor (gracefully degrade if unavailable)."""
+        try:
+            from .clients.vault import VaultClient
+            from .clients.waddleai import WaddleAIClient
+            from .clients.prometheus import PrometheusClient
+            from .workers.capacity_predictor import CapacityPredictor
+            import redis.asyncio as redis
 
-        vault = VaultClient()
-        waddleai_endpoint = app.config.get(
-            "WADDLEAI_ENDPOINT", "https://waddleai.cluster.svc:8443"
-        )
-        waddleai_cluster_id = app.config.get("CLUSTER_ID", "dal2")
-        prometheus_endpoint = app.config.get(
-            "PROMETHEUS_ENDPOINT", "http://prometheus:9090"
-        )
+            vault = VaultClient()
+            waddleai_endpoint = app.config.get(
+                "WADDLEAI_ENDPOINT", "https://waddleai.cluster.svc:8443"
+            )
+            waddleai_cluster_id = app.config.get("CLUSTER_ID", "dal2")
+            prometheus_endpoint = app.config.get(
+                "PROMETHEUS_ENDPOINT", "http://prometheus:9090"
+            )
 
-        waddleai = WaddleAIClient(
-            endpoint=waddleai_endpoint,
-            vault_client=vault,
-            cluster_id=waddleai_cluster_id,
-        )
-        prometheus = PrometheusClient(endpoint=prometheus_endpoint)
+            waddleai = WaddleAIClient(
+                endpoint=waddleai_endpoint,
+                vault_client=vault,
+                cluster_id=waddleai_cluster_id,
+            )
+            prometheus = PrometheusClient(endpoint=prometheus_endpoint)
 
-        # Optional Redis cache (None disables caching)
-        redis_client = None
-        redis_url = app.config.get("REDIS_URL")
-        if redis_url:
-            try:
-                redis_client = await redis.from_url(redis_url)
-            except Exception as e:
-                app.logger.warning("Redis connection failed; caching disabled: %s", e)
+            # Optional Redis cache (None disables caching)
+            redis_client = None
+            redis_url = app.config.get("REDIS_URL")
+            if redis_url:
+                try:
+                    redis_client = await redis.from_url(redis_url)
+                except Exception as e:
+                    app.logger.warning("Redis connection failed; caching disabled: %s", e)
 
-        predictor = CapacityPredictor(
-            db_session=db,
-            prometheus_client=prometheus,
-            waddleai_client=waddleai,
-            redis_client=redis_client,
-        )
-        app.capacity_predictor = predictor
+            predictor = CapacityPredictor(
+                db_session=app.config.get("db"),
+                prometheus_client=prometheus,
+                waddleai_client=waddleai,
+                redis_client=redis_client,
+            )
+            app.capacity_predictor = predictor
+        except Exception as e:
+            app.logger.warning("Capacity predictor initialization failed: %s", e)
+            app.logger.warning("Continuing without capacity predictor (degraded mode)")
 
     # Register blueprints
     from .auth import auth_bp
@@ -203,6 +225,9 @@ async def create_app(config_class: type = Config) -> Quart:
         """Alias for /healthz endpoint."""
         try:
             db = get_db()
+            if db is None:
+                # Degraded mode: DB not available but app is still running
+                return {"status": "unhealthy", "database": "unavailable"}, 503
             with db.engine.connect() as conn:
                 conn.execute(text("SELECT 1"))
             return {"status": "healthy", "database": "connected"}, 200
@@ -214,15 +239,18 @@ async def create_app(config_class: type = Config) -> Quart:
         """Alias for /readyz endpoint."""
         readiness_state = {"status": "ready", "checks": {}}
 
-        # Check Postgres
+        # Check Database (graceful if unavailable)
         try:
             db = get_db()
-            with db.engine.connect() as conn:
-                conn.execute(text("SELECT 1"))
-            readiness_state["checks"]["postgres"] = "up"
+            if db is None:
+                readiness_state["checks"]["database"] = "unavailable (degraded mode)"
+            else:
+                with db.engine.connect() as conn:
+                    conn.execute(text("SELECT 1"))
+                readiness_state["checks"]["database"] = "up"
         except Exception as e:
             readiness_state["status"] = "not_ready"
-            readiness_state["checks"]["postgres"] = f"down: {str(e)[:50]}"
+            readiness_state["checks"]["database"] = f"down: {str(e)[:50]}"
 
         # Check Vault (defensive: may not be initialized in dev).
         try:
@@ -277,6 +305,9 @@ async def create_app(config_class: type = Config) -> Quart:
         """Health check endpoint."""
         try:
             db = get_db()
+            if db is None:
+                # Degraded mode: DB not available but app is still running
+                return {"status": "unhealthy", "database": "unavailable"}, 503
             with db.engine.connect() as conn:
                 conn.execute(text("SELECT 1"))
             return {"status": "healthy", "database": "connected"}, 200
@@ -289,15 +320,18 @@ async def create_app(config_class: type = Config) -> Quart:
         """Readiness: Vault unsealed, Postgres reachable, SPIRE up, gRPC warm."""
         readiness_state = {"status": "ready", "checks": {}}
 
-        # Check Postgres
+        # Check Database (graceful if unavailable)
         try:
             db = get_db()
-            with db.engine.connect() as conn:
-                conn.execute(text("SELECT 1"))
-            readiness_state["checks"]["postgres"] = "up"
+            if db is None:
+                readiness_state["checks"]["database"] = "unavailable (degraded mode)"
+            else:
+                with db.engine.connect() as conn:
+                    conn.execute(text("SELECT 1"))
+                readiness_state["checks"]["database"] = "up"
         except Exception as e:
             readiness_state["status"] = "not_ready"
-            readiness_state["checks"]["postgres"] = f"down: {str(e)[:50]}"
+            readiness_state["checks"]["database"] = f"down: {str(e)[:50]}"
 
         # Check Vault (defensive: may not be initialized in dev).
         try:
@@ -329,16 +363,25 @@ async def create_app(config_class: type = Config) -> Quart:
         """Prometheus metrics endpoint."""
         return Response(generate_latest(), mimetype=CONTENT_TYPE_LATEST)
 
-    # Start gRPC server as background task alongside Quart/hypercorn.
+    # Start gRPC server as background task alongside Quart/hypercorn (graceful degradation).
     @app.before_serving
     async def _start_grpc() -> None:
+        """Start gRPC server (non-fatal if it fails to bind or initialize)."""
         import asyncio
-        from . import grpc_runner
-        asyncio.ensure_future(grpc_runner.serve())
+        try:
+            from . import grpc_runner
+            asyncio.ensure_future(grpc_runner.serve())
+        except Exception as e:
+            app.logger.warning("gRPC server startup failed: %s", e)
+            app.logger.warning("Continuing without gRPC server (HTTP/REST only)")
 
-    # Wrap with audit middleware for request logging
-    emitter = Emitter()
-    app.asgi_app = AuditMiddleware(app.asgi_app, emitter)
+    # Wrap with audit middleware for request logging. Emitter requires at least one
+    # sink; default to StdoutSink so the app always boots (production can configure
+    # FileSink/SyslogSink/KillKrillSink). Gated by AUDIT_ENABLED.
+    if app.config.get("AUDIT_ENABLED", True):
+        from penguin_aaa.audit.sinks import StdoutSink
+        emitter = Emitter(StdoutSink())
+        app.asgi_app = AuditMiddleware(app.asgi_app, emitter)
 
     return app
 

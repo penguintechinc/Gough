@@ -147,6 +147,43 @@ class Config:
             f"{cls.DB_HOST}:{cls.DB_PORT}/{cls.DB_NAME}"
         )
 
+    @classmethod
+    def validate_secrets(cls) -> None:
+        """Validate that secrets are properly configured.
+
+        In production/non-development environments, raises RuntimeError if any
+        critical secrets still have their dev-default values. Dev/test
+        environments can use defaults.
+
+        Raises:
+            RuntimeError: If running in production with dev-default secrets.
+        """
+        # Only enforce strict validation for production (non-DEBUG, non-TESTING)
+        is_dev_or_test = cls.DEBUG or cls.TESTING
+        if is_dev_or_test:
+            return
+
+        # Check SECRET_KEY
+        if cls.SECRET_KEY == "dev-secret-key-change-in-production":
+            raise RuntimeError(
+                "SECRET_KEY is set to dev default in production. "
+                "Set SECRET_KEY environment variable to a secure random value."
+            )
+
+        # Check JWT_SECRET_KEY
+        if cls.JWT_SECRET_KEY == "dev-secret-key-change-in-production":
+            raise RuntimeError(
+                "JWT_SECRET_KEY is set to dev default in production. "
+                "Set JWT_SECRET_KEY environment variable to a secure random value."
+            )
+
+        # Check SECURITY_PASSWORD_SALT
+        if cls.SECURITY_PASSWORD_SALT == "dev-salt-change-in-production":
+            raise RuntimeError(
+                "SECURITY_PASSWORD_SALT is set to dev default in production. "
+                "Set SECURITY_PASSWORD_SALT environment variable to a secure random value."
+            )
+
 
 class DevelopmentConfig(Config):
     """Development configuration."""

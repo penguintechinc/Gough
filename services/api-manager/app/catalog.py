@@ -89,6 +89,10 @@ def seed_builtin_biomes(db: object) -> None:
 
     Each biome is inserted with signature_verified=True and published_at set
     to indicate they are pre-validated product components.
+
+    Note: default_frontend and default_cni are intentionally not persisted to the
+    biomes table; they are provided in BUILTIN_BIOMES for reference and will be
+    resolved at runtime via biome-specific configuration or defaults.
     """
     from datetime import datetime, timezone
 

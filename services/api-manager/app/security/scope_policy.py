@@ -173,9 +173,14 @@ SCOPE_POLICY: dict[tuple[str, str], frozenset[str] | None] = {
 # ==============================================================================
 
 ANONYMOUS_PATHS: frozenset[tuple[str, str]] = frozenset({
+    ("GET", "/health"),
     ("GET", "/healthz"),
+    ("GET", "/ready"),
     ("GET", "/readyz"),
+    ("GET", "/metrics"),
     ("GET", "/api/v1/version"),
+    ("GET", "/api/v1/openapi.json"),
+    ("GET", "/api/v1/openapi.yaml"),
     ("GET", "/api/v1/ipxe/helper/<string:mac>"),
     ("GET", "/api/v1/ipxe/deploy/<string:mac>"),
     ("GET", "/api/v1/ipxe/kernel/<string:name>"),

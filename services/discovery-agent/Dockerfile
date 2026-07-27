@@ -11,8 +11,8 @@
 
 # ── Stage 1: builder ──────────────────────────────────────────────────────────
 
-# sha256 digest — pin via Renovate
-FROM golang:1.24-bookworm AS builder
+# TODO: pin digest via Renovate
+FROM golang:1.24-bookworm@sha256:<PLACEHOLDER_UPDATE_VIA_RENOVATE> AS builder
 
 ARG VERSION=dev
 ARG XDP_BUILD_TAGS=noxdp,netgo
@@ -38,8 +38,8 @@ RUN file /out/discovery-agent | grep -q "statically linked" || \
 
 # ── Stage 2: runtime ──────────────────────────────────────────────────────────
 
-# sha256 digest — pin via Renovate
-FROM debian:bookworm-slim AS runtime
+# TODO: pin digest via Renovate
+FROM debian:bookworm-slim@sha256:<PLACEHOLDER_UPDATE_VIA_RENOVATE> AS runtime
 
 LABEL org.opencontainers.image.title="gough-discovery-agent"
 LABEL org.opencontainers.image.description="Gough Phase 1 node discovery agent — runs inside Ubuntu 24.04 initrd helper image"

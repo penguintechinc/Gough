@@ -1,7 +1,7 @@
 # Project Template Makefile
 # This Makefile provides common development tasks for multi-language projects
 
-.PHONY: help setup dev test build clean lint format docker deploy
+.PHONY: help setup dev test build clean lint format docker deploy install-hooks
 
 # Default target
 .DEFAULT_GOAL := help
@@ -51,7 +51,7 @@ setup: ## Setup - Install all dependencies and initialize the project
 	@$(MAKE) setup-go
 	@$(MAKE) setup-python
 	@$(MAKE) setup-node
-	@$(MAKE) setup-git-hooks
+	@$(MAKE) install-hooks
 	@echo "$(GREEN)Setup complete!$(RESET)"
 
 setup-env: ## Setup - Create environment file from template
@@ -82,12 +82,11 @@ setup-node: ## Setup - Install Node.js dependencies and tools
 	@npm install
 	@cd services/webui && npm install
 
-setup-git-hooks: ## Setup - Install Git pre-commit hooks
+install-hooks: ## Setup - Install Git hooks from .githooks directory
 	@echo "$(BLUE)Installing Git hooks...$(RESET)"
-	@cp scripts/git-hooks/pre-commit .git/hooks/pre-commit
-	@chmod +x .git/hooks/pre-commit
-	@cp scripts/git-hooks/commit-msg .git/hooks/commit-msg
-	@chmod +x .git/hooks/commit-msg
+	@git config core.hooksPath .githooks
+	@chmod +x .githooks/*
+	@echo "$(GREEN)Git hooks installed (core.hooksPath = .githooks)$(RESET)"
 
 # Development Commands
 dev: ## Development - Start development environment
@@ -415,7 +414,7 @@ docs-build: ## Documentation - Build documentation
 
 # Git Commands
 git-hooks-install: ## Git - Install Git hooks
-	@$(MAKE) setup-git-hooks
+	@$(MAKE) install-hooks
 
 git-hooks-test: ## Git - Test Git hooks
 	@echo "$(BLUE)Testing Git hooks...$(RESET)"

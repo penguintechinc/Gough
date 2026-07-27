@@ -48,6 +48,10 @@ def create_self_signed_cert(common_name: str, spiffe_id: str) -> tuple[str, str]
             x509.UniformResourceIdentifier(spiffe_id),
         ]),
         critical=False,
+    ).add_extension(
+        # Real SPIRE trust-anchor certs are CAs; the hardened validator requires it.
+        x509.BasicConstraints(ca=True, path_length=None),
+        critical=True,
     ).sign(private_key, hashes.SHA256(), default_backend())
 
     # Serialize to PEM

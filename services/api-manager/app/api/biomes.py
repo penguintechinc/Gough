@@ -53,6 +53,26 @@ biomes_bp = Blueprint("biomes", __name__, url_prefix="/api/v1/biomes")
 # ============================================================================
 
 
+def _current_tenant_id() -> str:
+    """Return the tenant_id from the current request context."""
+    tc = g.get("tenant_context")
+    if tc is not None:
+        return getattr(tc, "tenant_id", "__default__")
+    user = g.get("current_user") or {}
+    payload = user.get("_jwt_payload") or {}
+    return payload.get("tenant", "__default__")
+
+
+def _is_cross_tenant() -> bool:
+    """True iff the JWT carries cross_tenant=true (super-admin only)."""
+    tc = g.get("tenant_context")
+    if tc is not None:
+        return bool(getattr(tc, "cross_tenant", False))
+    user = g.get("current_user") or {}
+    payload = user.get("_jwt_payload") or {}
+    return bool(payload.get("cross_tenant", False))
+
+
 # Compliance lanes that require MFA for sign/upgrade flows. Cluster
 # config is not yet wired in M1, so we use the deployment env tier as a
 # proxy: anything other than ``alpha`` is treated as a compliance lane.
@@ -565,6 +585,13 @@ async def get_biome(biome_id: int):
     biome = db(db.biomes.id == biome_id).select().first()
     if not biome:
         return err_not_found(f"Biome {biome_id} not found")
+
+    # Tenant isolation (FIX #7c): guard biome ownership
+    if not _is_cross_tenant():
+        biome_tenant = getattr(biome, "tenant_id", "__default__")
+        if biome_tenant != _current_tenant_id():
+            return err_not_found(f"Biome {biome_id} not found")
+
     return envelope_success({"biome": serialize_biome(biome)})
 
 
@@ -593,6 +620,12 @@ async def update_biome(biome_id: int):
     biome = db(db.biomes.id == biome_id).select().first()
     if not biome:
         return err_not_found(f"Biome {biome_id} not found")
+
+    # Tenant isolation (FIX #7c): guard biome ownership
+    if not _is_cross_tenant():
+        biome_tenant = getattr(biome, "tenant_id", "__default__")
+        if biome_tenant != _current_tenant_id():
+            return err_not_found(f"Biome {biome_id} not found")
 
     # Check for name conflict if name is being changed
     if "name" in data and data["name"] != biome.name:
@@ -675,6 +708,12 @@ async def delete_biome(biome_id: int):
     biome = db(db.biomes.id == biome_id).select().first()
     if not biome:
         return err_not_found(f"Biome {biome_id} not found")
+
+    # Tenant isolation (FIX #7c): guard biome ownership
+    if not _is_cross_tenant():
+        biome_tenant = getattr(biome, "tenant_id", "__default__")
+        if biome_tenant != _current_tenant_id():
+            return err_not_found(f"Biome {biome_id} not found")
 
     hard = _parse_bool(request.args.get("hard")) is True
     if hard and not _user_has_scope("gough.cluster.admin"):

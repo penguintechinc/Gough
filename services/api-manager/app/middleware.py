@@ -313,21 +313,14 @@ async def install_security_middleware(app) -> None:
         async def _tenant_before_request():
             return await _tenant_mw(app, _noop_setter)
 
-    # Step 3: scope enforcement (defensive).
+    # Step 3: scope enforcement (FAIL-CLOSED, FIX #16).
+    # If scope enforcement middleware fails to initialize, the service MUST
+    # refuse to start. This is non-negotiable: serving without scope enforcement
+    # is a critical security failure.
     _scope_result = safe_import_scope_enforcement()
     if _scope_result is not None:
         _scope_mw, _, _ = _scope_result
-        try:
-            await _scope_mw(app)
-        except Exception as exc:  # noqa: BLE001
-            # If scope middleware fails to initialize (e.g., SCOPE_POLICY not
-            # yet defined), log and continue; exporter will still work.
-            import logging
-            logging.warning(
-                "install_security_middleware: scope_enforcement_middleware "
-                "init failed (Wave 1 work may be incomplete): %s",
-                exc,
-            )
+        await _scope_mw(app)  # Re-raise on failure; no try/except
 
 
 # Convenience alias used by app/__init__.py so the factory can simply call
