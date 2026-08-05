@@ -17,10 +17,9 @@ Thread Safety:
 import os
 from penguintechinc_utils import get_logger
 import threading
-from typing import Optional, Dict, Any, List
+from typing import Optional, Dict, Any, List, cast
 from contextlib import contextmanager
 from penguin_dal import DB
-from sqlalchemy import text
 from datetime import datetime
 
 logger = get_logger(__name__)
@@ -109,26 +108,28 @@ def execute_query(
     query: str,
     params: Optional[Dict[str, Any]] = None,
     fetch: bool = True
-) -> Optional[List[Dict[str, Any]]]:
+) -> Optional[List[Any]]:
     """
-    Execute raw SQL query with parameter binding.
+    Execute raw SQL query with parameter binding via penguin-dal executesql.
 
     Args:
-        query: SQL query string
+        query: SQL query string using driver-native placeholders
+            (e.g. ``%(name)s`` for Postgres, ``?`` for sqlite -- NOT
+            SQLAlchemy ``:name`` style, see penguin_dal.DB.executesql).
         params: Query parameters for binding
-        fetch: Whether to fetch results
+        fetch: Whether to return fetched results
 
     Returns:
-        List of row dictionaries if fetch=True, None otherwise
+        List of row tuples if fetch=True, None otherwise
     """
     db = get_db()
     try:
-        with db.engine.connect() as conn:
-            result = conn.execute(text(query), params or {})
-            if fetch:
-                return [dict(row._mapping) for row in result]
-            conn.commit()
-            return None
+        # No as_dict/fields/colnames/return_rowcount passed, so executesql's
+        # broader return union collapses to list[tuple] | None at runtime.
+        result = cast(Optional[List[Any]], db.executesql(query, params))
+        if fetch:
+            return result
+        return None
     except Exception as e:
         logger.error(f"Query execution failed: {e}", exc_info=True)
         raise

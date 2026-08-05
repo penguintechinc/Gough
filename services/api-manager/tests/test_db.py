@@ -167,7 +167,7 @@ class TestGaleraFunctions:
 
         result = set_wsrep_sync_wait(mock_db, level=2)
         assert result is True
-        mock_db.engine.connect.assert_not_called()
+        mock_db.executesql.assert_not_called()
 
     @patch('app.db.galera.is_galera_enabled')
     def test_set_wsrep_sync_wait_success(self, mock_enabled):
@@ -176,12 +176,12 @@ class TestGaleraFunctions:
 
         mock_enabled.return_value = True
         mock_db = MagicMock()
-        mock_conn = MagicMock()
-        mock_db.engine.connect.return_value.__enter__.return_value = mock_conn
 
         result = set_wsrep_sync_wait(mock_db, level=3)
         assert result is True
-        mock_conn.execute.assert_called_once()
+        mock_db.executesql.assert_called_once_with(
+            'SET SESSION wsrep_sync_wait = %(level)s', {'level': 3}
+        )
 
     @patch('app.db.galera.is_galera_enabled')
     def test_set_wsrep_sync_wait_failure(self, mock_enabled):
@@ -190,7 +190,7 @@ class TestGaleraFunctions:
 
         mock_enabled.return_value = True
         mock_db = MagicMock()
-        mock_db.engine.connect.side_effect = Exception("Connection failed")
+        mock_db.executesql.side_effect = Exception("Connection failed")
 
         result = set_wsrep_sync_wait(mock_db, level=1)
         assert result is False
@@ -205,7 +205,7 @@ class TestGaleraFunctions:
 
         result = set_auto_increment_config(mock_db)
         assert result is True
-        mock_db.engine.connect.assert_not_called()
+        mock_db.transaction.assert_not_called()
 
     @patch('app.db.galera.is_galera_enabled')
     @patch('app.db.galera.get_galera_config')
@@ -217,13 +217,13 @@ class TestGaleraFunctions:
         mock_gconf = GaleraConfig(auto_increment_offset=2, auto_increment_increment=3)
         mock_config.return_value = mock_gconf
 
+        mock_tx = MagicMock()
         mock_db = MagicMock()
-        mock_conn = MagicMock()
-        mock_db.engine.connect.return_value.__enter__.return_value = mock_conn
+        mock_db.transaction.return_value.__enter__.return_value = mock_tx
 
         result = set_auto_increment_config(mock_db)
         assert result is True
-        assert mock_conn.execute.call_count == 2
+        assert mock_tx.executesql.call_count == 2
 
     @patch('app.db.galera.is_galera_enabled')
     def test_set_auto_increment_config_custom_values(self, mock_enabled):
@@ -231,12 +231,18 @@ class TestGaleraFunctions:
         from app.db.galera import set_auto_increment_config
 
         mock_enabled.return_value = True
+        mock_tx = MagicMock()
         mock_db = MagicMock()
-        mock_conn = MagicMock()
-        mock_db.engine.connect.return_value.__enter__.return_value = mock_conn
+        mock_db.transaction.return_value.__enter__.return_value = mock_tx
 
         result = set_auto_increment_config(mock_db, offset=5, increment=10)
         assert result is True
+        mock_tx.executesql.assert_any_call(
+            'SET SESSION auto_increment_offset = %(offset)s', {'offset': 5}
+        )
+        mock_tx.executesql.assert_any_call(
+            'SET SESSION auto_increment_increment = %(increment)s', {'increment': 10}
+        )
 
     @patch('app.db.galera.is_galera_enabled')
     def test_get_cluster_status_disabled(self, mock_enabled):
@@ -256,14 +262,11 @@ class TestGaleraFunctions:
 
         mock_enabled.return_value = True
         mock_db = MagicMock()
-        mock_conn = MagicMock()
-        mock_result = [
+        mock_db.executesql.return_value = [
             ('wsrep_cluster_size', '3'),
             ('wsrep_cluster_status', 'Primary'),
             ('wsrep_ready', 'ON'),
         ]
-        mock_conn.execute.return_value = mock_result
-        mock_db.engine.connect.return_value.__enter__.return_value = mock_conn
 
         result = get_cluster_status(mock_db)
         assert isinstance(result, dict)
@@ -277,7 +280,7 @@ class TestGaleraFunctions:
 
         mock_enabled.return_value = True
         mock_db = MagicMock()
-        mock_db.engine.connect.side_effect = Exception("Query failed")
+        mock_db.executesql.side_effect = Exception("Query failed")
 
         result = get_cluster_status(mock_db)
         assert result is None
@@ -608,17 +611,14 @@ class TestDatabaseInit:
 
         monkeypatch.setenv('DATABASE_URL', 'sqlite:///test.db')
         mock_db = MagicMock()
-        mock_conn = MagicMock()
-        mock_result = [MagicMock(_mapping={'id': 1, 'name': 'test'})]
-        mock_conn.execute.return_value = mock_result
-
-        mock_db.engine.connect.return_value.__enter__.return_value = mock_conn
+        mock_db.executesql.return_value = [(1, 'test')]
 
         with patch('app.db.database.get_db', return_value=mock_db):
             result = execute_query("SELECT * FROM test", fetch=True)
 
             assert isinstance(result, list)
             assert len(result) == 1
+            mock_db.executesql.assert_called_once_with("SELECT * FROM test", None)
 
     def test_execute_query_without_fetch(self, monkeypatch):
         """Test execute_query() with fetch=False."""
@@ -626,14 +626,13 @@ class TestDatabaseInit:
 
         monkeypatch.setenv('DATABASE_URL', 'sqlite:///test.db')
         mock_db = MagicMock()
-        mock_conn = MagicMock()
-        mock_db.engine.connect.return_value.__enter__.return_value = mock_conn
+        mock_db.executesql.return_value = None
 
         with patch('app.db.database.get_db', return_value=mock_db):
             result = execute_query("INSERT INTO test VALUES (1)", fetch=False)
 
             assert result is None
-            mock_conn.commit.assert_called_once()
+            mock_db.executesql.assert_called_once_with("INSERT INTO test VALUES (1)", None)
 
     def test_execute_query_with_params(self, monkeypatch):
         """Test execute_query() with parameter binding."""
@@ -641,13 +640,14 @@ class TestDatabaseInit:
 
         monkeypatch.setenv('DATABASE_URL', 'sqlite:///test.db')
         mock_db = MagicMock()
-        mock_conn = MagicMock()
-        mock_db.engine.connect.return_value.__enter__.return_value = mock_conn
+        mock_db.executesql.return_value = [(1,)]
 
         with patch('app.db.database.get_db', return_value=mock_db):
-            execute_query("SELECT * FROM test WHERE id = :id", params={'id': 1})
+            execute_query("SELECT * FROM test WHERE id = %(id)s", params={'id': 1})
 
-            mock_conn.execute.assert_called_once()
+            mock_db.executesql.assert_called_once_with(
+                "SELECT * FROM test WHERE id = %(id)s", {'id': 1}
+            )
 
     def test_execute_query_error(self, monkeypatch):
         """Test execute_query() handles errors."""
@@ -655,7 +655,7 @@ class TestDatabaseInit:
 
         monkeypatch.setenv('DATABASE_URL', 'sqlite:///test.db')
         mock_db = MagicMock()
-        mock_db.engine.connect.side_effect = Exception("Query failed")
+        mock_db.executesql.side_effect = Exception("Query failed")
 
         with patch('app.db.database.get_db', return_value=mock_db):
             with pytest.raises(Exception, match="Query failed"):
