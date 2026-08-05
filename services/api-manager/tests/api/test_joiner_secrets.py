@@ -97,6 +97,51 @@ def _make_secret(**overrides: Any) -> FakeJoinerSecret:
     return FakeJoinerSecret(**base)
 
 
+def _seed_biome(dal_db: Any, **overrides: Any) -> int:
+    """Insert a minimal real ``biomes`` row; ``joiner_secrets.emitter_biome_id``
+    is a NOT NULL FK to it."""
+    base: dict[str, Any] = dict(name="test-biome")
+    base.update(overrides)
+    return int(dal_db.biomes.insert(**base))
+
+
+def _seed_joiner_secret(
+    dal_db: Any, *, emitter_biome_id: Optional[int] = None, **overrides: Any
+) -> str:
+    """Insert a real ``joiner_secrets`` row via penguin-dal; return its id (str).
+
+    Used by tests exercising the penguin-dal-converted read/write paths
+    (``list_joiner_secrets`` / the lookup+revoke-mark in ``rotate_``/
+    ``revoke_joiner_secret``), as opposed to ``_make_secret``, which only
+    builds an in-memory stand-in for pure-serializer tests.
+    """
+    if emitter_biome_id is None:
+        emitter_biome_id = _seed_biome(dal_db)
+    base: dict[str, Any] = dict(
+        id=str(uuid.uuid4()),
+        cluster_id=str(uuid.uuid4()),
+        tenant_id="acme",
+        biome_kind="vault",
+        emitter_biome_id=emitter_biome_id,
+        emitter_node_id=None,
+        extractor_name="root-token",
+        scope="cluster",
+        ciphertext=b"CT-PLAINTEXT-MUST-NEVER-LEAK",
+        iv=b"IIIIIIIIIIII",
+        auth_tag=b"TTTTTTTTTTTTTTTT",
+        dek_wrapped=b"vault:v1:DEK-MUST-NEVER-LEAK",
+        vault_kek_name="gough-joiner-dek-wrap",
+        ttl_seconds=3600,
+        expires_at=datetime.now(timezone.utc) + timedelta(hours=12),
+        rotation_class="vault-unseal",
+        created_at=datetime.now(timezone.utc),
+    )
+    base.update(overrides)
+    base["id"] = str(base["id"])
+    base["cluster_id"] = str(base["cluster_id"])
+    return str(dal_db.joiner_secrets.insert(**base))
+
+
 class FakeQuery:
     """Minimal SQLAlchemy-style query stub backed by a list."""
 
@@ -146,9 +191,23 @@ def _build_app(
     principal: Principal,
     mfa_lane: Optional[str] = None,
     rotation_provider: Optional[Any] = None,
+    dal_db: Optional[Any] = None,
+    monkeypatch: Optional[pytest.MonkeyPatch] = None,
 ) -> Quart:
+    """Build a Quart app with ``joiner_secrets_bp`` registered.
+
+    ``rows``/``FakeSession`` back the still-SQLAlchemy-session-based paths
+    (``g.db_session``, used by ``AuditEventWriter``/``JoinerSecretEmitter``).
+    Pass ``dal_db`` (a real ``pg_db``) + ``monkeypatch`` together to also
+    patch ``joiner_module.get_db`` for the penguin-dal-converted
+    lookup/list/revoke-mark logic.
+    """
     app = Quart(__name__)
     app.register_blueprint(joiner_secrets_bp, url_prefix="/api/v1")
+
+    if dal_db is not None:
+        assert monkeypatch is not None, "dal_db requires monkeypatch"
+        monkeypatch.setattr(joiner_module, "get_db", lambda: dal_db)
 
     session = FakeSession(rows)
 
@@ -256,14 +315,31 @@ class TestSerializerSecretContract:
 
 @pytest.mark.asyncio
 class TestListJoinerSecrets:
-    async def test_list_happy_path_omits_envelope(self) -> None:
+    """Read path -- converted to penguin-dal, exercised against real Postgres.
+
+    ``test_list_requires_scope`` returns before ``list_joiner_secrets`` ever
+    calls ``get_db()`` (scope decorator short-circuits first), so it doesn't
+    need ``pg_db`` and is unchanged.
+    """
+
+    async def test_list_happy_path_omits_envelope(
+        self, pg_db: Any, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
         cluster_id = uuid.uuid4()
-        rows = [
-            _make_secret(cluster_id=cluster_id, biome_kind="vault"),
-            _make_secret(cluster_id=cluster_id, biome_kind="postgres"),
-        ]
+        biome_id = _seed_biome(pg_db)
+        _seed_joiner_secret(
+            pg_db, cluster_id=cluster_id, biome_kind="vault", emitter_biome_id=biome_id
+        )
+        _seed_joiner_secret(
+            pg_db,
+            cluster_id=cluster_id,
+            biome_kind="postgres",
+            emitter_biome_id=biome_id,
+        )
         principal = _principal(scopes={"gough.joiner.read"})
-        app = _build_app(rows=rows, principal=principal)
+        app = _build_app(
+            rows=[], principal=principal, dal_db=pg_db, monkeypatch=monkeypatch
+        )
         client = app.test_client()
         resp = await client.get(f"/api/v1/clusters/{cluster_id}/joiner-secrets")
         assert resp.status_code == 200
@@ -273,33 +349,77 @@ class TestListJoinerSecrets:
             for forbidden in SECRET_FIELDS_MUST_BE_ABSENT:
                 assert forbidden not in item
 
-    async def test_list_filter_egg_kind(self) -> None:
+    async def test_list_empty_result(
+        self, pg_db: Any, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """No secrets for this cluster -> 200 with an empty items list."""
         cluster_id = uuid.uuid4()
-        rows = [_make_secret(cluster_id=cluster_id, biome_kind="vault")]
+        _seed_joiner_secret(pg_db, cluster_id=uuid.uuid4())  # different cluster
         principal = _principal(scopes={"gough.joiner.read"})
-        app = _build_app(rows=rows, principal=principal)
+        app = _build_app(
+            rows=[], principal=principal, dal_db=pg_db, monkeypatch=monkeypatch
+        )
+        client = app.test_client()
+        resp = await client.get(f"/api/v1/clusters/{cluster_id}/joiner-secrets")
+        assert resp.status_code == 200
+        data = await resp.get_json()
+        assert data == {
+            "cluster_id": str(cluster_id),
+            "tenant_id": "acme",
+            "count": 0,
+            "items": [],
+        }
+
+    async def test_list_filter_biome_kind(
+        self, pg_db: Any, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        cluster_id = uuid.uuid4()
+        biome_id = _seed_biome(pg_db)
+        _seed_joiner_secret(
+            pg_db, cluster_id=cluster_id, biome_kind="vault", emitter_biome_id=biome_id
+        )
+        _seed_joiner_secret(
+            pg_db,
+            cluster_id=cluster_id,
+            biome_kind="postgres",
+            emitter_biome_id=biome_id,
+        )
+        principal = _principal(scopes={"gough.joiner.read"})
+        app = _build_app(
+            rows=[], principal=principal, dal_db=pg_db, monkeypatch=monkeypatch
+        )
         client = app.test_client()
         resp = await client.get(
-            f"/api/v1/clusters/{cluster_id}/joiner-secrets?egg_kind=vault"
+            f"/api/v1/clusters/{cluster_id}/joiner-secrets?biome_kind=vault"
         )
         assert resp.status_code == 200
+        data = await resp.get_json()
+        assert data["count"] == 1
+        assert data["items"][0]["biome_kind"] == "vault"
 
-    async def test_list_filter_status_revoked(self) -> None:
+    async def test_list_filter_status_revoked(
+        self, pg_db: Any, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
         cluster_id = uuid.uuid4()
-        rows = [
-            _make_secret(cluster_id=cluster_id),
-            _make_secret(
-                cluster_id=cluster_id, revoked_at=datetime.now(timezone.utc)
-            ),
-        ]
+        biome_id = _seed_biome(pg_db)
+        _seed_joiner_secret(pg_db, cluster_id=cluster_id, emitter_biome_id=biome_id)
+        _seed_joiner_secret(
+            pg_db,
+            cluster_id=cluster_id,
+            emitter_biome_id=biome_id,
+            revoked_at=datetime.now(timezone.utc),
+        )
         principal = _principal(scopes={"gough.joiner.read"})
-        app = _build_app(rows=rows, principal=principal)
+        app = _build_app(
+            rows=[], principal=principal, dal_db=pg_db, monkeypatch=monkeypatch
+        )
         client = app.test_client()
         resp = await client.get(
             f"/api/v1/clusters/{cluster_id}/joiner-secrets?status=revoked"
         )
         assert resp.status_code == 200
         data = await resp.get_json()
+        assert data["count"] == 1
         assert all(item["status"] == "revoked" for item in data["items"])
 
     async def test_list_requires_scope(self) -> None:
@@ -310,16 +430,25 @@ class TestListJoinerSecrets:
         resp = await client.get(f"/api/v1/clusters/{cluster_id}/joiner-secrets")
         assert resp.status_code == 403
 
-    async def test_list_filter_scope_field(self) -> None:
+    async def test_list_filter_scope_field(
+        self, pg_db: Any, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
         cluster_id = uuid.uuid4()
-        rows = [_make_secret(cluster_id=cluster_id, scope="tenant")]
+        biome_id = _seed_biome(pg_db)
+        _seed_joiner_secret(
+            pg_db, cluster_id=cluster_id, scope="tenant", emitter_biome_id=biome_id
+        )
         principal = _principal(scopes={"gough.joiner.read"})
-        app = _build_app(rows=rows, principal=principal)
+        app = _build_app(
+            rows=[], principal=principal, dal_db=pg_db, monkeypatch=monkeypatch
+        )
         client = app.test_client()
         resp = await client.get(
             f"/api/v1/clusters/{cluster_id}/joiner-secrets?scope=tenant"
         )
         assert resp.status_code == 200
+        data = await resp.get_json()
+        assert data["count"] == 1
 
 
 # =============================================================================
@@ -329,9 +458,23 @@ class TestListJoinerSecrets:
 
 @pytest.mark.asyncio
 class TestRotateJoinerSecret:
-    async def test_rotate_happy_path(self) -> None:
+    """The lookup + revoke-mark is converted to penguin-dal (needs ``pg_db``);
+    ``AuditEventWriter``/``JoinerSecretEmitter`` stay on the SQLAlchemy
+    session (``FakeSession``) and ``JoinerSecretEmitter`` itself is replaced
+    by a ``FakeEmitter`` in every test that reaches it, same as before this
+    conversion -- the real class's call signature is already out of sync
+    with this call site independent of DB access (see task report).
+
+    ``test_rotate_missing_reason`` / ``test_rotate_requires_rotate_scope`` /
+    ``test_rotate_mfa_required_in_compliance_lane`` all return before the
+    handler calls ``get_db()``, so they're unchanged.
+    """
+
+    async def test_rotate_happy_path(
+        self, pg_db: Any, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
         cluster_id = uuid.uuid4()
-        original = _make_secret(cluster_id=cluster_id)
+        original_id = _seed_joiner_secret(pg_db, cluster_id=cluster_id)
 
         def provider(_row: Any) -> ExtractedMaterial:
             return ExtractedMaterial(
@@ -345,14 +488,21 @@ class TestRotateJoinerSecret:
             scopes={"gough.joiner.rotate", "gough.joiner.read"}
         )
         app = _build_app(
-            rows=[original], principal=principal, rotation_provider=provider
+            rows=[],
+            principal=principal,
+            rotation_provider=provider,
+            dal_db=pg_db,
+            monkeypatch=monkeypatch,
         )
 
-        # Patch the emitter so we don't actually try to insert rows
+        # Patch the emitter so we don't actually try to run the real
+        # extractor/Vault/control-tunnel flow -- it inserts the "new" row
+        # into the real DB directly so the post-emit lookup finds it.
         from app.api import joiner_secrets as jm
 
+        new_id = uuid.uuid4()
         emit_result = EmitResult(
-            joiner_secret_id=uuid.uuid4(),
+            joiner_secret_id=new_id,
             audit_event_id=uuid.uuid4(),
             expires_at=datetime.now(timezone.utc) + timedelta(seconds=600),
         )
@@ -362,15 +512,13 @@ class TestRotateJoinerSecret:
                 pass
 
             def emit(self, **_: Any) -> EmitResult:
-                # Inject the 'new' row into the session so the post-emit
-                # query can find it.
-                new_row = _make_secret(
+                _seed_joiner_secret(
+                    pg_db,
+                    id=new_id,
                     cluster_id=cluster_id,
-                    id=emit_result.joiner_secret_id,
-                    extractor_name=original.extractor_name,
+                    extractor_name="root-token",
                     expires_at=emit_result.expires_at,
                 )
-                app.config["_session"].rows.insert(0, new_row)
                 return emit_result
 
         original_cls = jm.JoinerSecretEmitter
@@ -378,7 +526,7 @@ class TestRotateJoinerSecret:
         try:
             client = app.test_client()
             resp = await client.post(
-                f"/api/v1/clusters/{cluster_id}/joiner-secrets/{original.id}/rotate",
+                f"/api/v1/clusters/{cluster_id}/joiner-secrets/{original_id}/rotate",
                 json={"reason": "key compromised"},
             )
         finally:
@@ -390,6 +538,7 @@ class TestRotateJoinerSecret:
             assert forbidden not in data["rotated"]
             assert forbidden not in data["new_secret"]
         assert data["rotated"]["status"] == "revoked"
+        assert data["new_secret"]["id"] == str(new_id)
 
     async def test_rotate_missing_reason(self) -> None:
         cluster_id = uuid.uuid4()
@@ -403,10 +552,14 @@ class TestRotateJoinerSecret:
         )
         assert resp.status_code == 400
 
-    async def test_rotate_not_found(self) -> None:
+    async def test_rotate_not_found(
+        self, pg_db: Any, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
         cluster_id = uuid.uuid4()
         principal = _principal(scopes={"gough.joiner.rotate"})
-        app = _build_app(rows=[], principal=principal)
+        app = _build_app(
+            rows=[], principal=principal, dal_db=pg_db, monkeypatch=monkeypatch
+        )
         client = app.test_client()
         resp = await client.post(
             f"/api/v1/clusters/{cluster_id}/joiner-secrets/{uuid.uuid4()}/rotate",
@@ -414,16 +567,20 @@ class TestRotateJoinerSecret:
         )
         assert resp.status_code == 404
 
-    async def test_rotate_already_revoked(self) -> None:
+    async def test_rotate_already_revoked(
+        self, pg_db: Any, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
         cluster_id = uuid.uuid4()
-        secret = _make_secret(
-            cluster_id=cluster_id, revoked_at=datetime.now(timezone.utc)
+        secret_id = _seed_joiner_secret(
+            pg_db, cluster_id=cluster_id, revoked_at=datetime.now(timezone.utc)
         )
         principal = _principal(scopes={"gough.joiner.rotate"})
-        app = _build_app(rows=[secret], principal=principal)
+        app = _build_app(
+            rows=[], principal=principal, dal_db=pg_db, monkeypatch=monkeypatch
+        )
         client = app.test_client()
         resp = await client.post(
-            f"/api/v1/clusters/{cluster_id}/joiner-secrets/{secret.id}/rotate",
+            f"/api/v1/clusters/{cluster_id}/joiner-secrets/{secret_id}/rotate",
             json={"reason": "rotate"},
         )
         assert resp.status_code == 409
@@ -457,9 +614,11 @@ class TestRotateJoinerSecret:
         body = await resp.get_json()
         assert body["error"] == "mfa_required"
 
-    async def test_rotate_mfa_satisfied(self) -> None:
+    async def test_rotate_mfa_satisfied(
+        self, pg_db: Any, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
         cluster_id = uuid.uuid4()
-        secret = _make_secret(cluster_id=cluster_id)
+        secret_id = _seed_joiner_secret(pg_db, cluster_id=cluster_id)
         principal = _principal(scopes={"gough.joiner.rotate"}, mfa=True)
 
         def provider(_row: Any) -> ExtractedMaterial:
@@ -470,10 +629,12 @@ class TestRotateJoinerSecret:
             )
 
         app = _build_app(
-            rows=[secret],
+            rows=[],
             principal=principal,
             mfa_lane="fedramp",
             rotation_provider=provider,
+            dal_db=pg_db,
+            monkeypatch=monkeypatch,
         )
 
         from app.api import joiner_secrets as jm
@@ -483,14 +644,12 @@ class TestRotateJoinerSecret:
                 pass
 
             def emit(self, **_: Any) -> EmitResult:
-                new_row = _make_secret(
-                    cluster_id=cluster_id,
-                    id=uuid.uuid4(),
-                    extractor_name=secret.extractor_name,
+                new_id = uuid.uuid4()
+                _seed_joiner_secret(
+                    pg_db, id=new_id, cluster_id=cluster_id, extractor_name="root-token"
                 )
-                app.config["_session"].rows.insert(0, new_row)
                 return EmitResult(
-                    joiner_secret_id=new_row.id,
+                    joiner_secret_id=new_id,
                     audit_event_id=uuid.uuid4(),
                     expires_at=None,
                 )
@@ -500,7 +659,7 @@ class TestRotateJoinerSecret:
         try:
             client = app.test_client()
             resp = await client.post(
-                f"/api/v1/clusters/{cluster_id}/joiner-secrets/{secret.id}/rotate",
+                f"/api/v1/clusters/{cluster_id}/joiner-secrets/{secret_id}/rotate",
                 json={"reason": "scheduled"},
             )
         finally:
@@ -508,15 +667,19 @@ class TestRotateJoinerSecret:
 
         assert resp.status_code == 201
 
-    async def test_rotate_provider_missing_returns_503(self) -> None:
+    async def test_rotate_provider_missing_returns_503(
+        self, pg_db: Any, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
         cluster_id = uuid.uuid4()
-        secret = _make_secret(cluster_id=cluster_id)
+        secret_id = _seed_joiner_secret(pg_db, cluster_id=cluster_id)
         principal = _principal(scopes={"gough.joiner.rotate"})
-        app = _build_app(rows=[secret], principal=principal)
+        app = _build_app(
+            rows=[], principal=principal, dal_db=pg_db, monkeypatch=monkeypatch
+        )
         # No rotation_provider configured
         client = app.test_client()
         resp = await client.post(
-            f"/api/v1/clusters/{cluster_id}/joiner-secrets/{secret.id}/rotate",
+            f"/api/v1/clusters/{cluster_id}/joiner-secrets/{secret_id}/rotate",
             json={"reason": "rotate"},
         )
         assert resp.status_code == 503
@@ -529,14 +692,24 @@ class TestRotateJoinerSecret:
 
 @pytest.mark.asyncio
 class TestRevokeJoinerSecret:
-    async def test_revoke_happy_path(self) -> None:
+    """Same split as TestRotateJoinerSecret: lookup + revoke-mark via
+    penguin-dal (``pg_db``), ``AuditEventWriter`` stays on the SQLAlchemy
+    session. ``test_revoke_missing_reason``/``test_revoke_requires_admin_scope``
+    return before ``get_db()`` is called, so they're unchanged.
+    """
+
+    async def test_revoke_happy_path(
+        self, pg_db: Any, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
         cluster_id = uuid.uuid4()
-        secret = _make_secret(cluster_id=cluster_id)
+        secret_id = _seed_joiner_secret(pg_db, cluster_id=cluster_id)
         principal = _principal(scopes={"gough.cluster.admin"})
-        app = _build_app(rows=[secret], principal=principal)
+        app = _build_app(
+            rows=[], principal=principal, dal_db=pg_db, monkeypatch=monkeypatch
+        )
         client = app.test_client()
         resp = await client.delete(
-            f"/api/v1/clusters/{cluster_id}/joiner-secrets/{secret.id}",
+            f"/api/v1/clusters/{cluster_id}/joiner-secrets/{secret_id}",
             json={"reason": "manual revoke"},
         )
         assert resp.status_code == 200
@@ -557,10 +730,14 @@ class TestRevokeJoinerSecret:
         )
         assert resp.status_code == 400
 
-    async def test_revoke_not_found(self) -> None:
+    async def test_revoke_not_found(
+        self, pg_db: Any, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
         cluster_id = uuid.uuid4()
         principal = _principal(scopes={"gough.cluster.admin"})
-        app = _build_app(rows=[], principal=principal)
+        app = _build_app(
+            rows=[], principal=principal, dal_db=pg_db, monkeypatch=monkeypatch
+        )
         client = app.test_client()
         resp = await client.delete(
             f"/api/v1/clusters/{cluster_id}/joiner-secrets/{uuid.uuid4()}",
@@ -568,16 +745,20 @@ class TestRevokeJoinerSecret:
         )
         assert resp.status_code == 404
 
-    async def test_revoke_idempotent_already_revoked_returns_409(self) -> None:
+    async def test_revoke_idempotent_already_revoked_returns_409(
+        self, pg_db: Any, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
         cluster_id = uuid.uuid4()
-        secret = _make_secret(
-            cluster_id=cluster_id, revoked_at=datetime.now(timezone.utc)
+        secret_id = _seed_joiner_secret(
+            pg_db, cluster_id=cluster_id, revoked_at=datetime.now(timezone.utc)
         )
         principal = _principal(scopes={"gough.cluster.admin"})
-        app = _build_app(rows=[secret], principal=principal)
+        app = _build_app(
+            rows=[], principal=principal, dal_db=pg_db, monkeypatch=monkeypatch
+        )
         client = app.test_client()
         resp = await client.delete(
-            f"/api/v1/clusters/{cluster_id}/joiner-secrets/{secret.id}",
+            f"/api/v1/clusters/{cluster_id}/joiner-secrets/{secret_id}",
             json={"reason": "rev"},
         )
         assert resp.status_code == 409

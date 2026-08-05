@@ -82,6 +82,33 @@ def _make_row(**overrides: Any) -> FakeAuditRow:
     return FakeAuditRow(**base)
 
 
+def _seed_audit_event(dal_db: Any, **overrides: Any) -> str:
+    """Insert a real ``audit_events`` row via penguin-dal; return its id (str).
+
+    Used by tests exercising the penguin-dal-converted read paths
+    (``list_audit_events`` / ``_stream_audit_events_jsonl``), as opposed to
+    ``_make_row``, which only builds an in-memory stand-in for the
+    still-SQLAlchemy-session-based paths (``verify_audit_chain`` / the
+    ``AuditEventWriter`` self-audit inside ``export_audit_log``).
+    """
+    base: dict[str, Any] = dict(
+        id=str(uuid.uuid4()),
+        ts=datetime.now(timezone.utc),
+        cluster_id="test-cluster",
+        tenant_id="acme",
+        actor_sub="alice@acme",
+        actor_scope=["gough.audit.read"],
+        action="joiner.secret.emit",
+        resource_kind="joiner_secret",
+        resource_id=str(uuid.uuid4()),
+        prev_hash=b"\x00" * 32,
+        hash=b"\x11" * 32,
+    )
+    base.update(overrides)
+    base["id"] = str(base["id"])
+    return str(dal_db.audit_events.insert(**base))
+
+
 class FakeQuery:
     def __init__(self, rows: list[Any]) -> None:
         self._rows = list(rows)
@@ -160,9 +187,23 @@ def _build_app(
     verify_result: Optional[dict[str, Any]] = None,
     mfa_lane: Optional[str] = None,
     nats_client: Optional[Any] = None,
+    dal_db: Optional[Any] = None,
+    monkeypatch: Optional[pytest.MonkeyPatch] = None,
 ) -> Quart:
+    """Build a Quart app with ``audit_bp`` registered.
+
+    ``rows``/``FakeSession`` back the still-SQLAlchemy-session-based paths
+    (``g.db_session``, used by ``verify_chain``/``AuditEventWriter``). Pass
+    ``dal_db`` (a real ``pg_db``) + ``monkeypatch`` together to also patch
+    ``audit_module.get_db`` for handlers converted to the penguin-dal
+    overlay (``list_audit_events`` / ``export_audit_log``'s export stream).
+    """
     app = Quart(__name__)
     app.register_blueprint(audit_bp, url_prefix="/api/v1/audit")
+
+    if dal_db is not None:
+        assert monkeypatch is not None, "dal_db requires monkeypatch"
+        monkeypatch.setattr(audit_module, "get_db", lambda: dal_db)
 
     session = FakeSession(rows)
 
@@ -228,10 +269,25 @@ class TestSerializerAuditEvent:
 
 @pytest.mark.asyncio
 class TestListAuditEvents:
-    async def test_list_happy_path(self) -> None:
-        rows = [_make_row(), _make_row(action="cluster_init")]
+    """Read path -- converted to penguin-dal, exercised against real Postgres.
+
+    ``test_list_invalid_format`` / ``test_list_requires_scope`` /
+    ``test_list_cluster_id_filter_requires_superadmin`` /
+    ``test_list_invalid_cursor`` all return before ``list_audit_events``
+    ever calls ``get_db()`` (bad input / scope check short-circuits first),
+    so they don't need ``pg_db`` and are unchanged.
+    """
+
+    async def test_list_happy_path(
+        self, pg_db: Any, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        _seed_audit_event(pg_db, tenant_id="acme")
+        _seed_audit_event(pg_db, tenant_id="acme", action="cluster_init")
         app = _build_app(
-            rows=rows, principal=_principal(scopes={"gough.audit.read"})
+            rows=[],
+            principal=_principal(scopes={"gough.audit.read"}),
+            dal_db=pg_db,
+            monkeypatch=monkeypatch,
         )
         client = app.test_client()
         resp = await client.get("/api/v1/audit/events")
@@ -239,10 +295,38 @@ class TestListAuditEvents:
         body = await resp.get_json()
         assert body["count"] == 2
 
-    async def test_list_format_jsonl(self) -> None:
-        rows = [_make_row(), _make_row()]
+    async def test_list_empty_result(
+        self, pg_db: Any, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """No rows for this tenant -> 200 with an empty items list."""
+        _seed_audit_event(pg_db, tenant_id="other-tenant")
         app = _build_app(
-            rows=rows, principal=_principal(scopes={"gough.audit.read"})
+            rows=[],
+            principal=_principal(scopes={"gough.audit.read"}, tenant="acme"),
+            dal_db=pg_db,
+            monkeypatch=monkeypatch,
+        )
+        client = app.test_client()
+        resp = await client.get("/api/v1/audit/events")
+        assert resp.status_code == 200
+        body = await resp.get_json()
+        assert body == {
+            "tenant_id": "acme",
+            "count": 0,
+            "next_cursor": None,
+            "items": [],
+        }
+
+    async def test_list_format_jsonl(
+        self, pg_db: Any, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        _seed_audit_event(pg_db, tenant_id="acme")
+        _seed_audit_event(pg_db, tenant_id="acme")
+        app = _build_app(
+            rows=[],
+            principal=_principal(scopes={"gough.audit.read"}),
+            dal_db=pg_db,
+            monkeypatch=monkeypatch,
         )
         client = app.test_client()
         resp = await client.get("/api/v1/audit/events?format=jsonl")
@@ -274,19 +358,25 @@ class TestListAuditEvents:
         )
         assert resp.status_code == 403
 
-    async def test_list_cluster_id_filter_with_superadmin(self) -> None:
-        rows = [_make_row(cluster_id="other-cluster")]
+    async def test_list_cluster_id_filter_with_superadmin(
+        self, pg_db: Any, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        _seed_audit_event(pg_db, tenant_id="acme", cluster_id="other-cluster")
         app = _build_app(
-            rows=rows,
+            rows=[],
             principal=_principal(
                 scopes={"gough.audit.read", "gough.cluster.superadmin"}
             ),
+            dal_db=pg_db,
+            monkeypatch=monkeypatch,
         )
         client = app.test_client()
         resp = await client.get(
             "/api/v1/audit/events?cluster_id=other-cluster"
         )
         assert resp.status_code == 200
+        body = await resp.get_json()
+        assert body["count"] == 1
 
     async def test_list_invalid_cursor(self) -> None:
         app = _build_app(
@@ -296,10 +386,23 @@ class TestListAuditEvents:
         resp = await client.get("/api/v1/audit/events?cursor=not-a-uuid")
         assert resp.status_code == 400
 
-    async def test_list_filters_dont_500(self) -> None:
-        rows = [_make_row(action="x", actor_sub="bob@acme")]
+    async def test_list_filters_dont_500(
+        self, pg_db: Any, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        _seed_audit_event(
+            pg_db,
+            tenant_id="acme",
+            action="x",
+            actor_sub="bob@acme",
+            resource_kind="joiner_secret",
+            resource_id="abc",
+            request_id="req-1",
+        )
         app = _build_app(
-            rows=rows, principal=_principal(scopes={"gough.audit.read"})
+            rows=[],
+            principal=_principal(scopes={"gough.audit.read"}),
+            dal_db=pg_db,
+            monkeypatch=monkeypatch,
         )
         client = app.test_client()
         resp = await client.get(
@@ -310,6 +413,34 @@ class TestListAuditEvents:
             "&request_id=req-1"
         )
         assert resp.status_code == 200
+        body = await resp.get_json()
+        assert body["count"] == 1
+
+    async def test_list_cursor_pagination_excludes_rows_at_or_before_cursor(
+        self, pg_db: Any, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """``cursor`` filters to ``id > cursor`` -- exercises the
+        str(uuid)-cast keyset comparison against the VARCHAR(36) id column.
+
+        Explicit, lexicographically-ordered ids (rather than random uuid4)
+        so ``id > cursor`` has a deterministic result to assert on.
+        """
+        first_id = "00000000-0000-0000-0000-000000000001"
+        second_id = "00000000-0000-0000-0000-000000000002"
+        _seed_audit_event(pg_db, id=first_id, tenant_id="acme")
+        _seed_audit_event(pg_db, id=second_id, tenant_id="acme")
+        app = _build_app(
+            rows=[],
+            principal=_principal(scopes={"gough.audit.read"}),
+            dal_db=pg_db,
+            monkeypatch=monkeypatch,
+        )
+        client = app.test_client()
+        resp = await client.get(f"/api/v1/audit/events?cursor={first_id}")
+        assert resp.status_code == 200
+        body = await resp.get_json()
+        assert body["count"] == 1
+        assert body["items"][0]["id"] == second_id
 
 
 # =============================================================================
@@ -391,15 +522,20 @@ class TestVerifyAuditChain:
 
 
 class TestStreamAuditEventsJsonl:
-    def test_stream_yields_one_line_per_row_plus_signature(self) -> None:
-        rows = [_make_row(), _make_row()]
-        session = FakeSession(rows)
+    """``db`` is a real penguin-dal DB (pg_db) now, not a SQLAlchemy session --
+    this helper does its own keyset-paginated SELECT (see the docstring on
+    ``_stream_audit_events_jsonl``), so it needs real ``audit_events`` rows.
+    """
+
+    def test_stream_yields_one_line_per_row_plus_signature(self, pg_db: Any) -> None:
+        _seed_audit_event(pg_db)
+        _seed_audit_event(pg_db)
         vault = MagicMock()
         vault.transit_sign.return_value = "vault:v1:sig"
 
         chunks = list(
             _stream_audit_events_jsonl(
-                session,
+                pg_db,
                 cluster_id_label="test-cluster",
                 target_sub="auditor@acme",
                 vault_client=vault,
@@ -419,12 +555,45 @@ class TestStreamAuditEventsJsonl:
         assert footer["signature"] == "vault:v1:sig"
         assert footer["target_sub"] == "auditor@acme"
 
-    def test_stream_with_no_vault_emits_unsigned(self) -> None:
-        rows = [_make_row()]
-        session = FakeSession(rows)
+    def test_stream_empty_table_yields_only_footer(self, pg_db: Any) -> None:
         chunks = list(
             _stream_audit_events_jsonl(
-                session,
+                pg_db,
+                cluster_id_label="test-cluster",
+                target_sub=None,
+                vault_client=None,
+                signing_key="gough-audit-export",
+            )
+        )
+        body = b"".join(chunks).decode("utf-8").strip().splitlines()
+        assert len(body) == 1  # footer only
+        footer = json.loads(body[0])
+        assert footer["rows_exported"] == 0
+
+    def test_stream_paginates_across_batch_boundary(self, pg_db: Any) -> None:
+        """More rows than ``batch_size`` -- keyset loop must fetch every page."""
+        for _ in range(5):
+            _seed_audit_event(pg_db)
+        chunks = list(
+            _stream_audit_events_jsonl(
+                pg_db,
+                cluster_id_label="test-cluster",
+                target_sub=None,
+                vault_client=None,
+                signing_key="gough-audit-export",
+                batch_size=2,
+            )
+        )
+        body = b"".join(chunks).decode("utf-8").strip().splitlines()
+        assert len(body) == 6  # 5 rows + footer
+        footer = json.loads(body[-1])
+        assert footer["rows_exported"] == 5
+
+    def test_stream_with_no_vault_emits_unsigned(self, pg_db: Any) -> None:
+        _seed_audit_event(pg_db)
+        chunks = list(
+            _stream_audit_events_jsonl(
+                pg_db,
                 cluster_id_label="test-cluster",
                 target_sub=None,
                 vault_client=None,
@@ -435,14 +604,13 @@ class TestStreamAuditEventsJsonl:
         footer = json.loads(body[-1])
         assert footer["signature"] == "unsigned"
 
-    def test_stream_handles_vault_error_gracefully(self) -> None:
-        rows = [_make_row()]
-        session = FakeSession(rows)
+    def test_stream_handles_vault_error_gracefully(self, pg_db: Any) -> None:
+        _seed_audit_event(pg_db)
         vault = MagicMock()
         vault.transit_sign.side_effect = RuntimeError("vault sealed")
         chunks = list(
             _stream_audit_events_jsonl(
-                session,
+                pg_db,
                 cluster_id_label="test-cluster",
                 target_sub=None,
                 vault_client=vault,
@@ -480,17 +648,22 @@ class TestExportAuditLog:
         resp = await client.get("/api/v1/audit/export")
         assert resp.status_code == 401
 
-    async def test_export_streams_jsonl_and_signs(self) -> None:
-        rows = [_make_row(), _make_row()]
+    async def test_export_streams_jsonl_and_signs(
+        self, pg_db: Any, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        _seed_audit_event(pg_db)
+        _seed_audit_event(pg_db)
         nats_client = MagicMock()
         nats_client.publish = MagicMock()
         app = _build_app(
-            rows=rows,
+            rows=[],
             principal=_principal(
                 scopes={"gough.cluster.superadmin"}, mfa=True
             ),
             mfa_lane="fedramp",
             nats_client=nats_client,
+            dal_db=pg_db,
+            monkeypatch=monkeypatch,
         )
         client = app.test_client()
         resp = await client.get(
@@ -515,24 +688,32 @@ class TestExportAuditLog:
             "Content-Disposition"
         ]
 
-    async def test_export_no_nats_client_does_not_fail(self) -> None:
-        rows = [_make_row()]
+    async def test_export_no_nats_client_does_not_fail(
+        self, pg_db: Any, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        _seed_audit_event(pg_db)
         app = _build_app(
-            rows=rows,
+            rows=[],
             principal=_principal(scopes={"gough.cluster.superadmin"}, mfa=True),
+            dal_db=pg_db,
+            monkeypatch=monkeypatch,
         )
         client = app.test_client()
         resp = await client.get("/api/v1/audit/export")
         assert resp.status_code == 200
 
-    async def test_export_nats_publish_failure_does_not_break_export(self) -> None:
-        rows = [_make_row()]
+    async def test_export_nats_publish_failure_does_not_break_export(
+        self, pg_db: Any, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        _seed_audit_event(pg_db)
         nats_client = MagicMock()
         nats_client.publish.side_effect = RuntimeError("nats down")
         app = _build_app(
-            rows=rows,
+            rows=[],
             principal=_principal(scopes={"gough.cluster.superadmin"}, mfa=True),
             nats_client=nats_client,
+            dal_db=pg_db,
+            monkeypatch=monkeypatch,
         )
         client = app.test_client()
         resp = await client.get("/api/v1/audit/export")

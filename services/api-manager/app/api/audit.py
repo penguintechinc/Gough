@@ -39,6 +39,8 @@ from app.security.audit_chain import (
 from app.security.scope_enforcement import require_scopes
 from app.security.tenant import set_tenant_guc
 
+from ..db.database import get_db
+
 log = logging.getLogger(__name__)
 
 audit_bp = Blueprint("audit", __name__)
@@ -203,12 +205,19 @@ def _build_audit_writer(cluster_id: str) -> AuditEventWriter:
 @audit_bp.route("/events", methods=["GET"])
 @require_scopes("gough.audit.read")
 async def list_audit_events():
-    """Paginated, tenant-scoped query over ``audit_events``."""
-    from app.models_m1 import AuditEvent  # local import to avoid circulars
+    """Paginated, tenant-scoped query over ``audit_events``.
 
+    Runtime reads go through the penguin-dal overlay (``get_db()``), not the
+    SQLAlchemy session -- there is no other SQLAlchemy-session-bound call in
+    this handler that needs to share a connection/transaction with this
+    query, so it does not call ``set_tenant_guc``/``_get_db_session()``
+    either; this matches every other penguin-dal-backed API module in this
+    service (nodes/biomes/webhooks/clusters/disks), none of which call
+    ``set_tenant_guc`` -- tenant isolation here is enforced by the explicit
+    ``tenant_id ==`` filter below (Layer 1/2 app-level scoping), same as
+    those modules.
+    """
     tenant_id = _get_tenant_id()
-    db = _get_db_session()
-    set_tenant_guc(db, tenant_id)
 
     args = request.args
     since = _parse_iso8601(args.get("since"))
@@ -234,47 +243,56 @@ async def list_audit_events():
         page_size = DEFAULT_PAGE_SIZE
     cursor = args.get("cursor")
 
-    query = db.query(AuditEvent).filter(AuditEvent.tenant_id == tenant_id)
+    if cluster_id_filter and not _is_super_admin():
+        return (
+            jsonify(
+                {
+                    "error": "forbidden",
+                    "message": (
+                        "cluster_id filter requires gough.cluster.superadmin"
+                    ),
+                }
+            ),
+            403,
+        )
 
-    if cluster_id_filter:
-        if not _is_super_admin():
-            return (
-                jsonify(
-                    {
-                        "error": "forbidden",
-                        "message": (
-                            "cluster_id filter requires gough.cluster.superadmin"
-                        ),
-                    }
-                ),
-                403,
-            )
-        query = query.filter(AuditEvent.cluster_id == cluster_id_filter)
-
-    if since:
-        query = query.filter(AuditEvent.ts >= since)
-    if until:
-        query = query.filter(AuditEvent.ts <= until)
-    if actor_sub:
-        query = query.filter(AuditEvent.actor_sub == actor_sub)
-    if action:
-        query = query.filter(AuditEvent.action == action)
-    if resource_kind:
-        query = query.filter(AuditEvent.resource_kind == resource_kind)
-    if resource_id:
-        query = query.filter(AuditEvent.resource_id == resource_id)
-    if request_id:
-        query = query.filter(AuditEvent.request_id == request_id)
+    cursor_uuid: Optional[uuid.UUID] = None
     if cursor:
         try:
             cursor_uuid = uuid.UUID(cursor)
-            query = query.filter(AuditEvent.id > cursor_uuid)
         except (TypeError, ValueError):
             return jsonify({"error": "invalid_cursor"}), 400
 
-    rows = query.order_by(AuditEvent.id.asc()).limit(page_size + 1).all()
+    db = get_db()
+    query = db.audit_events.tenant_id == tenant_id
+
+    if cluster_id_filter:
+        query = query & (db.audit_events.cluster_id == cluster_id_filter)
+    if since:
+        query = query & (db.audit_events.ts >= since)
+    if until:
+        query = query & (db.audit_events.ts <= until)
+    if actor_sub:
+        query = query & (db.audit_events.actor_sub == actor_sub)
+    if action:
+        query = query & (db.audit_events.action == action)
+    if resource_kind:
+        query = query & (db.audit_events.resource_kind == resource_kind)
+    if resource_id:
+        query = query & (db.audit_events.resource_id == resource_id)
+    if request_id:
+        query = query & (db.audit_events.request_id == request_id)
+    if cursor_uuid is not None:
+        # ``id`` is physically VARCHAR(36) (app.models_m1.UUID TypeDecorator
+        # stores as string) -- reflected by penguin-dal as a String column,
+        # so compare against the string form, not the uuid.UUID object.
+        query = query & (db.audit_events.id > str(cursor_uuid))
+
+    rows = db(query).select(
+        orderby=db.audit_events.id, limitby=(0, page_size + 1)
+    )
     has_more = len(rows) > page_size
-    rows = rows[:page_size]
+    rows = list(rows)[:page_size]
     next_cursor = str(rows[-1].id) if rows and has_more else None
     items = [_serialize_audit_event(r) for r in rows]
 
@@ -335,25 +353,45 @@ def _stream_audit_events_jsonl(
     target_sub: Optional[str],
     vault_client: Optional[Any],
     signing_key: str,
+    batch_size: int = 500,
 ) -> Iterable[bytes]:
     """Synchronously yield JSONL bytes for the entire ``audit_events`` table.
+
+    ``db`` is a penguin-dal ``DB`` instance. penguin-dal's ``.select()`` has
+    no server-side cursor (it materializes its full result set per call), so
+    there is no direct ``yield_per``-equivalent -- memory-bounded iteration
+    over the whole table is done here with a keyset-paginated loop instead:
+    batches of ``batch_size`` rows ordered by ``id`` (UUIDv7, monotonically
+    increasing), each batch's last id feeding the next batch's ``WHERE id >
+    :last_id``. Cross-tenant by design (superadmin-only export, unchanged
+    from the pre-conversion behavior -- no tenant filter here).
 
     Each row is hashed (SHA-256 over JCS canonical form) into a rolling export
     digest. The final line is a Vault-transit signature over that digest so a
     downstream verifier can detect tampering during transport.
     """
-    from app.models_m1 import AuditEvent
-
     rolling = hashlib.sha256()
     count = 0
+    # ``id`` is physically VARCHAR(36) (see app.models_m1.UUID
+    # TypeDecorator); an all-zero UUID sentinel sorts before every real
+    # UUIDv7 id as a string too, so it's a safe "no rows yet" starting point.
+    last_id = str(uuid.UUID(int=0))
 
-    query = db.query(AuditEvent).order_by(AuditEvent.id.asc()).yield_per(500)
-    for row in query:
-        record = _serialize_audit_event(row)
-        canonical = canonicalize_record(record)
-        rolling.update(canonical)
-        count += 1
-        yield canonical + b"\n"
+    while True:
+        batch = db(db.audit_events.id > last_id).select(
+            orderby=db.audit_events.id, limitby=(0, batch_size)
+        )
+        if not batch:
+            break
+        for row in batch:
+            record = _serialize_audit_event(row)
+            canonical = canonicalize_record(record)
+            rolling.update(canonical)
+            count += 1
+            yield canonical + b"\n"
+        last_id = batch[-1].id
+        if len(batch) < batch_size:
+            break
 
     digest = rolling.digest()
 
@@ -399,8 +437,12 @@ async def export_audit_log():
             401,
         )
 
-    db = _get_db_session()
-    set_tenant_guc(db, tenant_id)
+    # This session is only needed for the SQLAlchemy-session-based
+    # AuditEventWriter below (app.security.audit_chain, out of scope for the
+    # penguin-dal conversion) -- unrelated to the penguin-dal read used for
+    # the actual export stream a few lines down.
+    db_session = _get_db_session()
+    set_tenant_guc(db_session, tenant_id)
 
     target_sub = request.args.get("target_sub")
     cluster_id_label = current_app.config.get("CLUSTER_ID", "unknown")
@@ -441,10 +483,12 @@ async def export_audit_log():
         except Exception:
             log.exception("Failed to publish gough.audit.exported NATS event")
 
+    dal_db = get_db()
+
     @stream_with_context
     async def _async_stream() -> AsyncIterator[bytes]:
         for chunk in _stream_audit_events_jsonl(
-            db,
+            dal_db,
             cluster_id_label=cluster_id_label,
             target_sub=target_sub,
             vault_client=vault_client,
