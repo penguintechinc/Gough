@@ -4,54 +4,30 @@ Reuses ``$DATABASE_URL`` when present (CI service container); otherwise spins
 an ephemeral ``postgres:16-bookworm`` container via testcontainers for the
 duration of the pytest session.
 
-Schema is built from BOTH SQLAlchemy declarative bases used by this service:
-
-* ``app.models_sqlalchemy.Base`` -- the main app models. Importing
-  ``app.models_m1`` additionally registers the M1 sprint tables (``nodes``,
-  ``leader_leases``, ``joiner_secrets``, ``audit_events``, ...) onto this
-  SAME ``Base.metadata`` object -- ``models_m1`` does not declare its own
-  Base, it just needs to be imported for its classes to register (see
-  ``app.models_sqlalchemy.create_all_tables``, which does the same import
-  for exactly this reason).
-* ``app.db.init_db.Base`` -- a second, unrelated declarative base holding
-  ``api_definitions`` / ``api_usage`` / ``api_keys``.
-
-Known gap: three tables used at runtime via penguin-dal have no SQLAlchemy
-model in either base -- they exist only as raw ``op.create_table()`` calls in
-Alembic migrations, so ``Base.metadata.create_all()`` cannot create them:
-
-* ``vault_bootstrap_tokens`` (alembic/versions/20260430_1100_plan4_security.py)
-* ``alert_rules`` (alembic/versions/20260430_1100_plan4_security.py)
-* ``upgrade_runs`` (alembic/versions/20260509_1000_create_upgrade_runs_table.py)
-  -- actively read/written via ``db.upgrade_runs`` in ``app/api/biomes.py``.
-
-Four Postgres views (``v_nodes_public``, ``v_eggs_public``,
-``v_capacity_public``, ``v_audit_events_redacted``) and the per-service DB
-roles/grants are likewise Alembic-only (raw ``op.execute()`` DDL) and are not
-recreated here. See task-3-report.md for the full breakdown. Tests that need
-any of the above should extend ``pg_db`` locally (e.g. via ``pg_url`` +
-raw DDL) until a follow-up task decides how to fold them in -- do not assume
-they exist on ``pg_db`` yet.
-
-Pre-existing schema bug worked around here (NOT fixed at the source -- out of
-this fixture's scope, see task-3-report.md): ``models_m1.Node.hardware_tags``
-is a plain ``JSON`` column with a plain btree index
-(``ix_nodes_hardware_tags``). Postgres' ``json`` type has no default btree
-operator class, so ``CREATE INDEX`` -- and therefore the entire
-``Base.metadata.create_all()`` call -- fails outright on real Postgres (SQLite
-never caught this because it has no real type/operator-class system). This
-same bug would hit ``app.models_sqlalchemy.create_all_tables()`` in a real
-deployment, not just this fixture. ``pg_db`` skips creating that one index
-(table + all other indexes/tables are created normally) so schema setup can
-proceed; needs a real fix (e.g. ``JSONB`` + GIN, or drop the index) in
-``app/models_m1.py`` under its own task.
+Schema is built exactly once per session by running the real Alembic
+migration chain (``alembic upgrade head``, currently a single baseline --
+``alembic/versions/20260805_1000_baseline_full_schema.py``) against the
+target database. This is the same migration that builds production schema
+(62 tables, 4 views, RLS policies, per-service DB roles), so this fixture and
+production share one schema authority instead of drifting via a hand-rolled
+``Base.metadata.create_all()``. Function-scoped ``pg_db`` gets per-test
+isolation by TRUNCATE-ing every data table between tests rather than
+re-running migrations per test, which would be both slow and unnecessary --
+the schema itself never changes mid-session.
 """
 
+from __future__ import annotations
+
+import logging
 import os
 from collections.abc import Iterator
+from pathlib import Path
+from urllib.parse import urlparse
 
 import pytest
 from penguin_dal import DB
+
+SERVICE_ROOT = Path(__file__).resolve().parent.parent
 
 
 @pytest.fixture(scope="session")
@@ -73,55 +49,108 @@ def pg_url() -> Iterator[str]:
         yield pg.get_connection_url().replace("postgresql+psycopg2://", "postgresql://")
 
 
+def _upgrade_head(pg_url: str) -> None:
+    """Run ``alembic upgrade head`` against ``pg_url``.
+
+    ``alembic/env.py`` resolves its connection string from
+    ``app.config.Config.get_db_uri()``, which is built from ``DB_HOST`` /
+    ``DB_PORT`` / ``DB_USER`` / ``DB_PASS`` / ``DB_NAME`` / ``DB_TYPE`` read
+    at class-definition (first-import) time -- not from ``$DATABASE_URL``
+    directly. Point Alembic at the test database by setting those env vars
+    from the parsed ``pg_url`` before invoking it, then restore whatever was
+    there beforehand so this doesn't leak into other tests/fixtures.
+
+    ``env.py`` also calls ``logging.config.fileConfig()``, which -- with its
+    default ``disable_existing_loggers=True`` -- permanently disables every
+    ``logging.Logger`` already registered under a name not listed in
+    ``alembic.ini``'s ``[loggers]`` section (only ``root``, ``sqlalchemy``,
+    ``alembic`` are). A real, subprocess ``alembic upgrade head`` never
+    surfaces this (nothing else shares that process' logging state), but
+    running it in-process here would otherwise silently and permanently mute
+    every other module's logger for the rest of the pytest session (caught
+    empirically: it broke an unrelated ``caplog`` assertion elsewhere in the
+    suite). Re-enable anything fileConfig newly disabled once the upgrade is
+    done, leaving loggers that were already disabled beforehand alone.
+    """
+    from alembic import command
+    from alembic.config import Config as AlembicConfig
+
+    logger_dict = logging.Logger.manager.loggerDict
+    already_disabled = {
+        name
+        for name, candidate in logger_dict.items()
+        if isinstance(candidate, logging.Logger) and candidate.disabled
+    }
+
+    parsed = urlparse(pg_url)
+    overrides = {
+        "DB_TYPE": "postgresql",
+        "DB_HOST": parsed.hostname or "localhost",
+        "DB_PORT": str(parsed.port or 5432),
+        "DB_NAME": (parsed.path or "/").lstrip("/"),
+        "DB_USER": parsed.username or "",
+        "DB_PASS": parsed.password or "",
+    }
+    previous = {key: os.environ.get(key) for key in overrides}
+    os.environ.update(overrides)
+    try:
+        cfg = AlembicConfig(str(SERVICE_ROOT / "alembic.ini"))
+        cfg.set_main_option("script_location", str(SERVICE_ROOT / "alembic"))
+        command.upgrade(cfg, "head")
+    finally:
+        for key, value in previous.items():
+            if value is None:
+                os.environ.pop(key, None)
+            else:
+                os.environ[key] = value
+        for name, candidate in list(logger_dict.items()):
+            if (
+                isinstance(candidate, logging.Logger)
+                and candidate.disabled
+                and name not in already_disabled
+            ):
+                candidate.disabled = False
+
+
+@pytest.fixture(scope="session")
+def _pg_schema(pg_url: str) -> None:
+    """Build the full schema exactly once per session via ``alembic upgrade head``.
+
+    Only pulled in transitively by ``pg_db`` -- tests that never request
+    ``pg_db``/``pg_url`` never spin up Postgres or need Docker at all.
+    """
+    _upgrade_head(pg_url)
+
+
+def _truncate_all(db: DB) -> None:
+    """TRUNCATE every reflected table except ``alembic_version``.
+
+    Cheap per-test isolation: wipes data without re-running migrations, which
+    only need to happen once per session since the schema itself is static.
+    """
+    table_names = [name for name in db.tables if name != "alembic_version"]
+    if not table_names:
+        return
+    quoted = ", ".join(f'"{name}"' for name in table_names)
+    db.executesql(
+        f"TRUNCATE TABLE {quoted} RESTART IDENTITY CASCADE",
+        check_injection=False,
+    )
+
+
 @pytest.fixture
-def pg_db(pg_url: str) -> Iterator[DB]:
+def pg_db(pg_url: str, _pg_schema: None) -> Iterator[DB]:
     """Function-scoped penguin-dal ``DB`` bound to a real Postgres instance.
 
-    Wipes and rebuilds the ``public`` schema from both SQLAlchemy declarative
-    bases (see module docstring for the known-missing-tables gap) before
-    handing back a reflected penguin-dal ``DB``.
+    The schema is built once per session (``_pg_schema``, via
+    ``alembic upgrade head``). Each test gets isolated data by TRUNCATE-ing
+    every table before and after it runs -- migrations are never re-run
+    per test.
     """
-    from sqlalchemy import create_engine, text
-
-    from app.models_sqlalchemy import Base as MainBase
-
-    # Import registers the M1 classes (nodes, leader_leases, joiner_secrets,
-    # audit_events, ...) onto MainBase.metadata -- it shares MainBase rather
-    # than declaring its own. Side-effect import only; noqa for the unused
-    # name.
-    from app import models_m1  # noqa: F401
-    from app.db.init_db import Base as InitBase
-
-    eng = create_engine(pg_url)
-    try:
-        with eng.begin() as conn:
-            conn.execute(text("DROP SCHEMA public CASCADE; CREATE SCHEMA public;"))
-
-        # See module docstring: ix_nodes_hardware_tags is a btree index on a
-        # JSON column, which Postgres rejects outright. Drop it from the
-        # metadata for the duration of create_all() only, then restore it so
-        # the rest of the process (other tests importing the same Base)
-        # still see the model as declared in app/models_m1.py.
-        nodes_table = MainBase.metadata.tables.get("nodes")
-        skipped_index = None
-        if nodes_table is not None:
-            for idx in nodes_table.indexes:
-                if idx.name == "ix_nodes_hardware_tags":
-                    skipped_index = idx
-                    break
-            if skipped_index is not None:
-                nodes_table.indexes.discard(skipped_index)
-
-        try:
-            MainBase.metadata.create_all(eng)  # schema authority = SQLAlchemy
-        finally:
-            if skipped_index is not None:
-                nodes_table.indexes.add(skipped_index)
-
-        InitBase.metadata.create_all(eng)
-    finally:
-        eng.dispose()
-
     db = DB(pg_url, pool_size=2, reflect=True)
-    yield db
-    db.close()
+    try:
+        _truncate_all(db)
+        yield db
+        _truncate_all(db)
+    finally:
+        db.close()
