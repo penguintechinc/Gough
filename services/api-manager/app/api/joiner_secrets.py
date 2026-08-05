@@ -19,8 +19,9 @@ from __future__ import annotations
 import logging
 import uuid
 from datetime import datetime, timedelta, timezone
-from typing import Any, Optional
+from typing import Any, Optional, cast
 
+from penguin_dal import Row
 from quart import Blueprint, current_app, g, jsonify, request
 
 from app import metrics as _metrics
@@ -31,14 +32,15 @@ from app.security.credentials import (
     InvalidCredentialError,
     validate_user_jwt,
 )
+from app.security.joiner_envelope import zero_bytes
 from app.security.scope_enforcement import require_scopes
 from app.security.tenant import set_tenant_guc
 from app.workers.joiner_secret_emitter import (
     ExtractedMaterial,
-    JoinerSecretEmitter,
+    persist_extracted_material,
 )
 
-from ..db.database import get_db
+from ..models import get_db
 
 log = logging.getLogger(__name__)
 
@@ -284,7 +286,28 @@ async def list_joiner_secrets(cluster_id: uuid.UUID):
 )
 @require_scopes("gough.joiner.rotate")
 async def rotate_joiner_secret(cluster_id: uuid.UUID, js_id: uuid.UUID):
-    """Rotate a joiner secret: revoke old row + emit fresh secret."""
+    """Rotate a joiner secret: revoke old row + persist a fresh one, atomically.
+
+    Revoke-mark, new-secret insert, and its audit-chain row all happen
+    inside a single ``db.transaction()`` (one pinned Postgres connection,
+    commit-on-clean-exit / rollback-on-exception) -- if persisting the new
+    secret fails for any reason (Vault down, encryption error, etc.), the
+    revoke of the old secret rolls back with it. Splitting these into
+    separate auto-committing calls (the naive per-call penguin-dal
+    ``.update()``/``.insert()`` pattern used elsewhere in this file) would
+    leave the old secret permanently revoked with no replacement on a
+    mid-rotation failure -- exactly the failure mode this transaction
+    exists to prevent.
+
+    Does not go through ``JoinerSecretEmitter.emit()`` -- that method's
+    contract (``biome_instance_id`` -> run a fresh control-tunnel
+    extraction -> ``list[JoinerSecretMetadata]``) is a different flow than
+    "persist material this caller already extracted via
+    ``JOINER_ROTATE_MATERIAL_PROVIDER``". Uses
+    ``app.workers.joiner_secret_emitter.persist_extracted_material``
+    instead, which is exactly that persistence step, factored out to take a
+    penguin-dal ``Tx`` so it can run inside this transaction.
+    """
     tenant_id = _get_tenant_id()
     mfa_block = _enforce_mfa_if_required(tenant_id)
     if mfa_block is not None:
@@ -298,12 +321,6 @@ async def rotate_joiner_secret(cluster_id: uuid.UUID, js_id: uuid.UUID):
             400,
         )
 
-    # Runtime lookup + revoke-mark via the penguin-dal overlay. The
-    # AuditEventWriter/JoinerSecretEmitter calls further down still take a
-    # SQLAlchemy session (`app.security.audit_chain` /
-    # `app.workers.joiner_secret_emitter`, both out of scope for this
-    # conversion) -- `_get_db_session()` + `set_tenant_guc()` are kept
-    # unchanged for those specifically, see `db_session` below.
     db = get_db()
     row: Any = (
         db(
@@ -346,74 +363,65 @@ async def rotate_joiner_secret(cluster_id: uuid.UUID, js_id: uuid.UUID):
 
     material: ExtractedMaterial = new_plaintext_provider(row)
 
-    now = datetime.now(timezone.utc)
-    db(db.joiner_secrets.id == str(js_id)).update(
-        revoked_at=now, rotated_at=now
-    )
-    # Reflect the just-applied update onto the local row so the response
-    # mirrors the new state without a second round-trip (mirrors the
-    # pre-conversion in-memory ORM attribute mutation).
-    row.revoked_at = now
-    row.rotated_at = now
-
-    db_session = _get_db_session()
-    set_tenant_guc(db_session, tenant_id)
-
-    audit_writer = _build_audit_writer(cluster_id)
     actor_sub = _get_actor_sub()
     actor_scope = _get_actor_scope()
     request_id = request.headers.get("X-Request-Id")
+    now = datetime.now(timezone.utc)
 
-    audit_writer.append(
-        actor_sub=actor_sub,
-        actor_scope=actor_scope,
-        action="joiner.secret.rotate",
-        resource_kind="joiner_secret",
-        resource_id=str(row.id),
-        tenant_id=tenant_id,
-        before={"joiner_secret_id": str(row.id), "revoked_at": None},
-        after={
-            "joiner_secret_id": str(row.id),
-            "revoked_at": now.isoformat(),
-            "reason": reason,
-        },
-        request_id=request_id,
-    )
-
-    emitter = JoinerSecretEmitter(
-        db_session=db_session,
-        vault_client=current_app.config["VAULT_CLIENT"],
-        audit_writer=audit_writer,
-    )
     try:
-        emit_result = emitter.emit(
-            cluster_id=cluster_id,
-            tenant_id=tenant_id,
-            biome_kind=row.biome_kind,
-            emitter_biome_id=row.emitter_biome_id,
-            emitter_node_id=row.emitter_node_id,
-            scope=row.scope,
-            material=material,
-            actor_sub=actor_sub,
-            actor_scope=actor_scope,
-            request_id=request_id,
-        )
+        with db.transaction() as tx:
+            tx.executesql(
+                "UPDATE joiner_secrets SET revoked_at = %s, rotated_at = %s "
+                "WHERE id = %s",
+                (now, now, str(js_id)),
+            )
+            new_id, audit_event_id, _expires_at = persist_extracted_material(
+                tx,
+                cluster_id=str(cluster_id),
+                tenant_id=tenant_id,
+                biome_kind=row.biome_kind,
+                emitter_biome_id=row.emitter_biome_id,
+                emitter_node_id=row.emitter_node_id,
+                extractor_name=row.extractor_name,
+                scope=row.scope,
+                vault_client=current_app.config["VAULT_CLIENT"],
+                material=material,
+                actor_sub=actor_sub,
+                actor_scope=actor_scope,
+                action="joiner.secret.rotate",
+                request_id=request_id,
+                reason=reason,
+            )
+            new_row_data = cast(
+                "list[dict[str, Any]]",
+                tx.executesql(
+                    "SELECT * FROM joiner_secrets WHERE id = %s",
+                    (new_id,),
+                    as_dict=True,
+                ),
+            )
     except Exception:
         _metrics.joiner_secret_decryption_failure.inc()
         raise
+    finally:
+        try:
+            zero_bytes(material.plaintext)
+        except Exception:  # pragma: no cover - best-effort
+            log.debug("zero_bytes(material.plaintext) failed; bytes will be GC'd")
 
-    new_row = (
-        db(db.joiner_secrets.id == str(emit_result.joiner_secret_id))
-        .select()
-        .first()
-    )
+    # Reflect the now-committed revoke onto the in-memory row for the
+    # response (same validated row from above; the UPDATE ran inside the
+    # transaction that just committed).
+    row.revoked_at = now
+    row.rotated_at = now
+    new_row = Row(new_row_data[0]) if new_row_data else None
 
     return (
         jsonify(
             {
                 "rotated": _serialize_joiner_secret(row),
                 "new_secret": _serialize_joiner_secret(new_row),
-                "audit_event_id": str(emit_result.audit_event_id),
+                "audit_event_id": audit_event_id,
             }
         ),
         201,

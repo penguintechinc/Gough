@@ -14,11 +14,16 @@ RLS-exempt, which is why this went unnoticed) RLS silently filtered every
 row to zero and the app has been relying entirely on its own app-level
 tenant filters.
 
-This module closes that gap generically, for every penguin-dal query,
-by hanging the GUC set/reset off the SQLAlchemy connection pool's own
-``checkout``/``checkin`` events on the engine backing ``app.config["db"]``
-(see ``install_rls_events``), rather than by having every call site thread a
-connection through ``set_tenant_guc`` by hand.
+This module closes that gap for the request-path connection pool -- the
+engine backing ``app.config["db"]`` (``app.models.get_db()``, wired via
+``install_rls_events`` in ``app.models.init_db``) -- by hanging the GUC
+set/reset off that pool's own ``checkout``/``checkin`` events, rather than
+by having every call site thread a connection through ``set_tenant_guc`` by
+hand. It does NOT cover the separate thread-local ``DB`` pool in
+``app.db.database`` (``get_db()`` there, keyed off ``DATABASE_URL``) --
+that pool has no RLS wiring at all today; nothing in this codebase should
+be using it for tenant-scoped reads until it's either wired the same way or
+consolidated away (follow-up, not done here).
 
 Why ``contextvars.ContextVar`` and not ``threading.local``: Quart request
 handlers issue blocking penguin-dal calls via ``asyncio.to_thread()``, which

@@ -39,7 +39,7 @@ from app.security.audit_chain import (
 from app.security.scope_enforcement import require_scopes
 from app.security.tenant import set_tenant_guc
 
-from ..db.database import get_db
+from ..models import get_db
 
 log = logging.getLogger(__name__)
 

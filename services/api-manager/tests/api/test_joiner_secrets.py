@@ -34,7 +34,7 @@ from app.api.joiner_secrets import (
 )
 from app.security.credentials import CredentialType, Principal
 from app.security.tenant import TenantContext
-from app.workers.joiner_secret_emitter import EmitResult, ExtractedMaterial
+from app.workers.joiner_secret_emitter import ExtractedMaterial
 
 
 SECRET_FIELDS_MUST_BE_ABSENT: frozenset[str] = frozenset(
@@ -193,14 +193,24 @@ def _build_app(
     rotation_provider: Optional[Any] = None,
     dal_db: Optional[Any] = None,
     monkeypatch: Optional[pytest.MonkeyPatch] = None,
+    rls_scoped: bool = False,
 ) -> Quart:
     """Build a Quart app with ``joiner_secrets_bp`` registered.
 
     ``rows``/``FakeSession`` back the still-SQLAlchemy-session-based paths
-    (``g.db_session``, used by ``AuditEventWriter``/``JoinerSecretEmitter``).
-    Pass ``dal_db`` (a real ``pg_db``) + ``monkeypatch`` together to also
-    patch ``joiner_module.get_db`` for the penguin-dal-converted
+    (``g.db_session``, used by ``AuditEventWriter``). Pass ``dal_db`` (a
+    real ``pg_db``) + ``monkeypatch`` together to also patch
+    ``joiner_module.get_db`` for the penguin-dal-converted
     lookup/list/revoke-mark logic.
+
+    ``rls_scoped=True`` additionally wires ``app.db.rls``'s pool
+    checkout/checkin GUC events onto ``dal_db.engine`` and pushes
+    ``principal.tenant_id`` onto the ``set_current_tenant`` ContextVar for
+    the duration of each request (mirroring the real ``tenant_middleware``),
+    so RLS is genuinely enforced against ``dal_db`` -- pass a
+    ``pg_db_scoped`` fixture (the actual non-owner ``api-manager-rw`` role)
+    as ``dal_db`` when using this; ``pg_db`` (the migration/table owner) is
+    RLS-exempt and would prove nothing.
     """
     app = Quart(__name__)
     app.register_blueprint(joiner_secrets_bp, url_prefix="/api/v1")
@@ -208,6 +218,20 @@ def _build_app(
     if dal_db is not None:
         assert monkeypatch is not None, "dal_db requires monkeypatch"
         monkeypatch.setattr(joiner_module, "get_db", lambda: dal_db)
+
+        if rls_scoped:
+            from app.db.rls import install_rls_events, set_current_tenant
+
+            install_rls_events(dal_db.engine)
+
+            @app.before_request
+            async def _push_rls_tenant() -> None:
+                set_current_tenant(principal.tenant_id)
+
+            @app.after_request
+            async def _pop_rls_tenant(response: Any) -> Any:
+                set_current_tenant(None)
+                return response
 
     session = FakeSession(rows)
 
@@ -323,22 +347,35 @@ class TestListJoinerSecrets:
     """
 
     async def test_list_happy_path_omits_envelope(
-        self, pg_db: Any, monkeypatch: pytest.MonkeyPatch
+        self, pg_db: Any, pg_db_scoped: Any, monkeypatch: pytest.MonkeyPatch
     ) -> None:
+        """Seeded via the owner role (``pg_db``, RLS-exempt); read back via
+        the actual scoped ``api-manager-rw`` role (``pg_db_scoped``) with
+        RLS genuinely enforced.
+        """
         cluster_id = uuid.uuid4()
         biome_id = _seed_biome(pg_db)
         _seed_joiner_secret(
-            pg_db, cluster_id=cluster_id, biome_kind="vault", emitter_biome_id=biome_id
+            pg_db,
+            cluster_id=cluster_id,
+            biome_kind="vault",
+            emitter_biome_id=biome_id,
+            tenant_id="acme",
         )
         _seed_joiner_secret(
             pg_db,
             cluster_id=cluster_id,
             biome_kind="postgres",
             emitter_biome_id=biome_id,
+            tenant_id="acme",
         )
-        principal = _principal(scopes={"gough.joiner.read"})
+        principal = _principal(scopes={"gough.joiner.read"}, tenant="acme")
         app = _build_app(
-            rows=[], principal=principal, dal_db=pg_db, monkeypatch=monkeypatch
+            rows=[],
+            principal=principal,
+            dal_db=pg_db_scoped,
+            monkeypatch=monkeypatch,
+            rls_scoped=True,
         )
         client = app.test_client()
         resp = await client.get(f"/api/v1/clusters/{cluster_id}/joiner-secrets")
@@ -350,14 +387,20 @@ class TestListJoinerSecrets:
                 assert forbidden not in item
 
     async def test_list_empty_result(
-        self, pg_db: Any, monkeypatch: pytest.MonkeyPatch
+        self, pg_db: Any, pg_db_scoped: Any, monkeypatch: pytest.MonkeyPatch
     ) -> None:
         """No secrets for this cluster -> 200 with an empty items list."""
         cluster_id = uuid.uuid4()
-        _seed_joiner_secret(pg_db, cluster_id=uuid.uuid4())  # different cluster
-        principal = _principal(scopes={"gough.joiner.read"})
+        _seed_joiner_secret(
+            pg_db, cluster_id=uuid.uuid4(), tenant_id="acme"
+        )  # different cluster, same tenant
+        principal = _principal(scopes={"gough.joiner.read"}, tenant="acme")
         app = _build_app(
-            rows=[], principal=principal, dal_db=pg_db, monkeypatch=monkeypatch
+            rows=[],
+            principal=principal,
+            dal_db=pg_db_scoped,
+            monkeypatch=monkeypatch,
+            rls_scoped=True,
         )
         client = app.test_client()
         resp = await client.get(f"/api/v1/clusters/{cluster_id}/joiner-secrets")
@@ -369,6 +412,68 @@ class TestListJoinerSecrets:
             "count": 0,
             "items": [],
         }
+
+    async def test_list_rls_isolates_two_tenants(
+        self, pg_db: Any, pg_db_scoped: Any, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Two tenants, one secret each on the SAME cluster_id -- tenant A's
+        request sees ONLY tenant A's secret (never tenant B's), and vice
+        versa, under real RLS enforcement (``pg_db_scoped``, not the
+        RLS-exempt owner role). Same ``cluster_id`` on purpose: the
+        app-level filter alone (``cluster_id == ... & tenant_id == ...``)
+        would already exclude tenant B's row if it had a different
+        cluster_id, so that wouldn't prove RLS is doing anything -- sharing
+        the cluster_id isolates what only RLS (Layer 4) enforces from what
+        the app-level filter (Layer 1/2) already would.
+        """
+        cluster_id = uuid.uuid4()
+        biome_id = _seed_biome(pg_db)
+        secret_a = _seed_joiner_secret(
+            pg_db,
+            cluster_id=cluster_id,
+            tenant_id="tenant-a",
+            emitter_biome_id=biome_id,
+            extractor_name="secret-a",
+        )
+        secret_b = _seed_joiner_secret(
+            pg_db,
+            cluster_id=cluster_id,
+            tenant_id="tenant-b",
+            emitter_biome_id=biome_id,
+            extractor_name="secret-b",
+        )
+
+        app_a = _build_app(
+            rows=[],
+            principal=_principal(scopes={"gough.joiner.read"}, tenant="tenant-a"),
+            dal_db=pg_db_scoped,
+            monkeypatch=monkeypatch,
+            rls_scoped=True,
+        )
+        resp_a = await app_a.test_client().get(
+            f"/api/v1/clusters/{cluster_id}/joiner-secrets"
+        )
+        assert resp_a.status_code == 200
+        data_a = await resp_a.get_json()
+        assert data_a["count"] == 1
+        assert data_a["items"][0]["id"] == secret_a
+        assert all(item["tenant_id"] == "tenant-a" for item in data_a["items"])
+
+        app_b = _build_app(
+            rows=[],
+            principal=_principal(scopes={"gough.joiner.read"}, tenant="tenant-b"),
+            dal_db=pg_db_scoped,
+            monkeypatch=monkeypatch,
+            rls_scoped=True,
+        )
+        resp_b = await app_b.test_client().get(
+            f"/api/v1/clusters/{cluster_id}/joiner-secrets"
+        )
+        assert resp_b.status_code == 200
+        data_b = await resp_b.get_json()
+        assert data_b["count"] == 1
+        assert data_b["items"][0]["id"] == secret_b
+        assert all(item["tenant_id"] == "tenant-b" for item in data_b["items"])
 
     async def test_list_filter_biome_kind(
         self, pg_db: Any, monkeypatch: pytest.MonkeyPatch
@@ -473,6 +578,14 @@ class TestRotateJoinerSecret:
     async def test_rotate_happy_path(
         self, pg_db: Any, monkeypatch: pytest.MonkeyPatch
     ) -> None:
+        """Exercises the REAL atomic persist path (``db.transaction()`` +
+        ``persist_extracted_material``) -- no ``JoinerSecretEmitter``
+        stand-in anymore, since ``rotate_joiner_secret`` no longer calls
+        that class at all (see the handler + module docstrings). The
+        ``vault_client`` mock ``_build_app`` already wires
+        (``transit_encrypt``/``transit_sign``) is all the real persist path
+        needs.
+        """
         cluster_id = uuid.uuid4()
         original_id = _seed_joiner_secret(pg_db, cluster_id=cluster_id)
 
@@ -495,42 +608,11 @@ class TestRotateJoinerSecret:
             monkeypatch=monkeypatch,
         )
 
-        # Patch the emitter so we don't actually try to run the real
-        # extractor/Vault/control-tunnel flow -- it inserts the "new" row
-        # into the real DB directly so the post-emit lookup finds it.
-        from app.api import joiner_secrets as jm
-
-        new_id = uuid.uuid4()
-        emit_result = EmitResult(
-            joiner_secret_id=new_id,
-            audit_event_id=uuid.uuid4(),
-            expires_at=datetime.now(timezone.utc) + timedelta(seconds=600),
+        client = app.test_client()
+        resp = await client.post(
+            f"/api/v1/clusters/{cluster_id}/joiner-secrets/{original_id}/rotate",
+            json={"reason": "key compromised"},
         )
-
-        class FakeEmitter:
-            def __init__(self, *_: Any, **__: Any) -> None:
-                pass
-
-            def emit(self, **_: Any) -> EmitResult:
-                _seed_joiner_secret(
-                    pg_db,
-                    id=new_id,
-                    cluster_id=cluster_id,
-                    extractor_name="root-token",
-                    expires_at=emit_result.expires_at,
-                )
-                return emit_result
-
-        original_cls = jm.JoinerSecretEmitter
-        jm.JoinerSecretEmitter = FakeEmitter
-        try:
-            client = app.test_client()
-            resp = await client.post(
-                f"/api/v1/clusters/{cluster_id}/joiner-secrets/{original_id}/rotate",
-                json={"reason": "key compromised"},
-            )
-        finally:
-            jm.JoinerSecretEmitter = original_cls
 
         assert resp.status_code == 201, await resp.get_data()
         data = await resp.get_json()
@@ -538,7 +620,73 @@ class TestRotateJoinerSecret:
             assert forbidden not in data["rotated"]
             assert forbidden not in data["new_secret"]
         assert data["rotated"]["status"] == "revoked"
-        assert data["new_secret"]["id"] == str(new_id)
+        assert data["new_secret"]["id"] != original_id
+        assert data["new_secret"]["extractor_name"] == "root-token"
+        assert data["new_secret"]["rotation_class"] == "vault-unseal"
+
+        # The new row is genuinely committed and independently readable --
+        # not an artifact of reading back inside the same transaction.
+        reread = (
+            pg_db(pg_db.joiner_secrets.id == data["new_secret"]["id"])
+            .select()
+            .first()
+        )
+        assert reread is not None
+        assert reread.revoked_at is None
+
+        # A fresh audit_events row backs the new secret's audit_event_id
+        # (the atomic persist path writes its own chain-hashed row rather
+        # than going through AuditEventWriter -- see persist_extracted_material).
+        audit_row = (
+            pg_db(pg_db.audit_events.id == data["audit_event_id"]).select().first()
+        )
+        assert audit_row is not None
+        assert audit_row.action == "joiner.secret.rotate"
+
+    async def test_rotate_atomic_rollback_on_persist_failure(
+        self, pg_db: Any, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """If persisting the new secret fails mid-transaction (Vault error),
+        the revoke of the OLD secret must roll back too -- this is the
+        fix-round #3(b) regression guard: a naive auto-committing
+        ``.update()`` before the persist step would leave the old secret
+        permanently revoked with no replacement.
+        """
+        cluster_id = uuid.uuid4()
+        original_id = _seed_joiner_secret(pg_db, cluster_id=cluster_id)
+
+        def provider(_row: Any) -> ExtractedMaterial:
+            return ExtractedMaterial(extractor_name="root-token", plaintext=b"x")
+
+        principal = _principal(scopes={"gough.joiner.rotate"})
+        app = _build_app(
+            rows=[],
+            principal=principal,
+            rotation_provider=provider,
+            dal_db=pg_db,
+            monkeypatch=monkeypatch,
+        )
+        # Force the Vault wrap call inside encrypt_envelope to fail.
+        app.config["VAULT_CLIENT"].transit_encrypt.side_effect = RuntimeError(
+            "vault sealed"
+        )
+
+        client = app.test_client()
+        resp = await client.post(
+            f"/api/v1/clusters/{cluster_id}/joiner-secrets/{original_id}/rotate",
+            json={"reason": "key compromised"},
+        )
+        assert resp.status_code == 500
+
+        # The original secret must NOT be left revoked -- the transaction
+        # that would have revoked it rolled back along with the failed
+        # persist.
+        original_row = (
+            pg_db(pg_db.joiner_secrets.id == original_id).select().first()
+        )
+        assert original_row is not None
+        assert original_row.revoked_at is None
+        assert original_row.rotated_at is None
 
     async def test_rotate_missing_reason(self) -> None:
         cluster_id = uuid.uuid4()
@@ -637,33 +785,11 @@ class TestRotateJoinerSecret:
             monkeypatch=monkeypatch,
         )
 
-        from app.api import joiner_secrets as jm
-
-        class FakeEmitter:
-            def __init__(self, *_: Any, **__: Any) -> None:
-                pass
-
-            def emit(self, **_: Any) -> EmitResult:
-                new_id = uuid.uuid4()
-                _seed_joiner_secret(
-                    pg_db, id=new_id, cluster_id=cluster_id, extractor_name="root-token"
-                )
-                return EmitResult(
-                    joiner_secret_id=new_id,
-                    audit_event_id=uuid.uuid4(),
-                    expires_at=None,
-                )
-
-        original_cls = jm.JoinerSecretEmitter
-        jm.JoinerSecretEmitter = FakeEmitter
-        try:
-            client = app.test_client()
-            resp = await client.post(
-                f"/api/v1/clusters/{cluster_id}/joiner-secrets/{secret_id}/rotate",
-                json={"reason": "scheduled"},
-            )
-        finally:
-            jm.JoinerSecretEmitter = original_cls
+        client = app.test_client()
+        resp = await client.post(
+            f"/api/v1/clusters/{cluster_id}/joiner-secrets/{secret_id}/rotate",
+            json={"reason": "scheduled"},
+        )
 
         assert resp.status_code == 201
 

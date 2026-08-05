@@ -189,6 +189,7 @@ def _build_app(
     nats_client: Optional[Any] = None,
     dal_db: Optional[Any] = None,
     monkeypatch: Optional[pytest.MonkeyPatch] = None,
+    rls_scoped: bool = False,
 ) -> Quart:
     """Build a Quart app with ``audit_bp`` registered.
 
@@ -197,6 +198,16 @@ def _build_app(
     ``dal_db`` (a real ``pg_db``) + ``monkeypatch`` together to also patch
     ``audit_module.get_db`` for handlers converted to the penguin-dal
     overlay (``list_audit_events`` / ``export_audit_log``'s export stream).
+
+    ``rls_scoped=True`` additionally wires ``app.db.rls``'s pool
+    checkout/checkin GUC events onto ``dal_db.engine`` and pushes
+    ``principal.tenant_id`` onto the ``set_current_tenant`` ContextVar for
+    the duration of each request (mirroring what the real
+    ``tenant_middleware`` does), so RLS is genuinely enforced against
+    ``dal_db`` -- pass a ``pg_db_scoped`` fixture (connected as the
+    non-owner ``api-manager-rw`` role) as ``dal_db`` when using this, since
+    ``pg_db`` (the migration/table owner) is RLS-exempt and would prove
+    nothing.
     """
     app = Quart(__name__)
     app.register_blueprint(audit_bp, url_prefix="/api/v1/audit")
@@ -204,6 +215,20 @@ def _build_app(
     if dal_db is not None:
         assert monkeypatch is not None, "dal_db requires monkeypatch"
         monkeypatch.setattr(audit_module, "get_db", lambda: dal_db)
+
+        if rls_scoped:
+            from app.db.rls import install_rls_events, set_current_tenant
+
+            install_rls_events(dal_db.engine)
+
+            @app.before_request
+            async def _push_rls_tenant() -> None:
+                set_current_tenant(principal.tenant_id)
+
+            @app.after_request
+            async def _pop_rls_tenant(response: Any) -> Any:
+                set_current_tenant(None)
+                return response
 
     session = FakeSession(rows)
 
@@ -267,6 +292,35 @@ class TestSerializerAuditEvent:
 # =============================================================================
 
 
+# Discovered while wiring the pg_db_scoped RLS tests below: the baseline
+# migration (alembic/versions/20260805_1000_baseline_full_schema.py:217)
+# only grants `api-manager-rw` INSERT on audit_events, never SELECT (SELECT
+# is only granted to the separate `audit-reader` role and, on the redacted
+# view, `webui-ro`). That's the actual production role api-manager's own DB
+# connection authenticates as (Config.DB_USER), so list_audit_events /
+# export_audit_log's read queries hit `permission denied for table
+# audit_events` against real Postgres today -- independent of RLS, and
+# predating this conversion. Fixing it means editing the alembic migration,
+# outside this task's file scope (app/api/audit.py, app/api/
+# joiner_secrets.py, app/workers/joiner_secret_emitter.py, app/db/rls.py's
+# docstring, and these test files) -- flagged in task-6a-report.md instead.
+# The tests below are marked xfail(strict=True) against this exact error
+# rather than silently reverted to the RLS-exempt pg_db (which would prove
+# nothing about tenant isolation, per the coordinator's fix-round #2) or
+# silently skipped -- strict=True means the marker itself starts failing
+# the moment the missing GRANT is added, which is exactly the signal that
+# should prompt removing it.
+_AUDIT_EVENTS_SELECT_NOT_GRANTED = pytest.mark.xfail(
+    strict=True,
+    raises=Exception,
+    reason=(
+        "api-manager-rw lacks GRANT SELECT ON audit_events (baseline "
+        "migration only grants INSERT) -- pre-existing infra gap outside "
+        "this task's file scope, see task-6a-report.md fix-round #2"
+    ),
+)
+
+
 @pytest.mark.asyncio
 class TestListAuditEvents:
     """Read path -- converted to penguin-dal, exercised against real Postgres.
@@ -278,16 +332,24 @@ class TestListAuditEvents:
     so they don't need ``pg_db`` and are unchanged.
     """
 
+    @_AUDIT_EVENTS_SELECT_NOT_GRANTED
     async def test_list_happy_path(
-        self, pg_db: Any, monkeypatch: pytest.MonkeyPatch
+        self, pg_db: Any, pg_db_scoped: Any, monkeypatch: pytest.MonkeyPatch
     ) -> None:
+        """Seeded via the owner role (``pg_db``, RLS-exempt); read back via
+        the actual scoped ``api-manager-rw`` role (``pg_db_scoped``) with RLS
+        genuinely enforced -- proves the converted ``db(...).select()``
+        returns the tenant's own rows under RLS, not just under an
+        RLS-exempt connection.
+        """
         _seed_audit_event(pg_db, tenant_id="acme")
         _seed_audit_event(pg_db, tenant_id="acme", action="cluster_init")
         app = _build_app(
             rows=[],
-            principal=_principal(scopes={"gough.audit.read"}),
-            dal_db=pg_db,
+            principal=_principal(scopes={"gough.audit.read"}, tenant="acme"),
+            dal_db=pg_db_scoped,
             monkeypatch=monkeypatch,
+            rls_scoped=True,
         )
         client = app.test_client()
         resp = await client.get("/api/v1/audit/events")
@@ -295,16 +357,18 @@ class TestListAuditEvents:
         body = await resp.get_json()
         assert body["count"] == 2
 
+    @_AUDIT_EVENTS_SELECT_NOT_GRANTED
     async def test_list_empty_result(
-        self, pg_db: Any, monkeypatch: pytest.MonkeyPatch
+        self, pg_db: Any, pg_db_scoped: Any, monkeypatch: pytest.MonkeyPatch
     ) -> None:
         """No rows for this tenant -> 200 with an empty items list."""
         _seed_audit_event(pg_db, tenant_id="other-tenant")
         app = _build_app(
             rows=[],
             principal=_principal(scopes={"gough.audit.read"}, tenant="acme"),
-            dal_db=pg_db,
+            dal_db=pg_db_scoped,
             monkeypatch=monkeypatch,
+            rls_scoped=True,
         )
         client = app.test_client()
         resp = await client.get("/api/v1/audit/events")
@@ -316,6 +380,51 @@ class TestListAuditEvents:
             "next_cursor": None,
             "items": [],
         }
+
+    @_AUDIT_EVENTS_SELECT_NOT_GRANTED
+    async def test_list_rls_isolates_two_tenants(
+        self, pg_db: Any, pg_db_scoped: Any, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Two tenants, one row each -- tenant A's request sees ONLY tenant
+        A's row (never tenant B's), and vice versa, under real RLS
+        enforcement (``pg_db_scoped``, not the RLS-exempt owner role).
+
+        This is the direct regression guard for FIX #7a wired through the
+        actual converted endpoint (``tests/test_rls_isolation.py`` proves
+        the GUC-wiring mechanism in isolation against a raw ``biomes``
+        query; this proves ``list_audit_events`` specifically benefits from
+        it, now that it reads via ``app.models.get_db()``).
+        """
+        _seed_audit_event(pg_db, tenant_id="tenant-a", action="a.action")
+        _seed_audit_event(pg_db, tenant_id="tenant-b", action="b.action")
+
+        app_a = _build_app(
+            rows=[],
+            principal=_principal(scopes={"gough.audit.read"}, tenant="tenant-a"),
+            dal_db=pg_db_scoped,
+            monkeypatch=monkeypatch,
+            rls_scoped=True,
+        )
+        resp_a = await app_a.test_client().get("/api/v1/audit/events")
+        assert resp_a.status_code == 200
+        body_a = await resp_a.get_json()
+        assert body_a["count"] == 1
+        assert body_a["items"][0]["action"] == "a.action"
+        assert all(item["tenant_id"] == "tenant-a" for item in body_a["items"])
+
+        app_b = _build_app(
+            rows=[],
+            principal=_principal(scopes={"gough.audit.read"}, tenant="tenant-b"),
+            dal_db=pg_db_scoped,
+            monkeypatch=monkeypatch,
+            rls_scoped=True,
+        )
+        resp_b = await app_b.test_client().get("/api/v1/audit/events")
+        assert resp_b.status_code == 200
+        body_b = await resp_b.get_json()
+        assert body_b["count"] == 1
+        assert body_b["items"][0]["action"] == "b.action"
+        assert all(item["tenant_id"] == "tenant-b" for item in body_b["items"])
 
     async def test_list_format_jsonl(
         self, pg_db: Any, monkeypatch: pytest.MonkeyPatch

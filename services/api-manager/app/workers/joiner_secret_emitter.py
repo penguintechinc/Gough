@@ -21,6 +21,7 @@ infrastructure (Layer 3), and migrations (Layer 4).
 
 from __future__ import annotations
 
+import json
 import logging
 import uuid
 from dataclasses import dataclass
@@ -33,7 +34,12 @@ from sqlalchemy.orm import Session
 
 from app.clients.vault import VaultClient
 from app.models_m1 import Biome, JoinerSecret, Node, NodeBiomeAssignment
-from app.security.audit_chain import AuditEventWriter
+from app.security.audit_chain import (
+    ZERO_HASH,
+    AuditEventWriter,
+    compute_chain_hash,
+    generate_uuidv7,
+)
 from app.security.joiner_envelope import (
     encrypt_envelope,
     zero_bytes,
@@ -158,6 +164,199 @@ class EmitResult:
     joiner_secret_id: object  # uuid.UUID
     audit_event_id: object    # uuid.UUID
     expires_at: object        # datetime
+
+
+def persist_extracted_material(
+    tx: Any,
+    *,
+    cluster_id: str,
+    tenant_id: str,
+    biome_kind: str,
+    emitter_biome_id: int,
+    emitter_node_id: Optional[int],
+    extractor_name: str,
+    scope: str,
+    vault_client: VaultClient,
+    material: ExtractedMaterial,
+    actor_sub: str,
+    actor_scope: list[str],
+    action: str,
+    resource_kind: str = "joiner_secret",
+    vault_kek_name: str = VAULT_KEK_NAME,
+    request_id: Optional[str] = None,
+    reason: Optional[str] = None,
+) -> tuple[str, str, Optional[datetime]]:
+    """Envelope-encrypt already-extracted material and persist it atomically.
+
+    Callers that already hold plaintext (e.g. ``app.api.joiner_secrets
+    .rotate_joiner_secret``, which gets it from
+    ``JOINER_ROTATE_MATERIAL_PROVIDER`` rather than a fresh control-tunnel
+    extraction) don't go through ``JoinerSecretEmitter.emit()`` -- that
+    method's whole first half (load biome_instance context, validate
+    joiner_emit_spec, run the extractor over the control tunnel) doesn't
+    apply, and it returns ``list[JoinerSecretMetadata]`` from a
+    ``biome_instance_id``, not a single result for an already-known secret.
+    This function is the second half only (encrypt + insert + audit),
+    extracted so both call sites share one persistence implementation.
+
+    Takes a penguin-dal ``Tx`` (``DB.transaction()``), not a SQLAlchemy
+    ``Session`` -- ``Tx`` only exposes raw driver-native-paramstyle
+    ``executesql()``, so the audit-chain row is appended here via the pure
+    hashing/id helpers from ``app.security.audit_chain`` (``generate_uuidv7``,
+    ``compute_chain_hash``, ``canonicalize_record``, ``ZERO_HASH`` -- none of
+    which need a ``db_session``) rather than ``AuditEventWriter``, which
+    does and is therefore incompatible with a ``Tx``. This mirrors
+    ``JoinerSecretEmitter._persist()``'s raw-SQL insert shape one-for-one,
+    just re-pointed at ``Tx.executesql`` instead of
+    ``Session.execute(text(...))``.
+
+    Args:
+        tx: Pinned-connection transaction handle from ``db.transaction()``.
+        cluster_id: Cluster UUID (string form -- see the VARCHAR(36) note in
+            ``app.api.joiner_secrets``).
+        tenant_id: Tenant id owning the new secret.
+        biome_kind: Biome kind label carried onto the audit record.
+        emitter_biome_id: FK to ``biomes.id``.
+        emitter_node_id: FK to ``nodes.id`` (nullable).
+        extractor_name: Extractor name carried onto the new row + audit record.
+        scope: One of ``VALID_SCOPES``.
+        vault_client: Vault client used to wrap the per-row DEK.
+        material: Already-extracted plaintext + rotation metadata.
+        actor_sub: Audit actor subject.
+        actor_scope: Audit actor scopes.
+        action: Audit action string (e.g. ``"joiner.secret.rotate"``).
+        resource_kind: Audit resource_kind (defaults to ``"joiner_secret"``).
+        vault_kek_name: Vault transit key name for DEK wrapping.
+        request_id: Optional request id carried onto the audit record.
+        reason: Optional operator-supplied reason (e.g. rotate's required
+            ``reason`` field), carried onto the audit record's after_json
+            when given.
+
+    Returns:
+        ``(joiner_secret_id, audit_event_id, expires_at)``, all as the same
+        types ``EmitResult`` carries (str ids, ``Optional[datetime]``).
+
+    Raises:
+        ExtractorSpecError: If ``scope`` is not in ``VALID_SCOPES``.
+    """
+    if scope not in VALID_SCOPES:
+        raise ExtractorSpecError(f"Invalid scope: {scope!r}")
+
+    envelope = encrypt_envelope(
+        plaintext=material.plaintext,
+        vault_client=vault_client,
+        vault_kek_name=vault_kek_name,
+    )
+
+    joiner_secret_id = uuid.uuid4()
+    now = datetime.now(timezone.utc)
+    expires_at: Optional[datetime] = None
+    if material.ttl_seconds and material.ttl_seconds > 0:
+        expires_at = now + timedelta(seconds=material.ttl_seconds)
+
+    prev_rows = tx.executesql(
+        "SELECT hash FROM audit_events ORDER BY ts DESC, id DESC LIMIT 1"
+    )
+    prev_hash_raw = prev_rows[0][0] if prev_rows else None
+    prev_hash: bytes = (
+        bytes(prev_hash_raw)
+        if isinstance(prev_hash_raw, (bytes, bytearray)) and len(prev_hash_raw) == 32
+        else ZERO_HASH
+    )
+
+    event_id = generate_uuidv7()
+    ts_utc = datetime.now(timezone.utc)
+    after_json: dict[str, Any] = {
+        "biome_kind": biome_kind,
+        "extractor_name": extractor_name,
+        "scope": scope,
+        "rotation_class": material.rotation_class,
+        "ttl_seconds": material.ttl_seconds if material.ttl_seconds else None,
+        "vault_kek_name": vault_kek_name,
+        "emitter_biome_id": emitter_biome_id,
+        "emitter_node_id": emitter_node_id,
+    }
+    if reason is not None:
+        after_json["reason"] = reason
+    record_fields = {
+        "id": str(event_id),
+        "ts": ts_utc.isoformat(),
+        "cluster_id": cluster_id,
+        "tenant_id": tenant_id,
+        "actor_sub": actor_sub,
+        "actor_scope": actor_scope,
+        "action": action,
+        "resource_kind": resource_kind,
+        "resource_id": str(joiner_secret_id),
+        "before_json": None,
+        "after_json": after_json,
+        "request_id": request_id,
+        "source_ip": None,
+        "user_agent": None,
+    }
+    chain_hash = compute_chain_hash(prev_hash, record_fields)
+
+    tx.executesql(
+        """
+        INSERT INTO audit_events
+        (id, ts, cluster_id, tenant_id, actor_sub, actor_scope, action,
+         resource_kind, resource_id, before_json, after_json, request_id,
+         source_ip, user_agent, prev_hash, hash, signature)
+        VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+        """,
+        (
+            str(event_id),
+            ts_utc,
+            cluster_id,
+            tenant_id,
+            actor_sub,
+            json.dumps(actor_scope),
+            action,
+            resource_kind,
+            str(joiner_secret_id),
+            None,
+            json.dumps(after_json),
+            request_id,
+            None,
+            None,
+            prev_hash,
+            chain_hash,
+            None,
+        ),
+    )
+
+    tx.executesql(
+        """
+        INSERT INTO joiner_secrets
+          (id, cluster_id, tenant_id, biome_kind, emitter_biome_id,
+           emitter_node_id, extractor_name, scope, ciphertext, iv,
+           auth_tag, dek_wrapped, vault_kek_name, ttl_seconds,
+           expires_at, rotation_class, created_at, audit_event_id)
+        VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+        """,
+        (
+            str(joiner_secret_id),
+            cluster_id,
+            tenant_id,
+            biome_kind,
+            emitter_biome_id,
+            emitter_node_id,
+            extractor_name,
+            scope,
+            envelope.ciphertext,
+            envelope.iv,
+            envelope.auth_tag,
+            envelope.dek_wrapped,
+            envelope.vault_kek_name,
+            material.ttl_seconds if material.ttl_seconds else None,
+            expires_at,
+            material.rotation_class,
+            now,
+            str(event_id),
+        ),
+    )
+
+    return str(joiner_secret_id), str(event_id), expires_at
 
 
 class _ExtractorSpec(BaseModel):
