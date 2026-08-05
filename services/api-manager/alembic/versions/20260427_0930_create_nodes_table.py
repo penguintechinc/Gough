@@ -20,6 +20,7 @@ References:
 
 from alembic import op
 import sqlalchemy as sa
+from sqlalchemy.dialects import postgresql
 
 
 # revision identifiers, used by Alembic.
@@ -47,7 +48,11 @@ def upgrade() -> None:
         sa.Column('ipv6', sa.String(45), nullable=True),
         sa.Column('boot_config_id', sa.Integer, nullable=True),
         sa.Column('hardware_json', sa.JSON(), nullable=True),
-        sa.Column('hardware_tags', sa.JSON(), nullable=True),
+        sa.Column(
+            'hardware_tags',
+            sa.JSON().with_variant(postgresql.JSONB(), 'postgresql'),
+            nullable=True,
+        ),
         sa.Column('posture', sa.String(32), nullable=False, server_default='compliant'),
         sa.Column('preferred_addr_family', sa.String(16), nullable=False, server_default='auto'),
         sa.Column('attestation_method', sa.String(32), nullable=False, server_default='discovery_agent'),
@@ -63,13 +68,17 @@ def upgrade() -> None:
     op.create_index('ix_nodes_tenant_id', 'nodes', ['tenant_id'])
     op.create_index('ix_nodes_primary_nic_mac', 'nodes', ['primary_nic_mac'])
 
-    # PostgreSQL-specific GIN index for hardware_tags JSONB; MySQL/SQLite use standard index
-    op.create_index(
-        'ix_nodes_hardware_tags',
-        'nodes',
-        ['hardware_tags'],
-        postgresql_using='gin',
-    )
+    # PostgreSQL-specific GIN index for hardware_tags JSONB. GIN has no MySQL/MariaDB
+    # or SQLite equivalent for JSON columns, so this index is a Postgres-only perf
+    # optimization -- skipped (not substituted) on other dialects, matching the
+    # column type itself (JSONB on Postgres, plain JSON elsewhere via with_variant).
+    if op.get_bind().dialect.name == 'postgresql':
+        op.create_index(
+            'ix_nodes_hardware_tags',
+            'nodes',
+            ['hardware_tags'],
+            postgresql_using='gin',
+        )
 
 
 def downgrade() -> None:
