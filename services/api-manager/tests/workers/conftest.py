@@ -18,6 +18,20 @@ import sys
 import types
 from unittest.mock import MagicMock
 
+# Registers the pg_url / pg_db / pg_db_scoped real-Postgres fixtures
+# (tests/pg_fixtures.py) for tests under tests/workers/ specifically.
+# tests/conftest.py (one level up) already declares this, but pytest only
+# honors a conftest.py's `pytest_plugins` list when that conftest is loaded
+# as part of the *initial* collection root for a given invocation -- when
+# pytest is invoked with a path scoped to tests/workers/ (e.g. the Makefile's
+# `pytest tests/workers/` target), pytest can resolve its rootdir to
+# tests/workers/ itself, one level *below* tests/conftest.py, silently
+# dropping that outer declaration (confirmed empirically: tests/conftest.py's
+# own non-pytest_plugins fixtures, e.g. `dal`, still inherit normally in that
+# case -- only the plugin-loading mechanism is affected). Redeclaring it here
+# makes pg_db available regardless of invocation path.
+pytest_plugins = ["tests.pg_fixtures"]
+
 
 def _stub(name: str, **attrs: object) -> types.ModuleType:
     mod = types.ModuleType(name)

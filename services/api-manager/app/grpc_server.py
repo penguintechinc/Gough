@@ -13,6 +13,8 @@ import logging
 import os
 import sys
 import string
+from collections.abc import Iterator
+from contextlib import contextmanager
 from datetime import datetime, timezone
 from typing import Any
 
@@ -30,7 +32,39 @@ from gough import biomes_pb2, biomes_pb2_grpc  # noqa: E402
 from gough import audit_pb2, audit_pb2_grpc  # noqa: E402
 from gough import identity_pb2, identity_pb2_grpc  # noqa: E402
 
+from app.db.rls import CROSS_TENANT_SENTINEL, get_current_tenant, set_current_tenant  # noqa: E402
+
 log = logging.getLogger(__name__)
+
+
+@contextmanager
+def _cross_tenant_scope() -> Iterator[None]:
+    """Push the RLS cross-tenant sentinel for one gRPC handler's DB work.
+
+    gRPC servicers run outside Quart's HTTP request pipeline (see module
+    docstring: mTLS/SPIFFE identity is Plan 4 scope, the runner is still an
+    insecure channel), so ``tenant_middleware`` never runs for these calls
+    and ``app.db.rls``'s tenant ContextVar is never set. A scoped Postgres
+    role would therefore see zero rows on every RLS-protected table (fail
+    closed) -- and every query these RPCs make is *already* untenanted at
+    the app level too: lookups are keyed by secret id / node id, never
+    tenant_id, because this is a system/agent-facing trust boundary, not a
+    per-tenant HTTP caller (see ``app.api.joiner_secrets`` module
+    docstring: "Plaintext extraction is reserved for the gRPC ``Joiner
+    .Consume`` RPC on a different trust boundary"). This explicitly opts
+    into the documented cross-tenant sentinel instead of silently returning
+    zero rows, and restores whatever tenant (if any) was set on this
+    task's context before returning -- writes made under this scope still
+    carry each row's own real ``tenant_id`` (the sentinel only affects
+    which existing rows are *visible* to reads/updates, not what gets
+    written).
+    """
+    previous = get_current_tenant()
+    set_current_tenant(CROSS_TENANT_SENTINEL)
+    try:
+        yield
+    finally:
+        set_current_tenant(previous)
 
 
 # ---------------------------------------------------------------------------
@@ -255,68 +289,138 @@ class IPXEServicer(ipxe_pb2_grpc.IPXEServicer):
 
 
 class JoinerSecretsServicer(joiner_pb2_grpc.JoinerSecretsServicer):
-    """gRPC handlers for JoinerSecrets service — delegates to joiner_secrets.py helpers."""
+    """gRPC handlers for JoinerSecrets service — delegates to joiner_secrets.py helpers.
+
+    A system/agent-facing trust boundary, not a per-tenant HTTP caller (see
+    ``app.api.joiner_secrets`` module docstring: "Plaintext extraction is
+    reserved for the gRPC ``Joiner.Consume`` RPC on a different trust
+    boundary"). None of these RPCs carried a tenant filter in the original
+    SQLAlchemy implementation either -- every lookup below is keyed by
+    ``secret_id``/``node_id`` alone -- so DB reads/writes run under
+    ``_cross_tenant_scope()`` (module-level helper above), not a per-request
+    tenant. mTLS/SPIFFE caller identity is Plan 4 scope (see module
+    docstring); until then there is no caller identity to scope to anyway.
+    """
 
     async def Emit(
         self,
         request: joiner_pb2.EmitRequest,
         context: grpc.aio.ServicerContext,
     ) -> joiner_pb2.EmitResponse:
-        from app.api.joiner_secrets import _get_db_session
-        from app.workers.joiner_secret_emitter import JoinerSecretEmitter, ExtractedMaterial
-        from app.security.audit_chain import AuditEventWriter
+        """Persist externally-extracted joiner material for a node.
+
+        Does NOT go through ``JoinerSecretEmitter.emit()`` -- that method's
+        contract (``biome_instance_id`` -> run a fresh control-tunnel
+        extraction -> ``list[JoinerSecretMetadata]``) is a different flow
+        than "persist material a ``JOINER_ROTATE_MATERIAL_PROVIDER`` already
+        extracted", the same distinction ``app.api.joiner_secrets
+        .rotate_joiner_secret`` makes (task 6a). The previous implementation
+        called ``JoinerSecretEmitter(db_session=..., audit_writer=...)``
+        (kwargs the real constructor has never accepted) then
+        ``emitter.emit(cluster_id=..., ...)`` (kwargs the real ``emit()``
+        has never accepted either -- it takes only ``biome_instance_id``) --
+        this RPC could never have succeeded, on any version of this file.
+        Uses the shared ``persist_extracted_material`` helper instead,
+        inside one ``db.transaction()`` -- the same pattern ``Rotate``
+        below and ``rotate_joiner_secret`` use.
+
+        NOTE (pre-existing gap, not fully resolved here): ``joiner_secrets
+        .emitter_biome_id`` is a NOT NULL FK to ``biomes.id``, but
+        ``EmitRequest`` carries no biome reference of its own (only
+        ``node_id``/``rotation_class``/``key_version``). Resolved here via
+        the node's current ``ready`` ``node_egg_assignments`` row, matching
+        this module's own documented flow ("Emitter biome reaches ready on
+        its target node" -- ``joiner_secret_emitter`` module docstring,
+        step 1); aborts NOT_FOUND if there is none, rather than guessing a
+        value. ``request.key_version`` has no column on ``joiner_secrets``
+        at all (only ``rotation_class`` is tracked) and is not persisted --
+        also pre-existing, not introduced by this conversion.
+        """
+        from app.models import get_db
+        from app.workers.joiner_secret_emitter import ExtractedMaterial, persist_extracted_material
+        from app.security.joiner_envelope import zero_bytes
         from quart import current_app
         import uuid as _uuid
 
         try:
-            db = _get_db_session()
-            vault_client = current_app.config.get("VAULT_CLIENT")
-            audit_writer = AuditEventWriter(db_session=db, cluster_id="grpc", signer=None)
-            emitter = JoinerSecretEmitter(
-                db_session=db,
-                vault_client=vault_client,
-                audit_writer=audit_writer,
+            node_id = int(request.node_id)
+        except (TypeError, ValueError):
+            await context.abort(
+                grpc.StatusCode.INVALID_ARGUMENT, f"Invalid node_id: {request.node_id!r}"
             )
+            return joiner_pb2.EmitResponse()
 
-            material_provider = current_app.config.get("JOINER_ROTATE_MATERIAL_PROVIDER")
-            if material_provider is None:
-                await context.abort(
-                    grpc.StatusCode.UNAVAILABLE, "JOINER_ROTATE_MATERIAL_PROVIDER not configured"
+        db = get_db()
+        vault_client = current_app.config.get("VAULT_CLIENT")
+        material_provider = current_app.config.get("JOINER_ROTATE_MATERIAL_PROVIDER")
+        cluster_id = str(_uuid.UUID(current_app.config.get("CLUSTER_ID", str(_uuid.uuid4()))))
+
+        def _resolve_ready_biome() -> tuple[int, str, str] | None:
+            with _cross_tenant_scope():
+                assignment = (
+                    db(
+                        (db.node_egg_assignments.node_id == node_id)
+                        & (db.node_egg_assignments.status == "ready")
+                    )
+                    .select(orderby=~db.node_egg_assignments.id, limitby=(0, 1))
+                    .first()
                 )
-                return joiner_pb2.EmitResponse()
+                if assignment is None:
+                    return None
+                biome = db(db.biomes.id == assignment.egg_id).select().first()
+            if biome is None:
+                return None
+            return int(biome.id), str(biome.tenant_id), str(biome.biome_kind)
 
-            cluster_id = _uuid.UUID(current_app.config.get("CLUSTER_ID", str(_uuid.uuid4())))
-            tenant_id = "__default__"
+        try:
+            if material_provider is None:
+                raise RuntimeError("JOINER_ROTATE_MATERIAL_PROVIDER not configured")
 
-            material: ExtractedMaterial = await asyncio.to_thread(
-                material_provider, None
-            )
+            resolved = await asyncio.to_thread(_resolve_ready_biome)
+            if resolved is None:
+                raise LookupError(f"No ready biome assignment for node {node_id}")
+            emitter_biome_id, tenant_id, biome_kind = resolved
 
-            result = await asyncio.to_thread(
-                emitter.emit,
-                cluster_id=cluster_id,
-                tenant_id=tenant_id,
-                biome_kind=request.rotation_class,
-                emitter_biome_id=None,
-                emitter_node_id=request.node_id,
-                scope=f"key_version:{request.key_version}",
-                material=material,
-                actor_sub="grpc",
-                actor_scope=[],
-                request_id=None,
-            )
+            material: ExtractedMaterial = await asyncio.to_thread(material_provider, None)
 
-            from app.models_m1 import JoinerSecret
-            row = db.query(JoinerSecret).filter(
-                JoinerSecret.id == result.joiner_secret_id
-            ).one()
+            def _persist() -> tuple[str, Any]:
+                with _cross_tenant_scope(), db.transaction() as tx:
+                    new_id, _audit_event_id, expires_at = persist_extracted_material(
+                        tx,
+                        cluster_id=cluster_id,
+                        tenant_id=tenant_id,
+                        biome_kind=biome_kind,
+                        emitter_biome_id=emitter_biome_id,
+                        emitter_node_id=node_id,
+                        extractor_name=request.rotation_class or "grpc-emit",
+                        scope="node",
+                        vault_client=vault_client,
+                        material=material,
+                        actor_sub="grpc",
+                        actor_scope=[],
+                        action="joiner.secret.emit",
+                    )
+                    return new_id, expires_at
 
-            expires_at_str = row.expires_at.isoformat() if row.expires_at else ""
+            try:
+                new_id, expires_at = await asyncio.to_thread(_persist)
+            finally:
+                try:
+                    zero_bytes(material.plaintext)
+                except Exception:  # pragma: no cover - best-effort
+                    log.debug("zero_bytes(material.plaintext) failed; bytes will be GC'd")
+
             return joiner_pb2.EmitResponse(
-                secret_id=str(row.id),
-                expires_at=expires_at_str,
+                secret_id=new_id,
+                expires_at=expires_at.isoformat() if expires_at else "",
             )
 
+        except LookupError as exc:
+            await context.abort(grpc.StatusCode.NOT_FOUND, str(exc))
+            return joiner_pb2.EmitResponse()
+        except RuntimeError as exc:
+            await context.abort(grpc.StatusCode.UNAVAILABLE, str(exc))
+            return joiner_pb2.EmitResponse()
         except Exception as exc:
             log.exception("JoinerSecrets.Emit gRPC handler failed: %s", exc)
             await context.abort(grpc.StatusCode.INTERNAL, str(exc))
@@ -327,32 +431,55 @@ class JoinerSecretsServicer(joiner_pb2_grpc.JoinerSecretsServicer):
         request: joiner_pb2.ConsumeRequest,
         context: grpc.aio.ServicerContext,
     ) -> joiner_pb2.ConsumeResponse:
-        from app.api.joiner_secrets import _get_db_session
-        from app.models_m1 import JoinerSecret
+        """Decrypt and return a joiner secret's plaintext.
+
+        Fixes a pre-existing bug found while making this reachable for the
+        first time: the response field is named ``decrypted_secret`` but
+        the previous implementation returned the raw envelope ciphertext
+        verbatim -- it never called ``decrypt_envelope`` at all, so every
+        (theoretical) caller of this RPC received AES-256-GCM ciphertext +
+        auth tag labeled as plaintext. Mirrors
+        ``IdentityServicer.VerifyOTPN``'s existing correct decrypt pattern
+        in this same file.
+        """
+        from app.models import get_db
+        from app.security.joiner_envelope import EnvelopeCiphertext, decrypt_envelope
+        from quart import current_app
         import uuid as _uuid
 
         try:
-            db = _get_db_session()
+            secret_id = str(_uuid.UUID(request.secret_id))
+        except (TypeError, ValueError) as exc:
+            await context.abort(grpc.StatusCode.INVALID_ARGUMENT, f"Invalid secret_id: {exc}")
+            return joiner_pb2.ConsumeResponse()
 
-            def _fetch() -> JoinerSecret:
-                row = (
-                    db.query(JoinerSecret)
-                    .filter(JoinerSecret.id == _uuid.UUID(request.secret_id))
-                    .one_or_none()
-                )
-                if row is None:
-                    raise KeyError(f"Secret not found: {request.secret_id}")
-                if row.revoked_at is not None:
-                    raise PermissionError(f"Secret {request.secret_id} is revoked")
-                return row
+        db = get_db()
+        vault_client = current_app.config.get("VAULT_CLIENT")
 
-            row = await asyncio.to_thread(_fetch)
+        def _fetch_and_decrypt() -> tuple[bytes, str]:
+            with _cross_tenant_scope():
+                row = db(db.joiner_secrets.id == secret_id).select().first()
+            if row is None:
+                raise KeyError(f"Secret not found: {request.secret_id}")
+            if row.revoked_at is not None:
+                raise PermissionError(f"Secret {request.secret_id} is revoked")
 
-            ciphertext: bytes = row.ciphertext or b""
-            rotation_class: str = row.rotation_class or ""
+            envelope = EnvelopeCiphertext(
+                ciphertext=bytes(row.ciphertext),
+                iv=bytes(row.iv),
+                auth_tag=bytes(row.auth_tag),
+                dek_wrapped=bytes(row.dek_wrapped),
+                vault_kek_name=row.vault_kek_name,
+            )
+            plaintext = decrypt_envelope(
+                envelope, vault_client, joiner_secret_id=_uuid.UUID(secret_id)
+            )
+            return plaintext, row.rotation_class or ""
 
+        try:
+            plaintext, rotation_class = await asyncio.to_thread(_fetch_and_decrypt)
             return joiner_pb2.ConsumeResponse(
-                decrypted_secret=ciphertext,
+                decrypted_secret=plaintext,
                 rotation_class=rotation_class,
             )
 
@@ -372,77 +499,97 @@ class JoinerSecretsServicer(joiner_pb2_grpc.JoinerSecretsServicer):
         request: joiner_pb2.RotateRequest,
         context: grpc.aio.ServicerContext,
     ) -> joiner_pb2.RotateResponse:
-        from app.api.joiner_secrets import _get_db_session
-        from app.models_m1 import JoinerSecret
-        from app.workers.joiner_secret_emitter import JoinerSecretEmitter
-        from app.security.audit_chain import AuditEventWriter
+        """Revoke + persist a fresh joiner secret atomically.
+
+        Same ``db.transaction()`` + ``persist_extracted_material`` pattern
+        as ``app.api.joiner_secrets.rotate_joiner_secret`` (task 6a) -- one
+        write path, not two -- adapted for this RPC's lookup-by-``secret_id``
+        -only contract (no tenant claim on this trust boundary; see class
+        docstring). Does not go through ``JoinerSecretEmitter.emit()`` for
+        the same reason ``Emit`` above doesn't -- that call was never valid
+        (constructor and ``.emit()`` kwargs neither one matches the real
+        class, same finding task 6a made for ``app/api/joiner_secrets.py``).
+        """
+        from app.models import get_db
+        from app.workers.joiner_secret_emitter import persist_extracted_material
+        from app.security.joiner_envelope import zero_bytes
         from quart import current_app
         import uuid as _uuid
 
         try:
-            db = _get_db_session()
+            secret_id = str(_uuid.UUID(request.secret_id))
+        except (TypeError, ValueError) as exc:
+            await context.abort(grpc.StatusCode.INVALID_ARGUMENT, f"Invalid secret_id: {exc}")
+            return joiner_pb2.RotateResponse()
 
-            row: JoinerSecret | None = (
-                db.query(JoinerSecret)
-                .filter(JoinerSecret.id == _uuid.UUID(request.secret_id))
-                .one_or_none()
-            )
+        db = get_db()
+
+        def _fetch_row() -> Any:
+            with _cross_tenant_scope():
+                return db(db.joiner_secrets.id == secret_id).select().first()
+
+        try:
+            row = await asyncio.to_thread(_fetch_row)
             if row is None:
-                await context.abort(grpc.StatusCode.NOT_FOUND, f"Secret not found: {request.secret_id}")
-                return joiner_pb2.RotateResponse()
+                raise KeyError(f"Secret not found: {request.secret_id}")
             if row.revoked_at is not None:
-                await context.abort(grpc.StatusCode.FAILED_PRECONDITION, "Cannot rotate a revoked secret")
-                return joiner_pb2.RotateResponse()
+                raise LookupError("Cannot rotate a revoked secret")
 
             material_provider = current_app.config.get("JOINER_ROTATE_MATERIAL_PROVIDER")
             if material_provider is None:
-                await context.abort(
-                    grpc.StatusCode.UNAVAILABLE, "JOINER_ROTATE_MATERIAL_PROVIDER not configured"
-                )
-                return joiner_pb2.RotateResponse()
+                raise RuntimeError("JOINER_ROTATE_MATERIAL_PROVIDER not configured")
 
             material = await asyncio.to_thread(material_provider, row)
-
             now = datetime.now(timezone.utc)
-            row.revoked_at = now
-            row.rotated_at = now
-            db.flush()
-
+            cluster_id = str(row.cluster_id)
             vault_client = current_app.config.get("VAULT_CLIENT")
-            cluster_id = _uuid.UUID(current_app.config.get("CLUSTER_ID", str(_uuid.uuid4())))
-            audit_writer = AuditEventWriter(db_session=db, cluster_id=str(cluster_id), signer=None)
-            emitter = JoinerSecretEmitter(
-                db_session=db,
-                vault_client=vault_client,
-                audit_writer=audit_writer,
-            )
 
-            result = await asyncio.to_thread(
-                emitter.emit,
-                cluster_id=cluster_id,
-                tenant_id=row.tenant_id,
-                biome_kind=row.biome_kind,
-                emitter_biome_id=row.emitter_biome_id,
-                emitter_node_id=row.emitter_node_id,
-                scope=row.scope,
-                material=material,
-                actor_sub="grpc",
-                actor_scope=[],
-                request_id=None,
-            )
+            def _persist() -> tuple[str, Any]:
+                with _cross_tenant_scope(), db.transaction() as tx:
+                    tx.executesql(
+                        "UPDATE joiner_secrets SET revoked_at = %s, rotated_at = %s "
+                        "WHERE id = %s",
+                        (now, now, secret_id),
+                    )
+                    new_id, _audit_event_id, expires_at = persist_extracted_material(
+                        tx,
+                        cluster_id=cluster_id,
+                        tenant_id=row.tenant_id,
+                        biome_kind=row.biome_kind,
+                        emitter_biome_id=row.emitter_biome_id,
+                        emitter_node_id=row.emitter_node_id,
+                        extractor_name=row.extractor_name,
+                        scope=row.scope,
+                        vault_client=vault_client,
+                        material=material,
+                        actor_sub="grpc",
+                        actor_scope=[],
+                        action="joiner.secret.rotate",
+                    )
+                    return new_id, expires_at
 
-            new_row = (
-                db.query(JoinerSecret)
-                .filter(JoinerSecret.id == result.joiner_secret_id)
-                .one()
-            )
+            try:
+                new_id, expires_at = await asyncio.to_thread(_persist)
+            finally:
+                try:
+                    zero_bytes(material.plaintext)
+                except Exception:  # pragma: no cover - best-effort
+                    log.debug("zero_bytes(material.plaintext) failed; bytes will be GC'd")
 
-            expires_at_str = new_row.expires_at.isoformat() if new_row.expires_at else ""
             return joiner_pb2.RotateResponse(
-                new_secret_id=str(new_row.id),
-                expires_at=expires_at_str,
+                new_secret_id=new_id,
+                expires_at=expires_at.isoformat() if expires_at else "",
             )
 
+        except KeyError as exc:
+            await context.abort(grpc.StatusCode.NOT_FOUND, str(exc))
+            return joiner_pb2.RotateResponse()
+        except LookupError as exc:
+            await context.abort(grpc.StatusCode.FAILED_PRECONDITION, str(exc))
+            return joiner_pb2.RotateResponse()
+        except RuntimeError as exc:
+            await context.abort(grpc.StatusCode.UNAVAILABLE, str(exc))
+            return joiner_pb2.RotateResponse()
         except Exception as exc:
             log.exception("JoinerSecrets.Rotate gRPC handler failed: %s", exc)
             await context.abort(grpc.StatusCode.INTERNAL, str(exc))
@@ -453,27 +600,31 @@ class JoinerSecretsServicer(joiner_pb2_grpc.JoinerSecretsServicer):
         request: joiner_pb2.RevokeRequest,
         context: grpc.aio.ServicerContext,
     ) -> joiner_pb2.RevokeResponse:
-        from app.api.joiner_secrets import _get_db_session
-        from app.models_m1 import JoinerSecret
+        """Mark a joiner secret revoked (never hard-deletes; see class docstring)."""
+        from app.models import get_db
         import uuid as _uuid
 
         try:
-            db = _get_db_session()
+            secret_id = str(_uuid.UUID(request.secret_id))
+        except (TypeError, ValueError) as exc:
+            await context.abort(grpc.StatusCode.INVALID_ARGUMENT, f"Invalid secret_id: {exc}")
+            return joiner_pb2.RevokeResponse()
 
-            def _do_revoke() -> bool:
-                row = (
-                    db.query(JoinerSecret)
-                    .filter(JoinerSecret.id == _uuid.UUID(request.secret_id))
-                    .one_or_none()
-                )
+        db = get_db()
+
+        def _do_revoke() -> bool:
+            with _cross_tenant_scope():
+                row = db(db.joiner_secrets.id == secret_id).select().first()
                 if row is None:
                     raise KeyError(f"Secret not found: {request.secret_id}")
                 if row.revoked_at is not None:
                     return False
-                row.revoked_at = datetime.now(timezone.utc)
-                db.flush()
+                db(db.joiner_secrets.id == secret_id).update(
+                    revoked_at=datetime.now(timezone.utc)
+                )
                 return True
 
+        try:
             revoked = await asyncio.to_thread(_do_revoke)
             return joiner_pb2.RevokeResponse(revoked=revoked)
 
@@ -490,48 +641,72 @@ class JoinerSecretsServicer(joiner_pb2_grpc.JoinerSecretsServicer):
         request: joiner_pb2.JoinerListRequest,
         context: grpc.aio.ServicerContext,
     ) -> joiner_pb2.JoinerListResponse:
-        from app.api.joiner_secrets import _get_db_session
-        from app.models_m1 import JoinerSecret
+        """List joiner secrets for a node, keyset-paginated.
+
+        Fixes a pre-existing bug found while making this reachable for the
+        first time: ``JoinerSecret.node_id`` in the proto response is a
+        ``string`` field, but the previous implementation assigned
+        ``r.emitter_node_id`` (an ``int``) to it directly -- protobuf raises
+        ``TypeError`` assigning an int to a string field, so this RPC could
+        never have returned a non-empty list even with a working DB
+        session. Cast to ``str`` here. Preserves the original's
+        ``created_at DESC`` ordering paired with an ``id >`` cursor filter
+        verbatim (not internally consistent as keyset pagination, but not
+        this task's call to redesign).
+        """
+        from app.models import get_db
         import uuid as _uuid
         import base64
         import json
 
-        try:
-            db = _get_db_session()
-            limit = request.limit if request.limit > 0 else 50
-            cursor = request.cursor or None
+        db = get_db()
+        limit = request.limit if request.limit > 0 else 50
+        cursor = request.cursor or None
 
-            def _fetch() -> tuple[list[JoinerSecret], str]:
-                query = db.query(JoinerSecret).filter(
-                    JoinerSecret.emitter_node_id == request.node_id
+        try:
+            node_id = int(request.node_id)
+        except (TypeError, ValueError):
+            await context.abort(
+                grpc.StatusCode.INVALID_ARGUMENT, f"Invalid node_id: {request.node_id!r}"
+            )
+            return joiner_pb2.JoinerListResponse()
+
+        def _fetch() -> tuple[list[Any], str]:
+            query = db.joiner_secrets.emitter_node_id == node_id
+
+            if cursor:
+                try:
+                    decoded = json.loads(base64.urlsafe_b64decode(cursor.encode()).decode())
+                    after_id = str(_uuid.UUID(decoded["id"]))
+                    query = query & (db.joiner_secrets.id > after_id)
+                except Exception:
+                    pass
+
+            with _cross_tenant_scope():
+                rows = list(
+                    db(query).select(
+                        orderby=~db.joiner_secrets.created_at,
+                        limitby=(0, limit + 1),
+                    )
                 )
 
-                if cursor:
-                    try:
-                        decoded = json.loads(base64.urlsafe_b64decode(cursor.encode()).decode())
-                        after_id = _uuid.UUID(decoded["id"])
-                        query = query.filter(JoinerSecret.id > after_id)
-                    except Exception:
-                        pass
+            next_cur = ""
+            if len(rows) > limit:
+                rows = rows[:limit]
+                last = rows[-1]
+                next_cur = base64.urlsafe_b64encode(
+                    json.dumps({"id": str(last.id)}).encode()
+                ).decode()
 
-                rows = query.order_by(JoinerSecret.created_at.desc()).limit(limit + 1).all()
+            return rows, next_cur
 
-                next_cur = ""
-                if len(rows) > limit:
-                    rows = rows[:limit]
-                    last = rows[-1]
-                    next_cur = base64.urlsafe_b64encode(
-                        json.dumps({"id": str(last.id)}).encode()
-                    ).decode()
-
-                return rows, next_cur
-
+        try:
             rows, next_cursor = await asyncio.to_thread(_fetch)
 
             secrets = [
                 joiner_pb2.JoinerSecret(
                     id=str(r.id),
-                    node_id=r.emitter_node_id or "",
+                    node_id=str(r.emitter_node_id) if r.emitter_node_id is not None else "",
                     rotation_class=r.rotation_class or "",
                     key_version=0,
                     created_at=r.created_at.isoformat() if r.created_at else "",
@@ -701,23 +876,47 @@ class BiomesServicer(biomes_pb2_grpc.BiomesServicer):
 
 
 class AuditServicer(audit_pb2_grpc.AuditServicer):
-    """gRPC Audit service — wraps AuditEventWriter for chain-append + verify/export."""
+    """gRPC Audit service — wraps AuditEventWriter for chain-append + verify/export.
+
+    ``Stream``/``ExportRange`` carried no tenant filter in the original
+    implementation either -- read under ``_cross_tenant_scope()`` (see that
+    helper's docstring, and the identical reasoning on
+    ``JoinerSecretsServicer``).
+    """
 
     async def AppendEvent(
         self,
         request: audit_pb2.AppendEventRequest,
         context: grpc.aio.ServicerContext,
     ) -> audit_pb2.AppendEventResponse:
+        """Append one hash-chained audit event via ``AuditEventWriter``.
+
+        ``AuditEventWriter``/``writer.append()`` require a real SQLAlchemy
+        ``Session`` (``app.security.audit_chain`` -- a third file, out of
+        this conversion's scope; see task 6a's identical boundary decision
+        for ``app/api/joiner_secrets.py``). Accessor fix only:
+        ``current_app.db_session`` is never set anywhere in this codebase
+        (grepped ``app/__init__.py`` and every ``app.db_session =``
+        assignment -- there are none), so this always raised
+        ``AttributeError`` before reaching ``AuditEventWriter`` at all.
+        Swapped for ``app.api.audit._get_db_session()``, the same
+        session-acquisition helper the REST audit endpoints use -- it still
+        depends on ``DB_SESSION_FACTORY`` being wired into
+        ``app/__init__.py``'s ``create_app()``, which task 6a found is
+        *also* never done, so this now raises a documented, precedented
+        ``RuntimeError`` instead of an undocumented ``AttributeError``.
+        Genuinely fixing this endpoint needs that wiring -- out of scope for
+        both this file and that one.
+        """
+        from app.api.audit import _get_db_session
         from app.security.audit_chain import AuditEventWriter
         from app.models_m1 import AuditEvent as AuditEventModel
-        from quart import current_app
         import json
-        import uuid as _uuid
 
         try:
             event_data = json.loads(request.event_data)
 
-            db = current_app.db_session
+            db = _get_db_session()
             cluster_id = event_data.get("cluster_id", "grpc")
 
             def _do_append() -> AuditEventModel:
@@ -757,43 +956,80 @@ class AuditServicer(audit_pb2_grpc.AuditServicer):
         request: audit_pb2.StreamRequest,
         context: grpc.aio.ServicerContext,
     ):
-        from quart import current_app
-        from sqlalchemy import text
+        """Stream audit events since ``start_offset`` as JSON payloads.
+
+        Fixes a pre-existing bug found while converting this query off
+        SQLAlchemy: the original ``SELECT`` named a column,
+        ``event_payload``, that has never existed on ``audit_events`` (see
+        ``app.models_m1.AuditEvent`` -- the real columns are
+        ``actor_sub``/``action``/``before_json``/``after_json``/etc, no
+        single combined ``event_payload``) -- this would have raised
+        ``UndefinedColumn`` from Postgres on every call, independent of
+        this conversion. Selects the real columns instead and assembles
+        the same payload shape ``ExportRange`` below already builds, which
+        is clearly what was intended (a JSON event payload per stream
+        entry). No tenant filter in the original query either -- see class
+        docstring on ``_cross_tenant_scope``.
+        """
+        from app.models import get_db
+        from typing import cast
         import json
 
+        db = get_db()
+
+        def _fetch_rows() -> list[dict[str, Any]]:
+            start_offset = request.start_offset if request.start_offset > 0 else 0
+            with _cross_tenant_scope():
+                return cast(
+                    "list[dict[str, Any]]",
+                    db.executesql(
+                        """
+                        SELECT id, ts, cluster_id, tenant_id, actor_sub, actor_scope,
+                               action, resource_kind, resource_id, before_json,
+                               after_json, request_id, source_ip, user_agent
+                        FROM audit_events
+                        WHERE ts >= to_timestamp(%s)
+                        ORDER BY ts ASC
+                        """,
+                        (start_offset,),
+                        as_dict=True,
+                    ),
+                )
+
         try:
-            db = current_app.db_session
-
-            def _fetch_rows() -> list:
-                query = text('''
-                    SELECT id, event_payload, ts
-                    FROM audit_events
-                    WHERE ts >= to_timestamp(:offset)
-                    ORDER BY ts ASC
-                ''')
-                start_offset = request.start_offset if request.start_offset > 0 else 0
-                rows = db.execute(query, {"offset": start_offset}).fetchall()
-                return rows
-
             rows = await asyncio.to_thread(_fetch_rows)
 
             for row in rows:
-                event_id, payload, ts = row[0], row[1], row[2]
+                payload = {
+                    "cluster_id": row["cluster_id"],
+                    "tenant_id": row["tenant_id"],
+                    "actor_sub": row["actor_sub"],
+                    "actor_scope": row["actor_scope"],
+                    "action": row["action"],
+                    "resource_kind": row["resource_kind"],
+                    "resource_id": row["resource_id"],
+                    "before_json": row["before_json"],
+                    "after_json": row["after_json"],
+                    "request_id": row["request_id"],
+                    "source_ip": row["source_ip"],
+                    "user_agent": row["user_agent"],
+                }
 
                 if request.filter:
                     try:
                         filter_obj = json.loads(request.filter)
-                        if payload and isinstance(payload, dict):
-                            after_json = payload.get("after_json", {})
-                            if not all(after_json.get(k) == v for k, v in filter_obj.items()):
-                                continue
+                        after_json = payload.get("after_json") or {}
+                        if isinstance(after_json, dict) and not all(
+                            after_json.get(k) == v for k, v in filter_obj.items()
+                        ):
+                            continue
                     except (json.JSONDecodeError, TypeError):
                         pass
 
                 yield audit_pb2.StreamResponse(
-                    event_id=str(event_id),
-                    event_payload=json.dumps(payload) if payload else "{}",
-                    timestamp=int(ts.timestamp()),
+                    event_id=str(row["id"]),
+                    event_payload=json.dumps(payload, default=str),
+                    timestamp=int(row["ts"].timestamp()),
                 )
 
         except Exception as exc:
@@ -805,12 +1041,20 @@ class AuditServicer(audit_pb2_grpc.AuditServicer):
         request: audit_pb2.VerifyRequest,
         context: grpc.aio.ServicerContext,
     ) -> audit_pb2.VerifyResponse:
+        """Verify the audit hash chain has no breaks.
+
+        ``verify_chain`` requires a real SQLAlchemy ``Session``
+        (``app.security.audit_chain`` -- out of this conversion's scope,
+        same boundary as ``AppendEvent`` above). Accessor fix only -- see
+        ``AppendEvent`` docstring for why ``current_app.db_session`` never
+        worked and what ``_get_db_session()`` still needs before this is a
+        full functional fix.
+        """
+        from app.api.audit import _get_db_session
         from app.security.audit_chain import verify_chain
-        from quart import current_app
-        import uuid as _uuid
 
         try:
-            db = current_app.db_session
+            db = _get_db_session()
 
             def _do_verify() -> dict:
                 result = verify_chain(db, since=None, to=None)
@@ -835,50 +1079,59 @@ class AuditServicer(audit_pb2_grpc.AuditServicer):
         request: audit_pb2.ExportRangeRequest,
         context: grpc.aio.ServicerContext,
     ) -> audit_pb2.ExportRangeResponse:
-        from quart import current_app
-        from sqlalchemy import text
+        """Export audit events in a time range as newline-delimited JSON.
+
+        No tenant filter in the original query -- see class docstring on
+        ``_cross_tenant_scope``.
+        """
+        from app.models import get_db
+        from typing import cast
         import json
         import uuid as _uuid
 
+        db = get_db()
+
+        def _do_export() -> bytes:
+            with _cross_tenant_scope():
+                rows = cast(
+                    "list[dict[str, Any]]",
+                    db.executesql(
+                        """
+                        SELECT id, ts, cluster_id, tenant_id, actor_sub, actor_scope, action,
+                               resource_kind, resource_id, before_json, after_json, request_id,
+                               source_ip, user_agent, prev_hash, hash, signature
+                        FROM audit_events
+                        WHERE ts BETWEEN to_timestamp(%s) AND to_timestamp(%s)
+                        ORDER BY ts ASC
+                        """,
+                        (request.start_time, request.end_time),
+                        as_dict=True,
+                    ),
+                )
+
+            lines = []
+            for row in rows:
+                record = {
+                    "id": str(row["id"]),
+                    "ts": row["ts"].isoformat(),
+                    "cluster_id": row["cluster_id"],
+                    "tenant_id": row["tenant_id"],
+                    "actor_sub": row["actor_sub"],
+                    "actor_scope": row["actor_scope"],
+                    "action": row["action"],
+                    "resource_kind": row["resource_kind"],
+                    "resource_id": row["resource_id"],
+                    "before_json": row["before_json"],
+                    "after_json": row["after_json"],
+                    "request_id": row["request_id"],
+                    "source_ip": row["source_ip"],
+                    "user_agent": row["user_agent"],
+                }
+                lines.append(json.dumps(record))
+
+            return "\n".join(lines).encode("utf-8")
+
         try:
-            db = current_app.db_session
-
-            def _do_export() -> bytes:
-                query = text('''
-                    SELECT id, ts, cluster_id, tenant_id, actor_sub, actor_scope, action,
-                           resource_kind, resource_id, before_json, after_json, request_id,
-                           source_ip, user_agent, prev_hash, hash, signature
-                    FROM audit_events
-                    WHERE ts BETWEEN to_timestamp(:start) AND to_timestamp(:end)
-                    ORDER BY ts ASC
-                ''')
-                rows = db.execute(
-                    query,
-                    {"start": request.start_time, "end": request.end_time},
-                ).fetchall()
-
-                lines = []
-                for row in rows:
-                    record = {
-                        "id": str(row.id),
-                        "ts": row.ts.isoformat(),
-                        "cluster_id": row.cluster_id,
-                        "tenant_id": row.tenant_id,
-                        "actor_sub": row.actor_sub,
-                        "actor_scope": row.actor_scope,
-                        "action": row.action,
-                        "resource_kind": row.resource_kind,
-                        "resource_id": row.resource_id,
-                        "before_json": row.before_json,
-                        "after_json": row.after_json,
-                        "request_id": row.request_id,
-                        "source_ip": row.source_ip,
-                        "user_agent": row.user_agent,
-                    }
-                    lines.append(json.dumps(record))
-
-                return "\n".join(lines).encode("utf-8")
-
             export_data = await asyncio.to_thread(_do_export)
             export_id = str(_uuid.uuid4())
 
@@ -1007,41 +1260,60 @@ class IdentityServicer(identity_pb2_grpc.IdentityServicer):
         request: identity_pb2.VerifyOTPNRequest,
         context: grpc.aio.ServicerContext,
     ) -> identity_pb2.VerifyOTPNResponse:
-        from app.models_m1 import JoinerSecret
+        """Verify a one-time-per-node secret and return its decrypted plaintext.
+
+        No tenant claim on this trust boundary (a node verifying its own
+        OTPN, before it has any other identity -- see
+        ``JoinerSecretsServicer`` class docstring for the same reasoning);
+        reads under ``_cross_tenant_scope()``. Preserves the original's
+        "return ``valid=False`` for every unverifiable case, never a gRPC
+        error" design -- not-found, revoked, malformed ``node_id``, and
+        decrypt failure are all folded into the same false result rather
+        than distinguishable abort codes, which avoids giving a caller an
+        oracle on *why* verification failed.
+        """
+        from app.models import get_db
         from app.security.joiner_envelope import EnvelopeCiphertext, decrypt_envelope
         from quart import current_app
-        import uuid as _uuid
 
         try:
-            db = current_app.db_session
+            db = get_db()
             vault_client = current_app.config.get("VAULT_CLIENT")
 
             def _verify_otp() -> tuple[bool, bytes, str, str]:
-                row = (
-                    db.query(JoinerSecret)
-                    .filter(
-                        JoinerSecret.emitter_node_id == request.node_id,
-                        JoinerSecret.rotation_class == request.rotation_class,
-                    )
-                    .one_or_none()
-                )
+                try:
+                    node_id = int(request.node_id)
+                except (TypeError, ValueError):
+                    return False, b"", "", ""
 
-                if not row:
+                with _cross_tenant_scope():
+                    row = (
+                        db(
+                            (db.joiner_secrets.emitter_node_id == node_id)
+                            & (db.joiner_secrets.rotation_class == request.rotation_class)
+                        )
+                        .select()
+                        .first()
+                    )
+
+                if row is None:
                     return False, b"", "", ""
 
                 if row.revoked_at is not None:
                     return False, b"", "", ""
 
                 envelope = EnvelopeCiphertext(
-                    ciphertext=row.ciphertext,
-                    iv=row.iv,
-                    auth_tag=row.auth_tag,
-                    dek_wrapped=row.dek_wrapped,
+                    ciphertext=bytes(row.ciphertext),
+                    iv=bytes(row.iv),
+                    auth_tag=bytes(row.auth_tag),
+                    dek_wrapped=bytes(row.dek_wrapped),
                     vault_kek_name=row.vault_kek_name,
                 )
 
                 try:
-                    plaintext = decrypt_envelope(envelope, vault_client, joiner_secret_id=row.id)
+                    plaintext = decrypt_envelope(
+                        envelope, vault_client, joiner_secret_id=row.id
+                    )
                 except Exception as e:
                     log.exception("Failed to decrypt envelope: %s", e)
                     return False, b"", "", ""
