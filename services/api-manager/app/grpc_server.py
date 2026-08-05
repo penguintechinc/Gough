@@ -335,6 +335,29 @@ class JoinerSecretsServicer(joiner_pb2_grpc.JoinerSecretsServicer):
         value. ``request.key_version`` has no column on ``joiner_secrets``
         at all (only ``rotation_class`` is tracked) and is not persisted --
         also pre-existing, not introduced by this conversion.
+
+        FIX ROUND 1 (data-integrity gap): ``_resolve_ready_biome`` must
+        only attribute the secret to a biome whose ``emits_joiner_secrets``
+        is true -- a node can have more than one ``ready`` assignment
+        (e.g. one joiner-emitting, one not), and picking the most-recent
+        ``ready`` row regardless of its biome's ``emits_joiner_secrets``
+        flag could attribute the persisted secret to the wrong biome. This
+        must have parity with the pre-existing
+        ``JoinerSecretEmitter._load_context``, which enforces the same
+        invariant (``if not biome.emits_joiner_secrets: raise
+        EmitterStateError(...)``) once it has resolved a specific biome.
+        penguin-dal's query builder has no join support (single ``Query``
+        tracks one table -- see ``penguin_dal.query.Query``), so this
+        can't be expressed as one filtered ``SELECT`` the way a real join
+        could; instead walks the node's ``ready`` assignments
+        most-recent-first and returns the first whose biome actually
+        emits, mirroring ``_load_context``'s per-assignment check rather
+        than trusting whichever assignment happens to be newest. No
+        qualifying assignment (none ready at all, or none with an
+        emitting biome) is treated identically -- both are "nothing to
+        emit for this node" and abort NOT_FOUND (the caller already maps
+        ``_resolve_ready_biome() is None`` to that), rather than
+        introducing a second, distinguishable failure mode.
         """
         from app.models import get_db
         from app.workers.joiner_secret_emitter import ExtractedMaterial, persist_extracted_material
@@ -357,20 +380,17 @@ class JoinerSecretsServicer(joiner_pb2_grpc.JoinerSecretsServicer):
 
         def _resolve_ready_biome() -> tuple[int, str, str] | None:
             with _cross_tenant_scope():
-                assignment = (
-                    db(
-                        (db.node_egg_assignments.node_id == node_id)
-                        & (db.node_egg_assignments.status == "ready")
-                    )
-                    .select(orderby=~db.node_egg_assignments.id, limitby=(0, 1))
-                    .first()
-                )
-                if assignment is None:
-                    return None
-                biome = db(db.biomes.id == assignment.egg_id).select().first()
-            if biome is None:
-                return None
-            return int(biome.id), str(biome.tenant_id), str(biome.biome_kind)
+                assignments = db(
+                    (db.node_egg_assignments.node_id == node_id)
+                    & (db.node_egg_assignments.status == "ready")
+                ).select(orderby=~db.node_egg_assignments.id)
+
+                for assignment in assignments:
+                    biome = db(db.biomes.id == assignment.egg_id).select().first()
+                    if biome is not None and biome.emits_joiner_secrets:
+                        return int(biome.id), str(biome.tenant_id), str(biome.biome_kind)
+
+            return None
 
         try:
             if material_provider is None:

@@ -326,7 +326,7 @@ class TestEmit:
         self, pg_db: Any, mock_vault_client: Any
     ) -> None:
         node_id = _seed_node(pg_db)
-        biome_id = _seed_biome(pg_db, biome_kind="k8s-primary")
+        biome_id = _seed_biome(pg_db, biome_kind="k8s-primary", emits_joiner_secrets=True)
         _seed_assignment(pg_db, node_id=node_id, egg_id=biome_id, status="ready")
 
         material = Mock()
@@ -349,6 +349,72 @@ class TestEmit:
         assert row is not None
         assert row.emitter_biome_id == biome_id
         assert row.tenant_id == "acme"
+
+    async def test_emit_skips_non_emitting_biome_when_multiple_ready(
+        self, pg_db: Any, mock_vault_client: Any
+    ) -> None:
+        """Regression (fix round 1): a node with two ``ready`` assignments --
+        one pointing at a non-emitting biome, one at an emitting biome --
+        must attribute the secret to the EMITTING biome, never whichever
+        assignment happens to be most recent. Parity with
+        ``JoinerSecretEmitter._load_context``'s ``emits_joiner_secrets``
+        enforcement."""
+        node_id = _seed_node(pg_db)
+        non_emitting_id = _seed_biome(
+            pg_db, biome_kind="sidecar", emits_joiner_secrets=False
+        )
+        emitting_id = _seed_biome(
+            pg_db, biome_kind="k8s-primary", emits_joiner_secrets=True
+        )
+        # Non-emitting assignment inserted (and thus higher id) AFTER the
+        # emitting one, so a naive "most recent ready row" pick would
+        # select the wrong (non-emitting) biome.
+        _seed_assignment(pg_db, node_id=node_id, egg_id=emitting_id, status="ready")
+        _seed_assignment(pg_db, node_id=node_id, egg_id=non_emitting_id, status="ready")
+
+        material = Mock()
+        material.extractor_name = "grpc-emit"
+        material.plaintext = b"fresh-token"
+        material.ttl_seconds = 3600
+        material.rotation_class = "single_use"
+        provider = Mock(return_value=material)
+
+        app = _make_app(db=pg_db, vault_client=mock_vault_client, material_provider=provider)
+        request = Mock(node_id=str(node_id), rotation_class="k8s-primary", key_version=1)
+        context = FakeGrpcContext()
+
+        async with app.app_context():
+            response = await JoinerSecretsServicer().Emit(request, context)
+
+        assert context.aborted is None
+        row = pg_db(pg_db.joiner_secrets.id == response.secret_id).select().first()
+        assert row is not None
+        assert row.emitter_biome_id == emitting_id
+
+    async def test_emit_not_found_when_ready_assignment_biome_does_not_emit(
+        self, pg_db: Any, mock_vault_client: Any
+    ) -> None:
+        """Regression (fix round 1): a node whose only ``ready`` assignment
+        points at a non-emitting biome must abort NOT_FOUND, the same as
+        having no ready assignment at all -- never persist a secret
+        attributed to a biome that doesn't emit joiner secrets."""
+        node_id = _seed_node(pg_db)
+        biome_id = _seed_biome(pg_db, biome_kind="sidecar", emits_joiner_secrets=False)
+        _seed_assignment(pg_db, node_id=node_id, egg_id=biome_id, status="ready")
+
+        provider = Mock()
+        app = _make_app(db=pg_db, vault_client=mock_vault_client, material_provider=provider)
+        request = Mock(node_id=str(node_id), rotation_class="sidecar", key_version=1)
+        context = FakeGrpcContext()
+
+        async with app.app_context():
+            with pytest.raises(_AbortCalled):
+                await JoinerSecretsServicer().Emit(request, context)
+
+        assert context.aborted is not None
+        code, _details = context.aborted
+        assert "NOT_FOUND" in str(code)
+        provider.assert_not_called()
 
     async def test_emit_not_found_when_no_ready_assignment(
         self, pg_db: Any, mock_vault_client: Any
