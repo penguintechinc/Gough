@@ -292,33 +292,13 @@ class TestSerializerAuditEvent:
 # =============================================================================
 
 
-# Discovered while wiring the pg_db_scoped RLS tests below: the baseline
-# migration (alembic/versions/20260805_1000_baseline_full_schema.py:217)
-# only grants `api-manager-rw` INSERT on audit_events, never SELECT (SELECT
-# is only granted to the separate `audit-reader` role and, on the redacted
-# view, `webui-ro`). That's the actual production role api-manager's own DB
-# connection authenticates as (Config.DB_USER), so list_audit_events /
-# export_audit_log's read queries hit `permission denied for table
-# audit_events` against real Postgres today -- independent of RLS, and
-# predating this conversion. Fixing it means editing the alembic migration,
-# outside this task's file scope (app/api/audit.py, app/api/
-# joiner_secrets.py, app/workers/joiner_secret_emitter.py, app/db/rls.py's
-# docstring, and these test files) -- flagged in task-6a-report.md instead.
-# The tests below are marked xfail(strict=True) against this exact error
-# rather than silently reverted to the RLS-exempt pg_db (which would prove
-# nothing about tenant isolation, per the coordinator's fix-round #2) or
-# silently skipped -- strict=True means the marker itself starts failing
-# the moment the missing GRANT is added, which is exactly the signal that
-# should prompt removing it.
-_AUDIT_EVENTS_SELECT_NOT_GRANTED = pytest.mark.xfail(
-    strict=True,
-    raises=Exception,
-    reason=(
-        "api-manager-rw lacks GRANT SELECT ON audit_events (baseline "
-        "migration only grants INSERT) -- pre-existing infra gap outside "
-        "this task's file scope, see task-6a-report.md fix-round #2"
-    ),
-)
+# Formerly xfail(strict=True): the baseline migration
+# (alembic/versions/20260805_1000_baseline_full_schema.py) only granted
+# `api-manager-rw` INSERT on audit_events, never SELECT, so
+# list_audit_events / export_audit_log's read queries hit `permission denied
+# for table audit_events` against real Postgres. The migration now grants
+# SELECT too (see the GRANT statement for audit_events); these tests run for
+# real against pg_db_scoped.
 
 
 @pytest.mark.asyncio
@@ -332,7 +312,6 @@ class TestListAuditEvents:
     so they don't need ``pg_db`` and are unchanged.
     """
 
-    @_AUDIT_EVENTS_SELECT_NOT_GRANTED
     async def test_list_happy_path(
         self, pg_db: Any, pg_db_scoped: Any, monkeypatch: pytest.MonkeyPatch
     ) -> None:
@@ -357,7 +336,6 @@ class TestListAuditEvents:
         body = await resp.get_json()
         assert body["count"] == 2
 
-    @_AUDIT_EVENTS_SELECT_NOT_GRANTED
     async def test_list_empty_result(
         self, pg_db: Any, pg_db_scoped: Any, monkeypatch: pytest.MonkeyPatch
     ) -> None:
@@ -381,7 +359,6 @@ class TestListAuditEvents:
             "items": [],
         }
 
-    @_AUDIT_EVENTS_SELECT_NOT_GRANTED
     async def test_list_rls_isolates_two_tenants(
         self, pg_db: Any, pg_db_scoped: Any, monkeypatch: pytest.MonkeyPatch
     ) -> None:

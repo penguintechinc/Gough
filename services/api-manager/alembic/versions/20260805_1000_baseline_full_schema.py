@@ -214,10 +214,19 @@ def upgrade() -> None:
                  'leader_leases', 'dr_drills', 'slo_definitions', 'node_tags_operator']
     for tbl in m1_tables:
         op.execute(f'GRANT SELECT, INSERT, UPDATE ON {tbl} TO "api-manager-rw"')
-    op.execute('GRANT INSERT ON audit_events TO "api-manager-rw"')
+    op.execute('GRANT SELECT, INSERT ON audit_events TO "api-manager-rw"')
     op.execute('GRANT DELETE ON node_egg_assignments TO "api-manager-rw"')
     op.execute('GRANT DELETE ON migration_events TO "api-manager-rw"')
     op.execute('GRANT DELETE ON disk_plans TO "api-manager-rw"')
+    # biomes: app.api.biomes.delete_biome's hard-delete path
+    # (``db(db.biomes.id == biome_id).delete()``) needs DELETE in addition to
+    # the SELECT/INSERT/UPDATE the m1_tables loop above already grants.
+    op.execute('GRANT DELETE ON biomes TO "api-manager-rw"')
+    # webhook_endpoints (app.models_m1.WebhookEndpoint) was simply left out
+    # of the m1_tables list above, even though app.api.webhooks (raw SQL:
+    # SELECT/INSERT/DELETE, no UPDATE) runs under this same role in
+    # production (Config.DB_USER) -- same gap class as audit_events/biomes.
+    op.execute('GRANT SELECT, INSERT, DELETE ON webhook_endpoints TO "api-manager-rw"')
 
     op.execute('GRANT SELECT ON nodes TO "worker-ipxe-rw"')
     op.execute('GRANT SELECT ON node_egg_assignments TO "worker-ipxe-rw"')
