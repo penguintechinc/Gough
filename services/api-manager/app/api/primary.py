@@ -20,7 +20,7 @@ import uuid
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from functools import wraps
-from typing import Any, Callable, Optional
+from typing import Any, Callable, Optional, cast
 
 from quart import Blueprint, current_app, g, jsonify, request
 
@@ -202,21 +202,27 @@ async def _check_etcd_quorum(etcd_client: Any) -> bool:
 
 async def _get_joiner_secrets(db: Any, cluster_id: str) -> dict[str, str]:
     """Retrieve kubeadm join token, CA hash, and certificate key from DB."""
-    secrets = {}
+    secrets: dict[str, str] = {}
     try:
-        # Query joiner_secrets table for latest valid tokens
-        rows = await asyncio.to_thread(
-            db.query,
-            "SELECT extractor_name, ciphertext FROM joiner_secrets "
-            "WHERE cluster_id=%s AND revoked_at IS NULL "
-            "AND (expires_at IS NULL OR expires_at > NOW()) "
-            "ORDER BY created_at DESC LIMIT 10",
-            (cluster_id,)
+        now = datetime.now(timezone.utc)
+        query = (
+            (db.joiner_secrets.cluster_id == cluster_id)
+            & (db.joiner_secrets.revoked_at == None)  # noqa: E711 — DAL idiom
+            & (
+                (db.joiner_secrets.expires_at == None)  # noqa: E711 — DAL idiom
+                | (db.joiner_secrets.expires_at > now)
+            )
+        )
+        rows = db(query).select(
+            db.joiner_secrets.extractor_name,
+            db.joiner_secrets.ciphertext,
+            orderby=~db.joiner_secrets.created_at,
+            limitby=(0, 10),
         )
         for row in rows:
-            name = row[0]
+            name = row.extractor_name
             if name in ("kubeadm_join_token", "kubeadm_ca_hash", "kubeadm_certificate_key"):
-                secrets[name] = row[1]  # ciphertext to be decrypted in real impl
+                secrets[name] = row.ciphertext  # ciphertext to be decrypted in real impl
     except Exception as e:
         log.error(f"Failed to fetch joiner secrets: {e}")
     return secrets
@@ -494,12 +500,20 @@ async def _update_endpoint_on_nodes(
         }
 
         try:
-            # Resolve node endpoint from DB (MANAGEMENT_IP or CLUSTER_IP)
+            # Resolve node endpoint from DB (MANAGEMENT_IP or CLUSTER_IP).
+            # NOTE: app.models_m1.Node has no management_ip/cluster_ip
+            # columns in the current schema -- this raw query has always
+            # failed against real Postgres ("column does not exist"), caught
+            # below exactly as before. Pre-existing, unrelated to this
+            # conversion; preserved verbatim via db.executesql() rather than
+            # guessing a column mapping (e.g. ipv4/ipv6).
             db = get_db()
-            node_row = await asyncio.to_thread(
-                db.query,
-                "SELECT management_ip, cluster_ip FROM nodes WHERE id=%s",
-                (node_id,)
+            node_row = cast(
+                "list[tuple[Any, ...]]",
+                db.executesql(
+                    "SELECT management_ip, cluster_ip FROM nodes WHERE id=%s",
+                    (node_id,),
+                ),
             )
             if not node_row:
                 node_result["error"] = f"Node {node_id} not found in DB"
@@ -600,12 +614,17 @@ async def _emit_gracious_arp(vip: str, node_ids: list[int]) -> dict[int, dict[st
         }
 
         try:
-            # Resolve node endpoint
+            # Resolve node endpoint. See the identical NOTE in
+            # _update_endpoint_on_nodes above: management_ip/cluster_ip are
+            # not real columns on `nodes` -- pre-existing, unrelated to this
+            # conversion, preserved verbatim via db.executesql().
             db = get_db()
-            node_row = await asyncio.to_thread(
-                db.query,
-                "SELECT management_ip, cluster_ip FROM nodes WHERE id=%s",
-                (node_id,)
+            node_row = cast(
+                "list[tuple[Any, ...]]",
+                db.executesql(
+                    "SELECT management_ip, cluster_ip FROM nodes WHERE id=%s",
+                    (node_id,),
+                ),
             )
             if not node_row:
                 node_result["error"] = f"Node {node_id} not found in DB"
@@ -755,9 +774,9 @@ async def switch_frontend():
     # Update endpoint everywhere
     db = get_db()
     try:
-        node_ids = await asyncio.to_thread(
-            lambda: [row[0] for row in db.query("SELECT id FROM nodes WHERE state='primary'")]
-        )
+        node_ids = [
+            row.id for row in db(db.nodes.state == "primary").select(db.nodes.id)
+        ]
         if not await _update_endpoint_on_nodes(new_endpoint or "", node_ids):
             return jsonify({
                 "status": "error",
@@ -846,6 +865,27 @@ async def _publish_helper_artifact(new_ca_cert: str, tftp_root: str) -> bool:
         return False
 
 
+def _rotate_bootstrap_ca(db: Any, new_cert: str) -> None:
+    """Substitute the new CA cert into ``biome_templates``' cloud-init content.
+
+    Best-effort -- the caller already treats failures here as non-fatal (the
+    CA rotation's primary side effects, issuing the cert and publishing the
+    helper artifact, have already succeeded by the time this runs).
+
+    NOTE: ``biome_templates`` does not exist anywhere in the current schema
+    (``app.models_m1`` / the Alembic baseline) -- this has always failed
+    against real Postgres ("relation \"biome_templates\" does not exist"),
+    caught by the caller exactly as before. Pre-existing, unrelated to this
+    DB-access conversion; not fixed here.
+    """
+    db.executesql(
+        "UPDATE biome_templates SET cloud_init_content = "
+        "REGEXP_REPLACE(cloud_init_content, '---CA_CERT---', %s) "
+        "WHERE biome_kind = 'k8s-helper'",
+        (new_cert,),
+    )
+
+
 @primary_bp.route("/rotate-ca", methods=["POST"])
 @auth_required
 @_scope_required("gough.cluster.superadmin")
@@ -912,14 +952,7 @@ async def rotate_ipxe_ca():
         # Update cloud-init bootstrap template (real impl updates DB)
         db = get_db()
         try:
-            await asyncio.to_thread(
-                lambda: db.query(
-                    "UPDATE biome_templates SET cloud_init_content = "
-                    "REGEXP_REPLACE(cloud_init_content, '---CA_CERT---', %s) "
-                    "WHERE biome_kind = 'k8s-helper'",
-                    (new_cert,)
-                )
-            )
+            _rotate_bootstrap_ca(db, new_cert)
         except Exception as e:
             log.warning(f"Failed to update bootstrap template: {e}")
 

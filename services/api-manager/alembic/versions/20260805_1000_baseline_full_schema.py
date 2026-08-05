@@ -223,10 +223,14 @@ def upgrade() -> None:
     # the SELECT/INSERT/UPDATE the m1_tables loop above already grants.
     op.execute('GRANT DELETE ON biomes TO "api-manager-rw"')
     # webhook_endpoints (app.models_m1.WebhookEndpoint) was simply left out
-    # of the m1_tables list above, even though app.api.webhooks (raw SQL:
-    # SELECT/INSERT/DELETE, no UPDATE) runs under this same role in
-    # production (Config.DB_USER) -- same gap class as audit_events/biomes.
-    op.execute('GRANT SELECT, INSERT, DELETE ON webhook_endpoints TO "api-manager-rw"')
+    # of the m1_tables list above, even though app.api.webhooks runs under
+    # this same role in production (Config.DB_USER) -- same gap class as
+    # audit_events/biomes. UPDATE is required too: the penguin-dal-converted
+    # delete_webhook/create_webhook/list_webhooks/test_webhook handlers don't
+    # currently issue UPDATEs, but webhook_endpoints has an updated_at column
+    # future writers will need, and there's no reason this role should be
+    # missing the one DML verb the m1_tables loop grants everyone else.
+    op.execute('GRANT SELECT, INSERT, UPDATE, DELETE ON webhook_endpoints TO "api-manager-rw"')
 
     op.execute('GRANT SELECT ON nodes TO "worker-ipxe-rw"')
     op.execute('GRANT SELECT ON node_egg_assignments TO "worker-ipxe-rw"')
@@ -257,7 +261,8 @@ def upgrade() -> None:
     rls_tables = ['nodes', 'disks', 'disk_plans', 'node_egg_assignments', 'biomes',
                   'storage_backends', 'migration_events',
                   'joiner_secrets', 'audit_events', 'dr_drills', 'slo_definitions',
-                  'hardware_firmware', 'node_tags_operator', 'node_bmc']
+                  'hardware_firmware', 'node_tags_operator', 'node_bmc',
+                  'webhook_endpoints']
     for tbl in rls_tables:
         op.execute(f'ALTER TABLE {tbl} ENABLE ROW LEVEL SECURITY')
         op.execute(f"""

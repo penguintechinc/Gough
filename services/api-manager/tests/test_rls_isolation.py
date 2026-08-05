@@ -140,3 +140,94 @@ def test_owner_connection_is_rls_exempt(
 
     tenant_ids = {row.tenant_id for row in rows}
     assert tenant_ids == {TENANT_A, TENANT_B}
+
+
+# =============================================================================
+# webhook_endpoints -- added to rls_tables by the penguin-dal runtime
+# migration (task 6b); previously missing from the baseline's rls_tables
+# list entirely, so it had no RLS policy at all regardless of GUC wiring.
+#
+# Queried directly here (``pg_db_scoped.webhook_endpoints.id > 0``, no
+# ``tenant_id ==`` filter) rather than through the HTTP endpoint, because
+# ``app.api.webhooks.list_webhooks`` already applies its own app-level
+# ``tenant_id ==`` filter -- a test that goes through the endpoint can't
+# distinguish "RLS isolates the rows" from "the app-level filter isolates
+# the rows" (see tests/api/test_webhooks.py's
+# ``test_list_rls_isolates_two_tenants`` docstring for that endpoint-level
+# smoke test instead).
+# =============================================================================
+
+
+def _seed_webhook_endpoint(owner_db: DB, *, url: str, tenant_id: str) -> int:
+    """Insert a minimal ``webhook_endpoints`` row as the table OWNER (bypasses
+    RLS on insert). created_at/updated_at have no server-side DEFAULT (see
+    the note in app.api.webhooks.create_webhook) -- supplied explicitly."""
+    from datetime import datetime, timezone
+
+    now = datetime.now(timezone.utc)
+    return owner_db.webhook_endpoints.insert(
+        tenant_id=tenant_id, url=url, signing_mode="ed25519", active=True,
+        event_filter=[], retry_policy={"mode": "standard"},
+        created_at=now, updated_at=now,
+    )
+
+
+@pytest.fixture
+def two_tenant_webhook_endpoints(pg_db: DB) -> tuple[int, int]:
+    id_a = _seed_webhook_endpoint(
+        pg_db, url="https://a.example.com/hook", tenant_id=TENANT_A
+    )
+    id_b = _seed_webhook_endpoint(
+        pg_db, url="https://b.example.com/hook", tenant_id=TENANT_B
+    )
+    return id_a, id_b
+
+
+def test_webhook_endpoints_tenant_a_sees_only_own_row(
+    pg_db_scoped: DB, two_tenant_webhook_endpoints: tuple[int, int]
+) -> None:
+    install_rls_events(pg_db_scoped.engine)
+    set_current_tenant(TENANT_A)
+    try:
+        rows = pg_db_scoped(pg_db_scoped.webhook_endpoints.id > 0).select()
+    finally:
+        set_current_tenant(None)
+
+    tenant_ids = {row.tenant_id for row in rows}
+    assert tenant_ids == {TENANT_A}
+    assert len(rows) == 1
+
+
+def test_webhook_endpoints_tenant_b_sees_only_own_row(
+    pg_db_scoped: DB, two_tenant_webhook_endpoints: tuple[int, int]
+) -> None:
+    install_rls_events(pg_db_scoped.engine)
+    set_current_tenant(TENANT_B)
+    try:
+        rows = pg_db_scoped(pg_db_scoped.webhook_endpoints.id > 0).select()
+    finally:
+        set_current_tenant(None)
+
+    tenant_ids = {row.tenant_id for row in rows}
+    assert tenant_ids == {TENANT_B}
+    assert len(rows) == 1
+
+
+def test_webhook_endpoints_unset_tenant_is_fail_closed(
+    pg_db_scoped: DB, two_tenant_webhook_endpoints: tuple[int, int]
+) -> None:
+    install_rls_events(pg_db_scoped.engine)
+    set_current_tenant(None)
+
+    rows = pg_db_scoped(pg_db_scoped.webhook_endpoints.id > 0).select()
+
+    assert len(rows) == 0
+
+
+def test_webhook_endpoints_owner_connection_is_rls_exempt(
+    pg_db: DB, two_tenant_webhook_endpoints: tuple[int, int]
+) -> None:
+    rows = pg_db(pg_db.webhook_endpoints.id > 0).select()
+
+    tenant_ids = {row.tenant_id for row in rows}
+    assert tenant_ids == {TENANT_A, TENANT_B}
