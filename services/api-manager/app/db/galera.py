@@ -237,6 +237,11 @@ def get_cluster_status(db: Any) -> Optional[Dict[str, Any]]:
         return None
 
     try:
+        # Static, known-safe SQL with no user input -- disable the
+        # quoted-literal injection heuristic so this doesn't emit a
+        # DALSecurityWarning on every call of the ~1s cluster-readiness
+        # polling loop (see executesql docstring: this is exactly the
+        # case check_injection=False is for).
         rows = db.executesql(
             "SHOW STATUS WHERE Variable_name IN ("
             "'wsrep_cluster_size', "
@@ -244,7 +249,8 @@ def get_cluster_status(db: Any) -> Optional[Dict[str, Any]]:
             "'wsrep_ready', "
             "'wsrep_connected', "
             "'wsrep_local_state_comment'"
-            ")"
+            ")",
+            check_injection=False,
         )
         rows_raw = [{'Variable_name': r[0], 'Value': r[1]} for r in rows]
 

@@ -147,7 +147,8 @@ def test_get_cluster_status_calls_executesql(monkeypatch):
         "'wsrep_ready', "
         "'wsrep_connected', "
         "'wsrep_local_state_comment'"
-        ")"
+        ")",
+        check_injection=False,
     )
 
 
