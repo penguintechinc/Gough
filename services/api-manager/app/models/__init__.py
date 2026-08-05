@@ -122,6 +122,16 @@ def init_db(app: Quart) -> DB:
         # The health endpoint will handle this gracefully
         db = None
 
+    # Step 3: Wire RLS tenant GUC enforcement (FIX #7a) onto the connection
+    # pool backing this DB instance, so every penguin-dal query -- on the
+    # event loop thread or an asyncio.to_thread() worker -- carries the
+    # request's tenant on the connection Postgres RLS policies inspect. See
+    # app.db.rls for the full mechanism; no-op for non-Postgres backends.
+    if db is not None:
+        from ..db.rls import install_rls_events
+
+        install_rls_events(db.engine)
+
     # Store db instance in app (may be None if connection failed)
     app.config["db"] = db
 

@@ -20,6 +20,7 @@ from __future__ import annotations
 
 import logging
 import os
+import secrets
 from collections.abc import Iterator
 from pathlib import Path
 from urllib.parse import urlparse
@@ -28,6 +29,16 @@ import pytest
 from penguin_dal import DB
 
 SERVICE_ROOT = Path(__file__).resolve().parent.parent
+
+# Non-owner role the baseline migration creates for the api-manager service
+# (``CREATE ROLE "api-manager-rw" WITH LOGIN`` -- no password set there;
+# production wires that in out-of-repo via a secrets-manager-driven ALTER
+# ROLE). Postgres exempts table OWNERS from RLS entirely, so ``pg_db``
+# (which connects as the migration/owner role) can never actually exercise
+# RLS -- this is precisely why the FIX #7a GUC-wiring bug went unnoticed.
+# ``pg_db_scoped`` below connects as this role instead so RLS is genuinely
+# enforced.
+_SCOPED_ROLE = "api-manager-rw"
 
 
 @pytest.fixture(scope="session")
@@ -152,5 +163,57 @@ def pg_db(pg_url: str, _pg_schema: None) -> Iterator[DB]:
         _truncate_all(db)
         yield db
         _truncate_all(db)
+    finally:
+        db.close()
+
+
+@pytest.fixture(scope="session")
+def _pg_scoped_role_password(pg_url: str, _pg_schema: None) -> str:
+    """Set a login password on the ``api-manager-rw`` role, once per session.
+
+    The baseline migration creates the role with ``WITH LOGIN`` but no
+    password -- production sets that separately (secrets-manager-driven, out
+    of repo). Generated fresh per session and scoped only to the ephemeral
+    test database, never persisted or reused across runs.
+    """
+    password = secrets.token_urlsafe(24)
+    owner_db = DB(pg_url, pool_size=1, reflect=False)
+    try:
+        owner_db.executesql(
+            f'ALTER ROLE "{_SCOPED_ROLE}" WITH LOGIN PASSWORD %s',
+            (password,),
+        )
+    finally:
+        owner_db.close()
+    return password
+
+
+def _scoped_pg_url(pg_url: str, password: str) -> str:
+    """Build a connection URL for ``_SCOPED_ROLE``, reusing ``pg_url``'s host/port/db."""
+    parsed = urlparse(pg_url)
+    host = parsed.hostname or "localhost"
+    port = parsed.port or 5432
+    dbname = (parsed.path or "/").lstrip("/")
+    return f"postgresql://{_SCOPED_ROLE}:{password}@{host}:{port}/{dbname}"
+
+
+@pytest.fixture
+def pg_db_scoped(pg_url: str, _pg_scoped_role_password: str) -> Iterator[DB]:
+    """Function-scoped penguin-dal ``DB`` connected as the non-owner ``api-manager-rw`` role.
+
+    Unlike ``pg_db`` (which connects as the migration/table OWNER -- exempt
+    from RLS by Postgres by default), this connects as the actual scoped
+    application role the baseline ``GRANT``s SELECT/INSERT/UPDATE to, so Row
+    Level Security policies are genuinely evaluated on every query. Use this
+    fixture -- never ``pg_db`` -- for any test that asserts RLS tenant
+    isolation actually filters rows.
+
+    Does NOT truncate tables (that's ``pg_db``'s job, and ``api-manager-rw``
+    lacks the privileges to run it): seed data via ``pg_db`` (owner) first,
+    then read it back through this fixture.
+    """
+    db = DB(_scoped_pg_url(pg_url, _pg_scoped_role_password), pool_size=2, reflect=True)
+    try:
+        yield db
     finally:
         db.close()

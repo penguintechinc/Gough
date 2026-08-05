@@ -21,6 +21,12 @@ from .galera import (
     handle_galera_deadlock,
     GaleraConfig,
 )
+from .rls import (
+    CROSS_TENANT_SENTINEL,
+    get_current_tenant,
+    install_rls_events,
+    set_current_tenant,
+)
 
 __all__ = [
     # penguin-dal runtime operations
@@ -37,4 +43,9 @@ __all__ = [
     'set_wsrep_sync_wait',
     'handle_galera_deadlock',
     'GaleraConfig',
+    # RLS tenant GUC wiring (FIX #7a)
+    'CROSS_TENANT_SENTINEL',
+    'get_current_tenant',
+    'install_rls_events',
+    'set_current_tenant',
 ]
