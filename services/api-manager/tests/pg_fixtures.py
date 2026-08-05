@@ -48,12 +48,14 @@ proceed; needs a real fix (e.g. ``JSONB`` + GIN, or drop the index) in
 """
 
 import os
+from collections.abc import Iterator
 
 import pytest
+from penguin_dal import DB
 
 
 @pytest.fixture(scope="session")
-def pg_url():
+def pg_url() -> Iterator[str]:
     """Session-scoped Postgres connection URL (``postgresql://...``).
 
     Reuses ``$DATABASE_URL`` when set (CI service container). Otherwise spins
@@ -65,14 +67,14 @@ def pg_url():
         yield existing.replace("postgresql+psycopg2://", "postgresql://")
         return
 
-    from testcontainers.postgres import PostgresContainer
+    from testcontainers.postgres import PostgresContainer  # type: ignore[import-untyped]
 
     with PostgresContainer("postgres:16-bookworm") as pg:
         yield pg.get_connection_url().replace("postgresql+psycopg2://", "postgresql://")
 
 
 @pytest.fixture
-def pg_db(pg_url):
+def pg_db(pg_url: str) -> Iterator[DB]:
     """Function-scoped penguin-dal ``DB`` bound to a real Postgres instance.
 
     Wipes and rebuilds the ``public`` schema from both SQLAlchemy declarative
@@ -80,8 +82,6 @@ def pg_db(pg_url):
     handing back a reflected penguin-dal ``DB``.
     """
     from sqlalchemy import create_engine, text
-
-    from penguin_dal import DB
 
     from app.models_sqlalchemy import Base as MainBase
 
@@ -93,32 +93,34 @@ def pg_db(pg_url):
     from app.db.init_db import Base as InitBase
 
     eng = create_engine(pg_url)
-    with eng.begin() as conn:
-        conn.execute(text("DROP SCHEMA public CASCADE; CREATE SCHEMA public;"))
-
-    # See module docstring: ix_nodes_hardware_tags is a btree index on a JSON
-    # column, which Postgres rejects outright. Drop it from the metadata for
-    # the duration of create_all() only, then restore it so the rest of the
-    # process (other tests importing the same Base) still see the model as
-    # declared in app/models_m1.py.
-    nodes_table = MainBase.metadata.tables.get("nodes")
-    skipped_index = None
-    if nodes_table is not None:
-        for idx in nodes_table.indexes:
-            if idx.name == "ix_nodes_hardware_tags":
-                skipped_index = idx
-                break
-        if skipped_index is not None:
-            nodes_table.indexes.discard(skipped_index)
-
     try:
-        MainBase.metadata.create_all(eng)  # schema authority = SQLAlchemy
-    finally:
-        if skipped_index is not None:
-            nodes_table.indexes.add(skipped_index)
+        with eng.begin() as conn:
+            conn.execute(text("DROP SCHEMA public CASCADE; CREATE SCHEMA public;"))
 
-    InitBase.metadata.create_all(eng)
-    eng.dispose()
+        # See module docstring: ix_nodes_hardware_tags is a btree index on a
+        # JSON column, which Postgres rejects outright. Drop it from the
+        # metadata for the duration of create_all() only, then restore it so
+        # the rest of the process (other tests importing the same Base)
+        # still see the model as declared in app/models_m1.py.
+        nodes_table = MainBase.metadata.tables.get("nodes")
+        skipped_index = None
+        if nodes_table is not None:
+            for idx in nodes_table.indexes:
+                if idx.name == "ix_nodes_hardware_tags":
+                    skipped_index = idx
+                    break
+            if skipped_index is not None:
+                nodes_table.indexes.discard(skipped_index)
+
+        try:
+            MainBase.metadata.create_all(eng)  # schema authority = SQLAlchemy
+        finally:
+            if skipped_index is not None:
+                nodes_table.indexes.add(skipped_index)
+
+        InitBase.metadata.create_all(eng)
+    finally:
+        eng.dispose()
 
     db = DB(pg_url, pool_size=2, reflect=True)
     yield db

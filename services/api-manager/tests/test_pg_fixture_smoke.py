@@ -10,8 +10,10 @@ as a pytest plugin, so it (and ``pg_url``) are available to every test module
 under ``tests/`` -- this is the pattern later conversion tasks should use.
 """
 
+from penguin_dal import DB
 
-def test_pg_db_is_real_postgres(pg_db):
+
+def test_pg_db_is_real_postgres(pg_db: DB) -> None:
     assert pg_db.executesql("SELECT 1") == [(1,)]
     # A table defined directly on models_sqlalchemy.Base.
     assert "auth_user" in pg_db.tables
