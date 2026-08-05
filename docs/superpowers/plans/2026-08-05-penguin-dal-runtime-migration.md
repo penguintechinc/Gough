@@ -13,6 +13,7 @@
 - **Schema authority stays SQLAlchemy+Alembic** — never move model definitions or migrations to penguin-dal. Runtime queries only.
 - **Sync + thread-local** DB pattern preserved; blocking DB calls in async handlers stay wrapped in `asyncio.to_thread`. No async DB rearchitecture.
 - **Parameterized SQL only** — raw SQL binds via `placeholders`/bound params; never f-string/`%`/`.format` of caller input.
+- **penguin-dal `executesql` uses DRIVER-NATIVE paramstyle** — `%(name)s` (psycopg2/Postgres, the runtime + test DB), `%s` positional, or `?` (sqlite). NEVER SQLAlchemy `:name`. Every converted raw-SQL string and every `Tx.executesql` call uses `%(name)s` for the Postgres runtime. `executesql` already exists on `release/python-dal/v0.4.x` — do not reimplement it.
 - **penguin-dal target version: 0.4.0** on branch `release/python-dal/v0.4.x`; gough repins `penguin-dal==0.3.0` → `0.4.0` in Phase 3.
 - **Every commit runs its task's tests green** before moving on. Backup-push each branch after every commit.
 - Python invoked as `python3` everywhere (never bare `python`).
@@ -24,106 +25,61 @@
 
 ## Phase 1 — penguin-dal primitives (repo: `~/code/penguin-libs`)
 
-### Task 1: `DB.executesql()`
+### Task 1: Validate existing `executesql` + lock the paramstyle contract
+
+`executesql` **already ships** on `release/python-dal/v0.4.x` (`class DB` in `db.py`) with a
+superset signature — **do NOT reimplement it.** This task validates it in the editable env and
+ensures the driver-native paramstyle contract the gough conversion relies on is covered by a test.
 
 **Files:**
-- Modify: `packages/python-dal/src/penguin_dal/db.py` (add method to `class DB`, after `commit()` ~line 123)
-- Test: `packages/python-dal/tests/test_executesql.py` (create)
+- Test: `packages/python-dal/tests/test_executesql.py` (extend ONLY if a listed case is missing)
 
 **Interfaces:**
-- Produces: `DB.executesql(query: str, placeholders: dict | list | None = None, as_dict: bool = False) -> list | None` — returns list of row-tuples (or list of dicts if `as_dict`) for statements that return rows, else `None`. Autocommits (own transaction per call).
+- Consumes (pre-existing, do not modify): `DB.executesql(query, placeholders=None, as_dict=False, fields=None, colnames=None, as_ordered_dict=False, return_rowcount=False, check_injection=True)` — uses `conn.exec_driver_sql`, DRIVER-NATIVE paramstyle (`%(name)s`/`%s` psycopg2, `?` sqlite; NEVER `:name`). Returns `list[tuple]` for SELECT (dict/OrderedDict/`Rows` per flags), `None` for writes (or `cursor.rowcount` if `return_rowcount=True`).
 
-- [ ] **Step 1: Write the failing tests**
-
-```python
-# packages/python-dal/tests/test_executesql.py
-import pytest
-from penguin_dal import DB
-
-@pytest.fixture
-def db(tmp_path):
-    d = DB(f"sqlite:///{tmp_path/'t.db'}", pool_size=1, reflect=False)
-    d.executesql("CREATE TABLE widget (id INTEGER PRIMARY KEY, name TEXT)")
-    return d
-
-def test_executesql_insert_returns_none(db):
-    assert db.executesql("INSERT INTO widget (name) VALUES (:n)", {"n": "a"}) is None
-
-def test_executesql_select_returns_rows(db):
-    db.executesql("INSERT INTO widget (name) VALUES (:n)", {"n": "a"})
-    rows = db.executesql("SELECT name FROM widget")
-    assert rows == [("a",)]
-
-def test_executesql_as_dict(db):
-    db.executesql("INSERT INTO widget (name) VALUES (:n)", {"n": "a"})
-    assert db.executesql("SELECT name FROM widget", as_dict=True) == [{"name": "a"}]
-
-def test_executesql_parameterized_no_injection(db):
-    # value with SQL metacharacters must be treated as a literal, not executed
-    evil = "a'); DROP TABLE widget; --"
-    db.executesql("INSERT INTO widget (name) VALUES (:n)", {"n": evil})
-    rows = db.executesql("SELECT name FROM widget")
-    assert rows == [(evil,)]  # table survived, value stored verbatim
-```
-
-- [ ] **Step 2: Run to verify failure**
+- [ ] **Step 1: Run the existing suite**
 
 Run: `cd ~/code/penguin-libs/packages/python-dal && python3 -m pytest tests/test_executesql.py -v`
-Expected: FAIL — `AttributeError: 'DB' object has no attribute 'executesql'`
+Expected: PASS.
 
-- [ ] **Step 3: Implement**
+- [ ] **Step 2: Confirm paramstyle + shaping coverage**
+
+Confirm `tests/test_executesql.py` covers, on sqlite (`?` paramstyle): a positional-placeholder SELECT returning rows, a write returning `None`, `as_dict=True`, and `return_rowcount=True`. If any is missing, ADD a minimal test for it (sqlite `?`; do NOT require a live Postgres here).
 
 ```python
-# in class DB, after commit()
-def executesql(
-    self,
-    query: str,
-    placeholders: dict | list | None = None,
-    as_dict: bool = False,
-) -> list | None:
-    """Execute raw SQL on a fresh autocommitted connection (PyDAL-compatible).
-
-    Returns a list of row tuples (or dicts if as_dict=True) for statements
-    that return rows, else None. Bind values via placeholders; never
-    interpolate caller input into the query string.
-    """
-    from sqlalchemy import text
-    with self._engine.begin() as conn:
-        result = conn.execute(text(query), placeholders or {})
-        if not result.returns_rows:
-            return None
-        rows = result.fetchall()
-        if as_dict:
-            return [dict(r._mapping) for r in rows]
-        return [tuple(r) for r in rows]
+# add only if missing — sqlite positional paramstyle:
+def test_executesql_positional_and_rowcount(tmp_path):
+    from penguin_dal import DB
+    d = DB(f"sqlite:///{tmp_path/'t.db'}", pool_size=1, reflect=False)
+    d.executesql("CREATE TABLE widget (id INTEGER PRIMARY KEY, name TEXT)")
+    assert d.executesql("INSERT INTO widget (name) VALUES (?)", ("a",)) is None
+    assert d.executesql("SELECT name FROM widget WHERE name = ?", ("a",)) == [("a",)]
+    assert d.executesql("SELECT name FROM widget", as_dict=True) == [{"name": "a"}]
+    assert d.executesql("UPDATE widget SET name = ? WHERE name = ?", ("b", "a"),
+                        return_rowcount=True) == 1
 ```
 
-- [ ] **Step 4: Run to verify pass**
+- [ ] **Step 3: Commit only if a test was added**
 
-Run: `python3 -m pytest tests/test_executesql.py -v`
-Expected: PASS (4 tests)
-
-- [ ] **Step 5: Commit**
-
-```bash
-git add packages/python-dal/src/penguin_dal/db.py packages/python-dal/tests/test_executesql.py
-git commit -m "feat(dal): add DB.executesql() parameterized raw-SQL primitive"
-git push
-```
+If Step 2 added a test: `git add tests/test_executesql.py && git commit -m "test(dal): cover executesql paramstyle + rowcount contract" && git push`.
+If nothing was missing: report `DONE_WITH_CONCERNS` with "executesql already complete — no change" (no commit).
 
 ---
 
-### Task 2: `DB.transaction()` context manager + version bump to 0.4.0
+### Task 2: `DB.transaction()` context manager (+ shared result-shaping helper)
+
+Net-new. Must be **consistent with the existing `executesql`**: driver-native paramstyle via `conn.exec_driver_sql`, same row shaping. Extract the shaping into a module helper and have BOTH `executesql` and `Tx.executesql` call it (DRY — the reviewer will flag duplicated shaping otherwise).
 
 **Files:**
-- Modify: `packages/python-dal/src/penguin_dal/db.py` (add `transaction()` to `class DB`)
-- Modify: `packages/python-dal/pyproject.toml` (version already `0.4.0` — confirm; if not, set it)
+- Modify: `packages/python-dal/src/penguin_dal/db.py` (add module-level `_shape_result` helper + `Tx` class above `class DB`; add `transaction()` to `class DB`; refactor the existing `executesql` result-shaping block to call `_shape_result`)
+- Modify: `packages/python-dal/pyproject.toml` (confirm version is `0.4.0`)
 - Test: `packages/python-dal/tests/test_transaction.py` (create)
 
 **Interfaces:**
-- Produces: `DB.transaction()` — a context manager yielding a `Tx` object with `Tx.executesql(query, placeholders=None, as_dict=False) -> list | None`. All statements run on ONE pinned connection inside one transaction; commits on clean exit, rolls back on exception. This is what advisory-lock / hash-chain / Galera-setup units use so lock/session state persists across statements.
+- Consumes: existing `executesql` execution style (`conn.exec_driver_sql(query, placeholders)`).
+- Produces: `DB.transaction()` — context manager yielding `Tx` with `Tx.executesql(query, placeholders=None, as_dict=False, return_rowcount=False) -> list | int | None`. All statements run on ONE pinned connection in ONE transaction; commit on clean exit, rollback on exception. Same driver-native paramstyle as `DB.executesql`.
 
-- [ ] **Step 1: Write the failing tests**
+- [ ] **Step 1: Write the failing tests** (sqlite, `?` paramstyle)
 
 ```python
 # packages/python-dal/tests/test_transaction.py
@@ -138,19 +94,18 @@ def db(tmp_path):
 
 def test_transaction_commits_on_clean_exit(db):
     with db.transaction() as tx:
-        tx.executesql("INSERT INTO widget (name) VALUES (:n)", {"n": "a"})
-        tx.executesql("INSERT INTO widget (name) VALUES (:n)", {"n": "b"})
+        tx.executesql("INSERT INTO widget (name) VALUES (?)", ("a",))
+        tx.executesql("INSERT INTO widget (name) VALUES (?)", ("b",))
     assert db.executesql("SELECT count(*) FROM widget") == [(2,)]
 
 def test_transaction_rolls_back_on_exception(db):
     with pytest.raises(RuntimeError):
         with db.transaction() as tx:
-            tx.executesql("INSERT INTO widget (name) VALUES (:n)", {"n": "a"})
+            tx.executesql("INSERT INTO widget (name) VALUES (?)", ("a",))
             raise RuntimeError("boom")
     assert db.executesql("SELECT count(*) FROM widget") == [(0,)]
 
 def test_transaction_statements_share_one_connection(db):
-    # a temp table created in the transaction is visible to the next statement
     with db.transaction() as tx:
         tx.executesql("CREATE TEMPORARY TABLE t (x INTEGER)")
         tx.executesql("INSERT INTO t VALUES (1)")
@@ -165,27 +120,43 @@ Expected: FAIL — `AttributeError: 'DB' object has no attribute 'transaction'`
 - [ ] **Step 3: Implement**
 
 ```python
-# add near top of db.py imports:
+# near top of db.py imports:
 from contextlib import contextmanager
 from collections.abc import Iterator
 
-# module-level helper class (above class DB):
+# module-level, above class DB — shared by DB.executesql and Tx.executesql:
+def _shape_result(result, as_dict=False, as_ordered_dict=False,
+                  fields=None, colnames=None, return_rowcount=False):
+    from collections import OrderedDict
+    from penguin_dal.query import Row, Rows
+    if not result.returns_rows:
+        if return_rowcount:
+            return result.rowcount if result.rowcount is not None else -1
+        return None
+    rows = result.fetchall()
+    col_names = list(result.keys())
+    field_list = fields or colnames
+    if as_ordered_dict:
+        return [OrderedDict(zip(col_names, r)) for r in rows]
+    if as_dict:
+        return [dict(zip(col_names, r)) for r in rows]
+    if field_list:
+        custom = [getattr(f, "name", None) or str(f) for f in field_list]
+        return Rows([Row(dict(zip(custom, r))) for r in rows])
+    return [tuple(r) for r in rows]
+
 class Tx:
-    """Raw-SQL executor bound to a single open connection inside a transaction."""
+    """Raw-SQL executor bound to one open connection inside a transaction."""
     def __init__(self, conn: Any) -> None:
         self._conn = conn
 
-    def executesql(
-        self, query: str, placeholders: dict | list | None = None, as_dict: bool = False
-    ) -> list | None:
-        from sqlalchemy import text
-        result = self._conn.execute(text(query), placeholders or {})
-        if not result.returns_rows:
-            return None
-        rows = result.fetchall()
-        if as_dict:
-            return [dict(r._mapping) for r in rows]
-        return [tuple(r) for r in rows]
+    def executesql(self, query: str, placeholders=None, as_dict: bool = False,
+                   return_rowcount: bool = False):
+        if placeholders is not None:
+            result = self._conn.exec_driver_sql(query, placeholders)
+        else:
+            result = self._conn.exec_driver_sql(query)
+        return _shape_result(result, as_dict=as_dict, return_rowcount=return_rowcount)
 
 # in class DB:
 @contextmanager
@@ -208,10 +179,12 @@ def transaction(self) -> Iterator[Tx]:
         conn.close()
 ```
 
+Then **refactor the existing `executesql`**: replace its result-shaping block (from `if not result.returns_rows:` through the final `return [tuple(row) for row in rows]`) with `return _shape_result(result, as_dict=as_dict, as_ordered_dict=as_ordered_dict, fields=fields, colnames=colnames, return_rowcount=return_rowcount)`. Behavior is unchanged — existing `test_executesql.py` must still pass.
+
 - [ ] **Step 4: Run to verify pass + confirm version**
 
 Run: `python3 -m pytest tests/test_executesql.py tests/test_transaction.py -v && grep '^version' pyproject.toml`
-Expected: PASS (7 tests); version shows `0.4.0`
+Expected: PASS (existing executesql tests + 3 transaction tests); version shows `0.4.0`
 
 - [ ] **Step 5: Commit**
 
@@ -340,6 +313,7 @@ with db.engine.connect() as conn:
 # after
 return db.executesql(query, params, as_dict=False)
 ```
+Paramstyle: `db.executesql` uses driver-native placeholders. Convert each raw query string and any callers of `execute_query` to `%(name)s` (Postgres) — never `:name`. Audit `execute_query` callers and update their SQL + params in the same task.
 
 - [ ] **Step 1: Failing test**
 
@@ -458,11 +432,11 @@ Notes: reflected table attribute is the SQL table name (`db.joiner_secrets`, `db
 **Pattern (advisory-lock unit must hold the lock across statements → one transaction):**
 ```python
 # before (db_session.execute(text(...)) across several statements)
-# after:
+# after (Postgres paramstyle = %(name)s, NOT :name):
 with db.transaction() as tx:
-    tx.executesql("SELECT pg_advisory_xact_lock(:k)", {"k": lock_key})
-    rows = tx.executesql("SELECT holder, expires_at FROM leader_lease WHERE name=:n", {"n": name})
-    tx.executesql("INSERT INTO leader_lease (...) VALUES (...) ON CONFLICT ... DO UPDATE ...", {...})
+    tx.executesql("SELECT pg_advisory_xact_lock(%(k)s)", {"k": lock_key})
+    rows = tx.executesql("SELECT holder, expires_at FROM leader_lease WHERE name=%(n)s", {"n": name})
+    tx.executesql("INSERT INTO leader_lease (...) VALUES (%(a)s, %(b)s) ON CONFLICT ... DO UPDATE ...", {...})
 # (pg_advisory_xact_lock auto-releases at transaction end — no manual unlock)
 ```
 Single-statement raw sites (`vault.py`, `smart_sweeper.py`) use `db.executesql(...)` directly.
