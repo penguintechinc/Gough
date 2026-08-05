@@ -22,6 +22,7 @@ from sqlalchemy import (
     TypeDecorator,
     UniqueConstraint,
     Uuid,
+    text,
 )
 from sqlalchemy.dialects import postgresql
 from sqlalchemy.orm import relationship, synonym
@@ -565,8 +566,19 @@ class JoinerSecret(Base):
     audit_event_id = Column(UUID(), ForeignKey("audit_events.id", ondelete="SET NULL"), nullable=True)
 
     __table_args__ = (
-        Index("ix_joiner_secrets_cluster_egg_extractor", "cluster_id", "biome_kind", "extractor_name"),
-        Index("ix_joiner_secrets_expires_at", "expires_at"),
+        # postgresql_where is honored (partial index) on Postgres and ignored
+        # (falls back to a full index) on every other dialect -- matches the
+        # migration this table was originally created by.
+        Index(
+            "ix_joiner_secrets_cluster_egg_extractor",
+            "cluster_id", "biome_kind", "extractor_name",
+            postgresql_where=text("revoked_at IS NULL"),
+        ),
+        Index(
+            "ix_joiner_secrets_expires_at",
+            "expires_at",
+            postgresql_where=text("revoked_at IS NULL"),
+        ),
         Index("ix_joiner_secrets_tenant_id", "tenant_id"),
         {"extend_existing": True},
     )
