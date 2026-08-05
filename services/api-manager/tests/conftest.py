@@ -24,6 +24,14 @@ import jwt
 import pytest
 from unittest.mock import MagicMock
 
+# Registers the pg_url / pg_db real-Postgres fixtures (tests/pg_fixtures.py)
+# for every test module under tests/, so conversion tasks can depend on
+# `pg_db` directly without a per-file import. Needs Docker locally (spins an
+# ephemeral postgres:16-bookworm via testcontainers) or $DATABASE_URL set
+# (CI service container) -- see tests/pg_fixtures.py for the known schema
+# gaps (tables that exist only as raw Alembic migrations).
+pytest_plugins = ["tests.pg_fixtures"]
+
 # Ensure penguin-dal singleton points to a per-test sqlite file *before* any
 # app-level import binds get_db results.
 
