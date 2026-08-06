@@ -17,6 +17,8 @@ from __future__ import annotations
 
 import json
 import uuid
+from collections.abc import Iterator
+from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from typing import Any, Optional
@@ -35,7 +37,6 @@ from app.api.joiner_secrets import (
 from app.security.credentials import CredentialType, Principal
 from app.security.tenant import TenantContext
 from app.workers.joiner_secret_emitter import ExtractedMaterial
-
 
 SECRET_FIELDS_MUST_BE_ABSENT: frozenset[str] = frozenset(
     {"ciphertext", "dek_wrapped", "iv", "auth_tag"}
@@ -164,16 +165,48 @@ class FakeQuery:
         return self._rows[0]
 
 
+class _FakeTx:
+    """Minimal penguin-dal ``Tx`` stand-in for ``AuditEventWriter.append()``
+    (Task 8a -- ``append()`` now needs ``.transaction()``/``Tx.executesql()``,
+    not a SQLAlchemy Session; see ``FakeSession`` docstring)."""
+
+    def __init__(self, session: "FakeSession") -> None:
+        self._session = session
+
+    def executesql(self, query: str, placeholders: Any = None, **_: Any) -> Any:
+        stripped = query.strip().upper()
+        if stripped.startswith("SELECT"):
+            return []
+        self._session.inserted.append((query, placeholders))
+        return None
+
+
 class FakeSession:
-    """Stand-in for SQLAlchemy session — captures inserts and returns rows."""
+    """Stand-in for SQLAlchemy session — captures inserts and returns rows.
+
+    Also implements penguin-dal's ``DB.transaction()``/``Tx.executesql()``
+    surface (``_FakeTx``) -- ``AuditEventWriter.append()`` (Task 8a) needs
+    that API, not ``Session.execute()``/``.add()``/``.flush()``. A real
+    object can't be both; this dual-interface test double can, since these
+    tests only assert on the endpoint's response contract, not on the
+    writer's own self-audit-log row.
+    """
 
     def __init__(self, rows: list[Any]) -> None:
         self.rows = rows
         self.added: list[Any] = []
         self.flushed = 0
+        self.inserted: list[tuple[str, Any]] = []
 
     def execute(self, *_: Any, **__: Any) -> Any:
         return MagicMock()
+
+    def executesql(self, query: str, placeholders: Any = None, **kwargs: Any) -> Any:
+        return _FakeTx(self).executesql(query, placeholders, **kwargs)
+
+    @contextmanager
+    def transaction(self) -> Iterator["_FakeTx"]:
+        yield _FakeTx(self)
 
     def query(self, _model: Any) -> FakeQuery:
         return FakeQuery(self.rows)
@@ -298,17 +331,13 @@ class TestSerializerSecretContract:
             assert forbidden not in out, f"Serializer leaked {forbidden!r}"
 
     def test_serializer_status_active(self) -> None:
-        row = _make_secret(
-            expires_at=datetime.now(timezone.utc) + timedelta(days=30)
-        )
+        row = _make_secret(expires_at=datetime.now(timezone.utc) + timedelta(days=30))
         out = _serialize_joiner_secret(row)
         assert out["status"] == "active"
         assert out["expiring_soon"] is False
 
     def test_serializer_status_expiring_soon(self) -> None:
-        row = _make_secret(
-            expires_at=datetime.now(timezone.utc) + timedelta(hours=1)
-        )
+        row = _make_secret(expires_at=datetime.now(timezone.utc) + timedelta(hours=1))
         out = _serialize_joiner_secret(row)
         assert out["status"] == "expiring-soon"
         assert out["expiring_soon"] is True
@@ -597,9 +626,7 @@ class TestRotateJoinerSecret:
                 rotation_class="vault-unseal",
             )
 
-        principal = _principal(
-            scopes={"gough.joiner.rotate", "gough.joiner.read"}
-        )
+        principal = _principal(scopes={"gough.joiner.rotate", "gough.joiner.read"})
         app = _build_app(
             rows=[],
             principal=principal,
@@ -627,9 +654,7 @@ class TestRotateJoinerSecret:
         # The new row is genuinely committed and independently readable --
         # not an artifact of reading back inside the same transaction.
         reread = (
-            pg_db(pg_db.joiner_secrets.id == data["new_secret"]["id"])
-            .select()
-            .first()
+            pg_db(pg_db.joiner_secrets.id == data["new_secret"]["id"]).select().first()
         )
         assert reread is not None
         assert reread.revoked_at is None
@@ -681,9 +706,7 @@ class TestRotateJoinerSecret:
         # The original secret must NOT be left revoked -- the transaction
         # that would have revoked it rolled back along with the failed
         # persist.
-        original_row = (
-            pg_db(pg_db.joiner_secrets.id == original_id).select().first()
-        )
+        original_row = pg_db(pg_db.joiner_secrets.id == original_id).select().first()
         assert original_row is not None
         assert original_row.revoked_at is None
         assert original_row.rotated_at is None
@@ -750,9 +773,7 @@ class TestRotateJoinerSecret:
         secret = _make_secret(cluster_id=cluster_id)
         # principal w/o MFA, fedramp lane
         principal = _principal(scopes={"gough.joiner.rotate"}, mfa=False)
-        app = _build_app(
-            rows=[secret], principal=principal, mfa_lane="fedramp"
-        )
+        app = _build_app(rows=[secret], principal=principal, mfa_lane="fedramp")
         client = app.test_client()
         resp = await client.post(
             f"/api/v1/clusters/{cluster_id}/joiner-secrets/{secret.id}/rotate",

@@ -1,13 +1,20 @@
-"""Tests for the audit_chain_writer worker.
+"""Tests for the audit_chain_writer worker (real Postgres via ``pg_db``).
 
 Covers:
 
 * Two-instance leader test — A is leader, writes succeed; B is non-leader,
   writes raise NotLeaderError.
+* ``append_event`` runs its advisory-lock + SERIALIZABLE + hash-chain
+  read+insert inside one shared, pinned ``db.transaction()`` — proven by a
+  genuine concurrent-writer test (see
+  ``test_concurrent_append_serializes_and_never_forks_chain``).
+* RLS cross-tenant sentinel — proven against ``pg_db_scoped`` (see
+  ``test_append_event_and_verify_require_cross_tenant_scope``).
 * Tampering — synthetic break in audit_events, verify_chain detects, metric
   increments, NATS event fires with first_break_id.
 * Offsite mirror — moto-backed S3; assert every committed row is shipped with
-  correct content + retention metadata; lag gauge updates.
+  correct content + retention metadata; lag gauge updates. (Skipped per the
+  pre-existing Python 3.14 asyncio.to_thread hang — see the skip reason.)
 * Scheduled verify — 24 h window respected; clean chain emits no event.
 """
 
@@ -16,21 +23,16 @@ from __future__ import annotations
 import asyncio
 import json
 import os
-import sys
-import uuid
-from contextlib import asynccontextmanager
+import threading
 from datetime import datetime, timedelta, timezone
-from typing import Any, Optional
-from unittest.mock import MagicMock
+from typing import Any, Optional, cast
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
+from penguin_dal import DB
 
-from app.security.audit_chain import (
-    ZERO_HASH,
-    canonicalize_record,
-    compute_chain_hash,
-    generate_uuidv7,
-)
+from app.db.rls import install_rls_events, set_current_tenant
+from app.security.audit_chain import ZERO_HASH, compute_chain_hash, generate_uuidv7
 from app.workers import audit_chain_writer as acw_module
 from app.workers import leader_lease as ll
 from app.workers.audit_chain_writer import (
@@ -40,179 +42,50 @@ from app.workers.audit_chain_writer import (
 )
 
 
+def _rows(result: Any) -> list[tuple[Any, ...]]:
+    """Narrow an ``executesql()`` result to ``list[tuple]`` for test assertions."""
+    return cast("list[tuple[Any, ...]]", result)
+
+
+_OFFSITE_MIRROR_SKIP_REASON = (
+    "asyncio.to_thread + prometheus_client autouse fixtures hang "
+    "indefinitely in Python 3.14 test environment"
+)
+
+
 # ---------------------------------------------------------------------------
-# Helpers — minimal in-memory audit_events store for the writer tests.
+# Seeding helper — real Postgres INSERT with a correctly-computed chain hash
+# for a caller-chosen ``ts`` (AuditEventWriter.append() always uses "now",
+# so window-boundary tests that need specific timestamps go straight to SQL,
+# mirroring AuditEventWriter._append_on_tx's insert shape exactly).
 # ---------------------------------------------------------------------------
-
-
-class _Row:
-    """SQLAlchemy-Row-like object with mapping access + index access."""
-
-    def __init__(self, fields: list[str], values: list[Any]) -> None:
-        self._fields = fields
-        self._values = values
-
-    @property
-    def _mapping(self) -> dict[str, Any]:
-        return dict(zip(self._fields, self._values))
-
-    def __getitem__(self, idx: int) -> Any:
-        return self._values[idx]
-
-
-class FakeAuditDB:
-    """In-memory audit_events table plus a single-row mirror_state."""
-
-    def __init__(self, *, supports_advisory_lock: bool = False) -> None:
-        self.events: list[dict[str, Any]] = []
-        self.mirror_state: dict[str, Any] = {}
-        self.supports_advisory_lock = supports_advisory_lock
-        self.advisory_lock_calls = 0
-        self.serializable_calls = 0
-
-    # -- SQLAlchemy execute stub -------------------------------------------------
-    def execute(self, statement: Any, params: Optional[dict[str, Any]] = None) -> Any:
-        sql = str(statement).strip().lower()
-        params = params or {}
-
-        if "set transaction isolation level serializable" in sql:
-            self.serializable_calls += 1
-            return MagicMock()
-        if "pg_advisory_xact_lock" in sql:
-            self.advisory_lock_calls += 1
-            if not self.supports_advisory_lock:
-                raise RuntimeError("not postgres (sqlite under test)")
-            return MagicMock()
-
-        # Audit-events SELECT for chain head
-        if sql.startswith("select hash from audit_events order by"):
-            if not self.events:
-                return MagicMock(first=MagicMock(return_value=None))
-            latest = sorted(self.events, key=lambda e: (e["ts"], e["id"]), reverse=True)[0]
-            row = _Row(["hash"], [latest["hash"]])
-            return MagicMock(first=MagicMock(return_value=row))
-
-        # Audit-events INSERT
-        if sql.startswith("insert into audit_events"):
-            row = dict(params)
-            self.events.append(row)
-            result = MagicMock()
-            result.rowcount = 1
-            return result
-
-        # Audit-events SELECT for verify_chain
-        if sql.startswith("select id, ts, cluster_id, tenant_id, actor_sub") or sql.startswith("select id, ts, prev_hash"):
-            since = params.get("since")
-            to = params.get("to")
-            rows = sorted(self.events, key=lambda e: (e["ts"], e["id"]))
-            if since is not None:
-                rows = [r for r in rows if r["ts"] >= since]
-            if to is not None:
-                rows = [r for r in rows if r["ts"] <= to]
-            tuples = [
-                (
-                    r["id"], r["ts"],
-                    r.get("cluster_id", "test-cluster"),
-                    r.get("tenant_id"),
-                    r["actor_sub"],
-                    r.get("actor_scope", []),
-                    r["action"],
-                    r["resource_kind"],
-                    r.get("resource_id"),
-                    r.get("before_json"),
-                    r.get("after_json"),
-                    r.get("request_id"),
-                    r.get("source_ip"),
-                    r.get("user_agent"),
-                    r["prev_hash"],
-                    r["hash"],
-                )
-                for r in rows
-            ]
-            mock_result = MagicMock()
-            mock_result.fetchall = MagicMock(return_value=tuples)
-            return mock_result
-
-        # Mirror — fetch_rows_after
-        if "from audit_events" in sql and "order by id asc" in sql:
-            watermark = params.get("watermark")
-            limit = params.get("limit", 1000)
-            rows = sorted(self.events, key=lambda e: e["id"])
-            if watermark is not None:
-                rows = [r for r in rows if r["id"] > watermark]
-            rows = rows[:limit]
-            fields = [
-                "id", "ts", "cluster_id", "tenant_id", "actor_sub", "actor_scope",
-                "action", "resource_kind", "resource_id", "before_json", "after_json",
-                "request_id", "source_ip", "user_agent", "prev_hash", "hash", "signature",
-            ]
-            row_objs = [_Row(fields, [r.get(f) for f in fields]) for r in rows]
-
-            class _Result:
-                def fetchall(self_inner: Any) -> Any:
-                    return row_objs
-            return _Result()
-
-        # Lag gauge — latest ts
-        if sql.startswith("select ts from audit_events order by ts desc limit 1"):
-            if not self.events:
-                return MagicMock(first=MagicMock(return_value=None))
-            latest = max(self.events, key=lambda e: e["ts"])
-            return MagicMock(first=MagicMock(return_value=_Row(["ts"], [latest["ts"]])))
-
-        if sql.startswith("select ts from audit_events where id"):
-            target = params.get("id")
-            for r in self.events:
-                if r["id"] == target:
-                    return MagicMock(first=MagicMock(return_value=_Row(["ts"], [r["ts"]])))
-            return MagicMock(first=MagicMock(return_value=None))
-
-        # Mirror watermark read
-        if sql.startswith("select last_shipped_id"):
-            if not self.mirror_state:
-                # Simulate "table missing" only on first read so subsequent
-                # tests can verify we still update a watermark in-memory.
-                raise RuntimeError("relation audit_events_mirror_state does not exist")
-            row = _Row(
-                ["last_shipped_id"], [self.mirror_state.get("last_shipped_id")]
-            )
-            return MagicMock(first=MagicMock(return_value=row))
-
-        # Mirror watermark UPSERT (postgres)
-        if sql.startswith("insert into audit_events_mirror_state"):
-            self.mirror_state["last_shipped_id"] = params["rid"]
-            self.mirror_state["updated_at"] = params["ts"]
-            return MagicMock()
-
-        if sql.startswith("update audit_events_mirror_state"):
-            self.mirror_state["last_shipped_id"] = params["rid"]
-            self.mirror_state["updated_at"] = params["ts"]
-            return MagicMock()
-
-        raise AssertionError(f"unexpected SQL: {sql}")
 
 
 def _seed_event(
-    db: FakeAuditDB,
+    db: DB,
     *,
     actor_sub: str = "user@x",
     action: str = "node.create",
     resource_kind: str = "node",
     ts: Optional[datetime] = None,
     cluster_id: str = "test-cluster",
-    prev_hash: Optional[bytes] = None,
 ) -> dict[str, Any]:
-    """Insert a syntactically-valid event into the fake DB with correct chain hash."""
+    """Insert a real, correctly-chained ``audit_events`` row at a chosen ``ts``."""
+
+    ts = ts or datetime.now(timezone.utc)
+    prev_rows = _rows(
+        db.executesql("SELECT hash FROM audit_events ORDER BY ts DESC, id DESC LIMIT 1")
+    )
+    prev_hash_raw = prev_rows[0][0] if prev_rows else None
+    prev_hash = (
+        bytes(prev_hash_raw)
+        if isinstance(prev_hash_raw, (bytes, bytearray, memoryview))
+        and len(prev_hash_raw) == 32
+        else ZERO_HASH
+    )
 
     event_id = generate_uuidv7()
-    ts = ts or datetime.now(timezone.utc)
-    if prev_hash is None:
-        if db.events:
-            prev_hash = sorted(db.events, key=lambda e: (e["ts"], e["id"]))[-1]["hash"]
-        else:
-            prev_hash = ZERO_HASH
-
-    fields = {
+    fields: dict[str, Any] = {
         "id": str(event_id),
         "ts": ts.isoformat(),
         "cluster_id": cluster_id,
@@ -228,32 +101,45 @@ def _seed_event(
         "source_ip": None,
         "user_agent": None,
     }
-    chain = compute_chain_hash(prev_hash, fields)
-    row = {
-        "id": event_id,
-        "ts": ts,
-        "cluster_id": cluster_id,
-        "tenant_id": None,
-        "actor_sub": actor_sub,
-        "actor_scope": [],
-        "action": action,
-        "resource_kind": resource_kind,
-        "resource_id": None,
-        "before_json": None,
-        "after_json": None,
-        "request_id": None,
-        "source_ip": None,
-        "user_agent": None,
-        "prev_hash": prev_hash,
-        "hash": chain,
-        "signature": None,
-    }
-    db.events.append(row)
-    return row
+    chain_hash = compute_chain_hash(prev_hash, fields)
+
+    db.executesql(
+        """
+        INSERT INTO audit_events
+        (id, ts, cluster_id, tenant_id, actor_sub, actor_scope, action,
+         resource_kind, resource_id, before_json, after_json, request_id,
+         source_ip, user_agent, prev_hash, hash, signature)
+        VALUES (%(id)s, %(ts)s, %(cluster_id)s, %(tenant_id)s, %(actor_sub)s,
+                %(actor_scope)s, %(action)s, %(resource_kind)s, %(resource_id)s,
+                %(before_json)s, %(after_json)s, %(request_id)s, %(source_ip)s,
+                %(user_agent)s, %(prev_hash)s, %(hash)s, NULL)
+        """,
+        {
+            "id": str(event_id),
+            "ts": ts,
+            "cluster_id": cluster_id,
+            "tenant_id": None,
+            "actor_sub": actor_sub,
+            "actor_scope": json.dumps([]),
+            "action": action,
+            "resource_kind": resource_kind,
+            "resource_id": None,
+            "before_json": None,
+            "after_json": None,
+            "request_id": None,
+            "source_ip": None,
+            "user_agent": None,
+            "prev_hash": prev_hash,
+            "hash": chain_hash,
+        },
+    )
+    return {"id": event_id, "ts": ts, "hash": chain_hash, "prev_hash": prev_hash}
 
 
 # ---------------------------------------------------------------------------
-# Stub leader-lease client — controls leadership outcome per replica.
+# Stub leader-lease client — controls leadership outcome per replica without
+# touching the real leader_leases table (that primitive is covered
+# end-to-end in test_leader_lease.py).
 # ---------------------------------------------------------------------------
 
 
@@ -264,7 +150,9 @@ class StubLeaseClient:
         self.holder: Optional[str] = None
         self.version = 0
 
-    def acquire(self, db_session: Any, lease_name: str, ttl_seconds: int, holder_id: str) -> Any:
+    def acquire(
+        self, db_session: Any, lease_name: str, ttl_seconds: int, holder_id: str
+    ) -> Any:
         if self.holder is None or self.holder == holder_id:
             self.holder = holder_id
             self.version += 1
@@ -289,7 +177,7 @@ class StubLeaseClient:
         return handle
 
     def is_leader(self, db_session: Any, handle: Any) -> bool:
-        return handle.holder_id == self.holder
+        return bool(handle.holder_id == self.holder)
 
 
 # ---------------------------------------------------------------------------
@@ -297,57 +185,270 @@ class StubLeaseClient:
 # ---------------------------------------------------------------------------
 
 
-def test_leader_can_append_non_leader_raises_not_leader() -> None:
-    db_a = FakeAuditDB()
-    db_b = FakeAuditDB()
-    # B writes against the same in-memory DB so we can verify only A's row
-    # ends up in the table.
-    db_b.events = db_a.events
-
+def test_leader_can_append_non_leader_raises_not_leader(pg_db: DB) -> None:
     lease = StubLeaseClient()
-    a = AuditChainWriter(db_a, vault_client=None, leader_lease_client=lease, replica_id="A", cluster_id="c1")
-    b = AuditChainWriter(db_b, vault_client=None, leader_lease_client=lease, replica_id="B", cluster_id="c1")
+    a = AuditChainWriter(
+        pg_db,
+        vault_client=None,
+        leader_lease_client=lease,
+        replica_id="A",
+        cluster_id="c1",
+    )
+    b = AuditChainWriter(
+        pg_db,
+        vault_client=None,
+        leader_lease_client=lease,
+        replica_id="B",
+        cluster_id="c1",
+    )
 
     assert a.try_acquire_leadership() is True
     assert b.try_acquire_leadership() is False
 
-    # A appends — succeeds
     before_append_calls = acw_module.APPEND_COUNTER.inc.call_count
-    event = a.append_event(actor_sub="alice", action="node.create", resource_kind="node")
+    event = a.append_event(
+        actor_sub="alice", action="node.create", resource_kind="node"
+    )
     assert event.actor_sub == "alice"
-    assert len(db_a.events) == 1
     assert acw_module.APPEND_COUNTER.inc.call_count == before_append_calls + 1
 
-    # B tries — refuses
     not_leader_before_calls = acw_module.NOT_LEADER_COUNTER.inc.call_count
     with pytest.raises(NotLeaderError):
         b.append_event(actor_sub="mallory", action="node.delete", resource_kind="node")
     assert acw_module.NOT_LEADER_COUNTER.inc.call_count == not_leader_before_calls + 1
-    # B's append never inserted a row.
-    assert len(db_a.events) == 1
+
+    rows = _rows(pg_db.executesql("SELECT COUNT(*) FROM audit_events"))
+    assert rows[0][0] == 1, "B's rejected append must not have inserted a row"
 
 
-def test_release_leadership_clears_handle() -> None:
-    db = FakeAuditDB()
+def test_release_leadership_clears_handle(pg_db: DB) -> None:
     lease = StubLeaseClient()
-    w = AuditChainWriter(db, vault_client=None, leader_lease_client=lease, replica_id="A")
+    w = AuditChainWriter(
+        pg_db, vault_client=None, leader_lease_client=lease, replica_id="A"
+    )
     assert w.try_acquire_leadership() is True
     assert w.is_leader() is True
     assert w.release_leadership() is True
     assert w.is_leader() is False
-    # Without leadership, append must refuse.
     with pytest.raises(NotLeaderError):
         w.append_event(actor_sub="alice", action="x", resource_kind="y")
 
 
-def test_append_invokes_advisory_lock_and_serializable() -> None:
-    db = FakeAuditDB(supports_advisory_lock=True)
+def test_append_persists_row_via_real_transaction(pg_db: DB) -> None:
     lease = StubLeaseClient()
-    w = AuditChainWriter(db, vault_client=None, leader_lease_client=lease, replica_id="A")
+    w = AuditChainWriter(
+        pg_db, vault_client=None, leader_lease_client=lease, replica_id="A"
+    )
     assert w.try_acquire_leadership() is True
+    event = w.append_event(actor_sub="x", action="y", resource_kind="z")
+
+    rows = _rows(
+        pg_db.executesql(
+            "SELECT actor_sub, prev_hash, hash FROM audit_events WHERE id = %(id)s",
+            {"id": str(event.id)},
+        )
+    )
+    assert len(rows) == 1
+    assert rows[0][0] == "x"
+    assert bytes(rows[0][1]) == ZERO_HASH
+
+
+# ---------------------------------------------------------------------------
+# Advisory-lock + shared-transaction serialization proof.
+# ---------------------------------------------------------------------------
+
+
+def test_concurrent_append_serializes_and_never_forks_chain(pg_db: DB) -> None:
+    """N threads on the SAME leader replica call ``append_event`` concurrently.
+
+    This is the proof that the advisory lock + hash-chain read+insert are
+    genuinely sharing one pinned connection/transaction (per
+    ``append_event``'s docstring) rather than each ``executesql()`` call
+    opening its own autocommitted connection: if the lock were dropped
+    between the chain-head read and the insert (e.g. by reverting to
+    per-call ``db.executesql()``), two threads could read the same
+    chain-head hash concurrently and each insert a row with an identical
+    ``prev_hash`` -- forking the chain (two rows both claiming to follow the
+    same predecessor). With the lock genuinely held for the transaction's
+    duration, Postgres serializes the N transactions and the resulting
+    chain is provably a single, unbroken sequence: sorting the N rows by
+    insertion order (``id`` is a monotonic UUIDv7), every row's
+    ``prev_hash`` must equal its immediate predecessor's ``hash``, and
+    ``ZERO_HASH`` must appear exactly once (the genesis link).
+
+    Each worker retries on ``psycopg2.errors.SerializationFailure`` -- under
+    SERIALIZABLE isolation, a transaction that blocked on the advisory lock
+    can still be aborted by Postgres's SSI conflict detector on commit (its
+    snapshot predates the lock-holder's commit; the docs literally say "the
+    transaction might succeed if retried"). This is expected, correct
+    SERIALIZABLE behavior, not a fork -- and it's a PRE-EXISTING property of
+    ``append_event`` inherited unchanged from the original SQLAlchemy
+    implementation (same SET + advisory lock + read + insert all sharing
+    one ambient, uncommitted-until-caller-commits transaction) that was
+    never actually exercised against real concurrent Postgres before this
+    conversion's test suite. ``append_event`` itself has no retry loop --
+    that gap is flagged in the task report as a pre-existing item for
+    follow-up, not fixed here (out of this task's scope).
+    """
+
+    lease = StubLeaseClient()
+    n = 12
+    barrier = threading.Barrier(n)
+    errors: list[BaseException] = []
+    lock = threading.Lock()
+
+    def make_writer() -> AuditChainWriter:
+        w = AuditChainWriter(
+            pg_db,
+            vault_client=None,
+            leader_lease_client=lease,
+            replica_id="A",
+            cluster_id="c1",
+        )
+        w._lease_handle = ll.LeaderLeaseHandle(
+            lease_name=acw_module.LEASE_NAME,
+            holder_id="A",
+            ttl_seconds=60,
+            acquired_at=datetime.now(timezone.utc),
+            expires_at=datetime.now(timezone.utc) + timedelta(seconds=60),
+            version=1,
+        )
+        return w
+
+    def worker(name: str) -> None:
+        barrier.wait()
+        try:
+            make_writer().append_event(
+                actor_sub=name, action="node.create", resource_kind="node"
+            )
+        except Exception as exc:  # noqa: BLE001
+            with lock:
+                errors.append(exc)
+
+    threads = [threading.Thread(target=worker, args=(f"writer-{i}",)) for i in range(n)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+
+    # Any SerializationFailure aborts get retried here, one at a time
+    # (zero contention, guaranteed to terminate) -- this is what makes the
+    # test deterministic instead of tuning arbitrary retry/backoff counts
+    # against real concurrent timing. Any other exception type fails the
+    # test outright.
+    for exc in errors:
+        assert "SerializationFailure" in repr(
+            exc
+        ), f"non-retriable append_event failure: {exc!r}"
+    for name in [f"writer-retry-{i}" for i in range(len(errors))]:
+        make_writer().append_event(
+            actor_sub=name, action="node.create", resource_kind="node"
+        )
+
+    rows = _rows(
+        pg_db.executesql("SELECT id, prev_hash, hash FROM audit_events ORDER BY id ASC")
+    )
+    assert len(rows) == n
+
+    hashes = [bytes(r[2]) for r in rows]
+    prev_hashes = [bytes(r[1]) for r in rows]
+
+    assert prev_hashes.count(ZERO_HASH) == 1, "exactly one row must chain off genesis"
+    for i in range(1, n):
+        assert prev_hashes[i] == hashes[i - 1], (
+            f"row {i} prev_hash must equal row {i - 1}'s hash -- a fork "
+            "means the advisory lock did not actually serialize concurrent appends"
+        )
+
+
+def test_append_invokes_advisory_lock_and_serializable(pg_db: DB) -> None:
+    lease = StubLeaseClient()
+    w = AuditChainWriter(
+        pg_db, vault_client=None, leader_lease_client=lease, replica_id="A"
+    )
+    assert w.try_acquire_leadership() is True
+    # No exception means both SET TRANSACTION ISOLATION LEVEL SERIALIZABLE and
+    # pg_advisory_xact_lock succeeded against real Postgres inside the shared tx.
     w.append_event(actor_sub="x", action="y", resource_kind="z")
-    assert db.advisory_lock_calls >= 1
-    assert db.serializable_calls >= 1
+
+
+# ---------------------------------------------------------------------------
+# RLS cross-tenant scope — proven against the scoped (non-owner) role.
+# ---------------------------------------------------------------------------
+
+
+def test_append_event_and_verify_require_cross_tenant_scope(pg_db_scoped: DB) -> None:
+    """Negative control: without ``_cross_tenant_scope()``, a scoped-role
+    caller's chain-head read/verify would fail-closed to zero visible rows
+    under RLS (an unset tenant ContextVar), silently returning a wrong
+    ``ZERO_HASH`` prev/forking the chain, or reporting a false "0 rows
+    checked" from ``verify_chain_scheduled``. Proven by calling the
+    lower-level pieces directly under each scope.
+    """
+    install_rls_events(pg_db_scoped.engine)
+    lease = StubLeaseClient()
+    w = AuditChainWriter(
+        pg_db_scoped,
+        vault_client=None,
+        leader_lease_client=lease,
+        replica_id="A",
+        cluster_id="c1",
+    )
+    assert w.try_acquire_leadership() is True
+
+    # append_event applies the sentinel itself -- this must succeed and see
+    # a genuine chain (not silently treat every append as "first event").
+    first = w.append_event(actor_sub="a", action="create", resource_kind="node")
+    assert first.prev_hash == ZERO_HASH
+    second = w.append_event(actor_sub="a", action="update", resource_kind="node")
+    assert second.prev_hash == first.hash, (
+        "append_event must see the real chain head under the cross-tenant "
+        "sentinel, not fail-closed to an empty view and re-use ZERO_HASH"
+    )
+
+    # Negative control: reading audit_events under an ordinary per-tenant GUC
+    # (not the sentinel append_event applies internally) sees nothing, since
+    # these rows carry tenant_id=NULL.
+    set_current_tenant("some-ordinary-tenant")
+    try:
+        rows = _rows(pg_db_scoped.executesql("SELECT COUNT(*) FROM audit_events"))
+    finally:
+        set_current_tenant(None)
+    assert rows[0][0] == 0, "a plain per-tenant GUC must not see these NULL-tenant rows"
+
+    # verify_chain_scheduled applies the sentinel itself too.
+    summary = w.verify_chain_scheduled(since=timedelta(hours=24))
+    assert summary["rows_checked"] == 2
+    assert summary["breaks"] == 0
+
+
+def test_verify_chain_scheduled_fails_closed_without_sentinel_would_lie(
+    pg_db_scoped: DB,
+) -> None:
+    """Same proof from the other direction: manually reading audit_events
+    with the ContextVar unset (simulating what ``verify_chain_scheduled``
+    would see if its ``_cross_tenant_scope()`` wrapper were removed) returns
+    zero rows even though real rows exist -- the exact "false 0 breaks"
+    failure mode ``_cross_tenant_scope()`` exists to prevent.
+    """
+    install_rls_events(pg_db_scoped.engine)
+    lease = StubLeaseClient()
+    w = AuditChainWriter(
+        pg_db_scoped,
+        vault_client=None,
+        leader_lease_client=lease,
+        replica_id="A",
+        cluster_id="c1",
+    )
+    assert w.try_acquire_leadership() is True
+    w.append_event(actor_sub="a", action="create", resource_kind="node")
+
+    set_current_tenant(None)
+    rows = _rows(pg_db_scoped.executesql("SELECT COUNT(*) FROM audit_events"))
+    assert rows[0][0] == 0, (
+        "unset tenant context must fail closed to zero rows -- this is exactly "
+        "why verify_chain_scheduled applies the cross-tenant sentinel itself"
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -355,14 +456,15 @@ def test_append_invokes_advisory_lock_and_serializable() -> None:
 # ---------------------------------------------------------------------------
 
 
-def test_tampering_detected_metric_increments_and_nats_emitted() -> None:
-    db = FakeAuditDB()
+def test_tampering_detected_metric_increments_and_nats_emitted(pg_db: DB) -> None:
     now = datetime.now(timezone.utc)
-    _seed_event(db, ts=now - timedelta(minutes=10))
-    bad = _seed_event(db, ts=now - timedelta(minutes=5))
-    # Mutate the second row's stored hash so verify_chain detects a break.
-    bad["hash"] = b"\xde" * 32
-    _seed_event(db, ts=now - timedelta(minutes=1))
+    _seed_event(pg_db, ts=now - timedelta(minutes=10))
+    bad = _seed_event(pg_db, ts=now - timedelta(minutes=5))
+    pg_db.executesql(
+        "UPDATE audit_events SET hash = %(hash)s WHERE id = %(id)s",
+        {"hash": b"\xde" * 32, "id": str(bad["id"])},
+    )
+    _seed_event(pg_db, ts=now - timedelta(minutes=1))
 
     captured: list[tuple[str, dict[str, Any]]] = []
 
@@ -371,7 +473,7 @@ def test_tampering_detected_metric_increments_and_nats_emitted() -> None:
 
     lease = StubLeaseClient()
     w = AuditChainWriter(
-        db,
+        pg_db,
         vault_client=None,
         leader_lease_client=lease,
         replica_id="A",
@@ -381,8 +483,6 @@ def test_tampering_detected_metric_increments_and_nats_emitted() -> None:
 
     before = acw_module.CHAIN_BREAK_COUNTER.inc.call_count
 
-    # Re-run the entire scheduled call inside a fresh event loop to ensure
-    # the publisher coroutine fully completes and is captured.
     captured.clear()
     asyncio.run(_run_verify_in_loop(w, timedelta(hours=24), captured))
 
@@ -406,16 +506,14 @@ async def _run_verify_in_loop(
 
     w.nats_publisher = cap
     w.verify_chain_scheduled(since=since)
-    # Allow any scheduled futures to run.
     await asyncio.sleep(0)
 
 
-def test_verify_clean_chain_emits_no_event() -> None:
-    db = FakeAuditDB()
+def test_verify_clean_chain_emits_no_event(pg_db: DB) -> None:
     now = datetime.now(timezone.utc)
-    _seed_event(db, ts=now - timedelta(minutes=10))
-    _seed_event(db, ts=now - timedelta(minutes=5))
-    _seed_event(db, ts=now - timedelta(minutes=1))
+    _seed_event(pg_db, ts=now - timedelta(minutes=10))
+    _seed_event(pg_db, ts=now - timedelta(minutes=5))
+    _seed_event(pg_db, ts=now - timedelta(minutes=1))
 
     captured: list[tuple[str, dict[str, Any]]] = []
 
@@ -423,8 +521,11 @@ def test_verify_clean_chain_emits_no_event() -> None:
         captured.append((subject, payload))
 
     w = AuditChainWriter(
-        db, vault_client=None, leader_lease_client=StubLeaseClient(),
-        replica_id="A", nats_publisher=capture,
+        pg_db,
+        vault_client=None,
+        leader_lease_client=StubLeaseClient(),
+        replica_id="A",
+        nats_publisher=capture,
     )
 
     summary = w.verify_chain_scheduled(since=timedelta(hours=24))
@@ -433,42 +534,48 @@ def test_verify_clean_chain_emits_no_event() -> None:
     assert captured == []
 
 
-def test_verify_window_respected() -> None:
+def test_verify_window_respected(pg_db: DB) -> None:
     """Rows older than 24 h are ignored even if tampered."""
 
-    db = FakeAuditDB()
     now = datetime.now(timezone.utc)
-    old = _seed_event(db, ts=now - timedelta(hours=48))
-    old["hash"] = b"\xff" * 32  # tamper an out-of-window row
-    _seed_event(db, ts=now - timedelta(minutes=1))
+    old = _seed_event(pg_db, ts=now - timedelta(hours=48))
+    pg_db.executesql(
+        "UPDATE audit_events SET hash = %(hash)s WHERE id = %(id)s",
+        {"hash": b"\xff" * 32, "id": str(old["id"])},
+    )
+    _seed_event(pg_db, ts=now - timedelta(minutes=1))
 
     w = AuditChainWriter(
-        db, vault_client=None, leader_lease_client=StubLeaseClient(), replica_id="A",
+        pg_db,
+        vault_client=None,
+        leader_lease_client=StubLeaseClient(),
+        replica_id="A",
     )
     summary = w.verify_chain_scheduled(since=timedelta(hours=24))
     assert summary["breaks"] == 0
 
 
-def test_publish_nats_break_returns_false_without_publisher(caplog: Any) -> None:
-    db = FakeAuditDB()
+def test_publish_nats_break_returns_false_without_publisher(pg_db: DB) -> None:
     w = AuditChainWriter(
-        db, vault_client=None, leader_lease_client=StubLeaseClient(), replica_id="A",
+        pg_db,
+        vault_client=None,
+        leader_lease_client=StubLeaseClient(),
+        replica_id="A",
     )
     assert w._publish_nats_break({"first_break_id": "x"}) is False
 
 
-def test_publish_nats_break_handles_publisher_exception() -> None:
-    db = FakeAuditDB()
-
+def test_publish_nats_break_handles_publisher_exception(pg_db: DB) -> None:
     async def boom(subject: str, payload: dict[str, Any]) -> None:
         raise RuntimeError("nats unreachable")
 
     w = AuditChainWriter(
-        db, vault_client=None, leader_lease_client=StubLeaseClient(),
-        replica_id="A", nats_publisher=boom,
+        pg_db,
+        vault_client=None,
+        leader_lease_client=StubLeaseClient(),
+        replica_id="A",
+        nats_publisher=boom,
     )
-    # The publisher itself doesn't run synchronously — but if no loop exists,
-    # asyncio.run is invoked which surfaces the exception, which we swallow.
     assert w._publish_nats_break({"first_break_id": "x"}) in (True, False)
 
 
@@ -481,10 +588,6 @@ def test_publish_nats_break_handles_publisher_exception() -> None:
 def fake_s3_session() -> Any:
     """An in-process S3 stand-in (no moto required) — supports the subset of
     operations the shipper exercises (``put_object``).
-
-    Using a hand-rolled fake keeps the test suite hermetic; if moto is
-    available we still verify behaviour against it via the dedicated
-    ``test_offsite_mirror_with_moto`` test below.
     """
 
     class FakeS3Client:
@@ -494,7 +597,6 @@ def fake_s3_session() -> Any:
         async def put_object(self, **kwargs: Any) -> dict[str, Any]:
             key = kwargs["Key"]
             if key in self.objects:
-                # Object Lock compliance — never overwrite.
                 raise RuntimeError(f"Object Lock prevents overwrite of {key!r}")
             self.objects[key] = {
                 "Body": kwargs["Body"],
@@ -516,18 +618,19 @@ def fake_s3_session() -> Any:
     return FakeS3Client()
 
 
-@pytest.mark.skip(reason="asyncio.to_thread + prometheus_client autouse fixtures hang indefinitely in Python 3.14 test environment")
+@pytest.mark.skip(reason=_OFFSITE_MIRROR_SKIP_REASON)
 @pytest.mark.asyncio
-async def test_offsite_mirror_ships_every_committed_row(fake_s3_session: Any) -> None:
-    db = FakeAuditDB()
+async def test_offsite_mirror_ships_every_committed_row(
+    pg_db: DB, fake_s3_session: Any
+) -> None:
     now = datetime.now(timezone.utc)
-    rows = [_seed_event(db, ts=now - timedelta(minutes=10 - i)) for i in range(5)]
+    rows = [_seed_event(pg_db, ts=now - timedelta(minutes=10 - i)) for i in range(5)]
 
     def factory(cfg: OffsiteMirrorConfig) -> Any:
         return fake_s3_session
 
     w = AuditChainWriter(
-        db,
+        pg_db,
         vault_client=None,
         leader_lease_client=StubLeaseClient(),
         replica_id="A",
@@ -547,7 +650,6 @@ async def test_offsite_mirror_ships_every_committed_row(fake_s3_session: Any) ->
     expected_keys = {f"audit-events/{r['id']}.json" for r in rows}
     assert keys == expected_keys
 
-    # Validate one object's content, retention, and SSE
     sample = fake_s3_session.objects[next(iter(expected_keys))]
     assert sample["ObjectLockMode"] == "COMPLIANCE"
     assert sample["ServerSideEncryption"] == "AES256"
@@ -557,15 +659,13 @@ async def test_offsite_mirror_ships_every_committed_row(fake_s3_session: Any) ->
     payload = json.loads(sample["Body"].decode("utf-8"))
     assert "id" in payload and "hash" in payload
 
-    # Lag gauge should have been set (verify_mirror_lag was called).
-    assert acw_module.MIRROR_LAG_GAUGE.set.called or acw_module.MIRROR_LAG_GAUGE.call_count >= 0
 
-
-@pytest.mark.skip(reason="asyncio.to_thread + prometheus_client autouse fixtures hang indefinitely in Python 3.14 test environment")
+@pytest.mark.skip(reason=_OFFSITE_MIRROR_SKIP_REASON)
 @pytest.mark.asyncio
-async def test_offsite_mirror_uses_kms_when_configured(fake_s3_session: Any) -> None:
-    db = FakeAuditDB()
-    _seed_event(db)
+async def test_offsite_mirror_uses_kms_when_configured(
+    pg_db: DB, fake_s3_session: Any
+) -> None:
+    _seed_event(pg_db)
 
     class _Vault:
         def get_kms_key_id(self) -> str:
@@ -576,7 +676,7 @@ async def test_offsite_mirror_uses_kms_when_configured(fake_s3_session: Any) -> 
         return fake_s3_session
 
     w = AuditChainWriter(
-        db,
+        pg_db,
         vault_client=_Vault(),
         leader_lease_client=StubLeaseClient(),
         replica_id="A",
@@ -596,11 +696,10 @@ async def test_offsite_mirror_uses_kms_when_configured(fake_s3_session: Any) -> 
     assert obj["SSEKMSKeyId"] == "alias/gough-audit"
 
 
-@pytest.mark.skip(reason="asyncio.to_thread + prometheus_client autouse fixtures hang indefinitely in Python 3.14 test environment")
+@pytest.mark.skip(reason=_OFFSITE_MIRROR_SKIP_REASON)
 @pytest.mark.asyncio
-async def test_offsite_mirror_recovers_from_transient_error() -> None:
-    db = FakeAuditDB()
-    _seed_event(db)
+async def test_offsite_mirror_recovers_from_transient_error(pg_db: DB) -> None:
+    _seed_event(pg_db)
 
     class FlakyS3:
         def __init__(self) -> None:
@@ -626,7 +725,7 @@ async def test_offsite_mirror_recovers_from_transient_error() -> None:
         return flaky
 
     w = AuditChainWriter(
-        db,
+        pg_db,
         vault_client=None,
         leader_lease_client=StubLeaseClient(),
         replica_id="A",
@@ -646,33 +745,30 @@ async def test_offsite_mirror_recovers_from_transient_error() -> None:
         },
     )
 
-    # The shipper should have retried after the transient failure.
     assert flaky.calls >= 2
     assert acw_module.MIRROR_FAILURE_COUNTER.inc.call_count > failures_before
     assert len(flaky.objects) == 1
 
 
-@pytest.mark.skip(reason="asyncio.to_thread + prometheus_client autouse fixtures hang indefinitely in Python 3.14 test environment")
+@pytest.mark.skip(reason=_OFFSITE_MIRROR_SKIP_REASON)
 @pytest.mark.asyncio
-async def test_offsite_mirror_with_moto() -> None:
+async def test_offsite_mirror_with_moto(pg_db: DB) -> None:
     """End-to-end test with the real ``moto`` mock S3 service if available."""
 
     try:
-        import aioboto3  # noqa: F401
+        import aioboto3  # type: ignore[import-not-found]  # noqa: F401
         from moto import mock_aws  # type: ignore[import-not-found]
     except ImportError:
         pytest.skip("aioboto3/moto not installed")
 
-    db = FakeAuditDB()
-    rows = [_seed_event(db) for _ in range(3)]
+    rows = [_seed_event(pg_db) for _ in range(3)]
 
     with mock_aws():
-        # Configure the real boto3 to talk to moto's mocked S3.
         os.environ.setdefault("AWS_ACCESS_KEY_ID", "test")
         os.environ.setdefault("AWS_SECRET_ACCESS_KEY", "test")
         os.environ.setdefault("AWS_DEFAULT_REGION", "us-east-1")
 
-        import boto3
+        import boto3  # type: ignore[import-untyped]
 
         s3 = boto3.client("s3", region_name="us-east-1")
         s3.create_bucket(
@@ -681,13 +777,13 @@ async def test_offsite_mirror_with_moto() -> None:
         )
 
         w = AuditChainWriter(
-            db,
+            pg_db,
             vault_client=None,
             leader_lease_client=StubLeaseClient(),
             replica_id="A",
         )
         await w.start_offsite_mirror(
-            s3_endpoint=None,  # default endpoint
+            s3_endpoint=None,  # type: ignore[arg-type]  # pre-existing: real default endpoint
             bucket="audit-mirror",
             retention_days=30,
             max_iterations=1,
@@ -699,16 +795,65 @@ async def test_offsite_mirror_with_moto() -> None:
         assert listed_keys == {f"audit-events/{r['id']}.json" for r in rows}
 
 
+@pytest.mark.asyncio
+async def test_start_offsite_mirror_max_iterations() -> None:
+    """start_offsite_mirror stops after max_iterations.
 
+    Bare ``MagicMock`` db (not ``pg_db``) -- ``_read_watermark()``'s broad
+    except swallows whatever a bare MagicMock's ``.executesql(...)`` return
+    produces (it can't parse as a UUID), so this exercises the "no
+    watermark, start from genesis" path without needing real Postgres; the
+    genuinely-real-DB offsite mirror path is covered (skipped, see
+    ``_OFFSITE_MIRROR_SKIP_REASON``) by the other ``test_offsite_mirror_*``
+    tests above.
+    """
+    mock_s3_client = MagicMock()
+    mock_s3_client.__aenter__.return_value = mock_s3_client
+    mock_s3_client.__aexit__.return_value = None
+    mock_s3_client.put_object = AsyncMock()
 
-def test_verify_chain_empty_database() -> None:
-    """Test verify_chain on empty audit_events table."""
-    db = FakeAuditDB()
-    w = AuditChainWriter(
-        db,
+    writer = AuditChainWriter(
+        db_session=MagicMock(),
         vault_client=None,
-        leader_lease_client=StubLeaseClient(),
-        replica_id="A",
+        s3_session_factory=lambda cfg: mock_s3_client,
+    )
+
+    result = await writer.start_offsite_mirror(
+        s3_endpoint="http://localhost:9000",
+        bucket="audit-bucket",
+        retention_days=90,
+        max_iterations=2,
+    )
+
+    assert result["iterations"] == 2
+
+
+@pytest.mark.asyncio
+async def test_start_offsite_mirror_aioboto3_import_error() -> None:
+    """start_offsite_mirror raises OffsiteMirrorError when aioboto3 missing."""
+    from app.workers.audit_chain_writer import OffsiteMirrorError
+
+    writer = AuditChainWriter(
+        db_session=MagicMock(), vault_client=None, s3_session_factory=None
+    )
+
+    with patch("builtins.__import__", side_effect=ImportError("aioboto3 not found")):
+        with pytest.raises(OffsiteMirrorError, match="aioboto3 is required"):
+            await writer.start_offsite_mirror(
+                s3_endpoint="http://localhost:9000",
+                bucket="audit-bucket",
+                retention_days=90,
+            )
+
+
+# ---------------------------------------------------------------------------
+# Misc coverage
+# ---------------------------------------------------------------------------
+
+
+def test_verify_chain_empty_database(pg_db: DB) -> None:
+    w = AuditChainWriter(
+        pg_db, vault_client=None, leader_lease_client=StubLeaseClient(), replica_id="A"
     )
 
     summary = w.verify_chain_scheduled(since=timedelta(hours=24))
@@ -718,16 +863,11 @@ def test_verify_chain_empty_database() -> None:
     assert summary["window_to"] is not None
 
 
-def test_verify_chain_single_event() -> None:
-    """Test verify_chain with a single event (always valid chain)."""
-    db = FakeAuditDB()
-    _seed_event(db)
+def test_verify_chain_single_event(pg_db: DB) -> None:
+    _seed_event(pg_db)
 
     w = AuditChainWriter(
-        db,
-        vault_client=None,
-        leader_lease_client=StubLeaseClient(),
-        replica_id="A",
+        pg_db, vault_client=None, leader_lease_client=StubLeaseClient(), replica_id="A"
     )
 
     summary = w.verify_chain_scheduled(since=timedelta(hours=24))
@@ -735,18 +875,13 @@ def test_verify_chain_single_event() -> None:
     assert summary["rows_checked"] >= 1
 
 
-def test_verify_chain_multiple_valid_events() -> None:
-    """Test verify_chain with multiple correctly-chained events."""
-    db = FakeAuditDB()
+def test_verify_chain_multiple_valid_events(pg_db: DB) -> None:
     now = datetime.now(timezone.utc)
     for i in range(5):
-        _seed_event(db, ts=now - timedelta(minutes=5 - i))
+        _seed_event(pg_db, ts=now - timedelta(minutes=5 - i))
 
     w = AuditChainWriter(
-        db,
-        vault_client=None,
-        leader_lease_client=StubLeaseClient(),
-        replica_id="A",
+        pg_db, vault_client=None, leader_lease_client=StubLeaseClient(), replica_id="A"
     )
 
     summary = w.verify_chain_scheduled(since=timedelta(hours=24))
@@ -754,16 +889,16 @@ def test_verify_chain_multiple_valid_events() -> None:
     assert summary["rows_checked"] == 5
 
 
-def test_verify_chain_multiple_breaks() -> None:
-    """Test verify_chain detects multiple breaks in the chain."""
-    db = FakeAuditDB()
+def test_verify_chain_multiple_breaks(pg_db: DB) -> None:
     now = datetime.now(timezone.utc)
-    event1 = _seed_event(db, ts=now - timedelta(minutes=10))
-    event2 = _seed_event(db, ts=now - timedelta(minutes=5))
-    event3 = _seed_event(db, ts=now - timedelta(minutes=1))
+    _seed_event(pg_db, ts=now - timedelta(minutes=10))
+    event2 = _seed_event(pg_db, ts=now - timedelta(minutes=5))
+    _seed_event(pg_db, ts=now - timedelta(minutes=1))
 
-    # Tamper with event2
-    event2["hash"] = b"\xaa" * 32
+    pg_db.executesql(
+        "UPDATE audit_events SET hash = %(hash)s WHERE id = %(id)s",
+        {"hash": b"\xaa" * 32, "id": str(event2["id"])},
+    )
 
     captured: list[tuple[str, dict[str, Any]]] = []
 
@@ -771,7 +906,7 @@ def test_verify_chain_multiple_breaks() -> None:
         captured.append((subject, payload))
 
     w = AuditChainWriter(
-        db,
+        pg_db,
         vault_client=None,
         leader_lease_client=StubLeaseClient(),
         replica_id="A",
@@ -779,59 +914,41 @@ def test_verify_chain_multiple_breaks() -> None:
     )
 
     asyncio.run(_run_verify_in_loop(w, timedelta(hours=24), captured))
-    assert captured  # At least one NATS event emitted
+    assert captured
 
 
-def test_is_leader_without_handle() -> None:
-    """Test is_leader returns False when no handle."""
-    db = FakeAuditDB()
+def test_is_leader_without_handle(pg_db: DB) -> None:
     lease = StubLeaseClient()
     w = AuditChainWriter(
-        db,
-        vault_client=None,
-        leader_lease_client=lease,
-        replica_id="A",
+        pg_db, vault_client=None, leader_lease_client=lease, replica_id="A"
     )
 
     assert w.is_leader() is False
 
 
-def test_release_leadership_without_handle() -> None:
-    """Test release_leadership returns False when no handle."""
-    db = FakeAuditDB()
+def test_release_leadership_without_handle(pg_db: DB) -> None:
     lease = StubLeaseClient()
     w = AuditChainWriter(
-        db,
-        vault_client=None,
-        leader_lease_client=lease,
-        replica_id="A",
+        pg_db, vault_client=None, leader_lease_client=lease, replica_id="A"
     )
 
     assert w.release_leadership() is False
 
 
-def test_try_acquire_leadership_twice() -> None:
-    """Test acquiring leadership when already held."""
-    db = FakeAuditDB()
+def test_try_acquire_leadership_twice(pg_db: DB) -> None:
     lease = StubLeaseClient()
     w = AuditChainWriter(
-        db,
-        vault_client=None,
-        leader_lease_client=lease,
-        replica_id="A",
+        pg_db, vault_client=None, leader_lease_client=lease, replica_id="A"
     )
 
     assert w.try_acquire_leadership() is True
-    # Acquiring again should still return True (already held)
     assert w.try_acquire_leadership() is True
 
 
-def test_append_event_with_custom_cluster_id() -> None:
-    """Test append_event respects custom cluster_id."""
-    db = FakeAuditDB(supports_advisory_lock=True)
+def test_append_event_with_custom_cluster_id(pg_db: DB) -> None:
     lease = StubLeaseClient()
     w = AuditChainWriter(
-        db,
+        pg_db,
         vault_client=None,
         leader_lease_client=lease,
         replica_id="A",
@@ -848,25 +965,20 @@ def test_append_event_with_custom_cluster_id() -> None:
     assert event.cluster_id == "prod-cluster-1"
 
 
-def test_verify_chain_window_boundary() -> None:
-    """Test verify_chain respects window boundaries precisely."""
-    db = FakeAuditDB()
+def test_verify_chain_window_boundary(pg_db: DB) -> None:
     now = datetime.now(timezone.utc)
     window_hours = 24
 
-    # Event just inside window
-    _seed_event(db, ts=now - timedelta(hours=23, minutes=59))
-    # Event just outside window
-    old_event = _seed_event(db, ts=now - timedelta(hours=24, minutes=1))
-    old_event["hash"] = b"\xff" * 32  # Tamper it
+    _seed_event(pg_db, ts=now - timedelta(hours=23, minutes=59))
+    old_event = _seed_event(pg_db, ts=now - timedelta(hours=24, minutes=1))
+    pg_db.executesql(
+        "UPDATE audit_events SET hash = %(hash)s WHERE id = %(id)s",
+        {"hash": b"\xff" * 32, "id": str(old_event["id"])},
+    )
 
     w = AuditChainWriter(
-        db,
-        vault_client=None,
-        leader_lease_client=StubLeaseClient(),
-        replica_id="A",
+        pg_db, vault_client=None, leader_lease_client=StubLeaseClient(), replica_id="A"
     )
 
     summary = w.verify_chain_scheduled(since=timedelta(hours=window_hours))
-    # Old event should be ignored (outside window)
     assert summary["breaks"] == 0

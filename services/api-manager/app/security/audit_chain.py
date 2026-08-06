@@ -5,7 +5,41 @@ RFC 8785 JCS canonicalization; SHA-256 chain hash; optional Vault-transit
 signature (Ed25519 enterprise / ECDSA P-256 fedramp lane).
 
 Genesis row insertion is handled by `gough init` at cluster bootstrap.
+
+penguin-dal conversion notes (Task 8a):
+
+* ``AuditEventWriter.append()`` takes an optional ``tx`` (a penguin-dal
+  ``Tx`` from ``DB.transaction()``). Callers that need the advisory-lock +
+  hash-read + insert to share one pinned connection (``AuditChainWriter
+  .append_event()`` in ``app.workers.audit_chain_writer``) pass their own
+  ``tx``; callers that just want a single self-contained append (none exist
+  live today -- see below) can omit it and a private transaction is opened.
+* The chain-head lookup (``SELECT hash FROM audit_events ORDER BY ts DESC,
+  id DESC LIMIT 1``) is intentionally NOT tenant-filtered -- the hash chain
+  is one global, cluster-wide sequence spanning every tenant's events, not
+  one chain per tenant. Callers MUST ensure RLS visibility spans every
+  tenant for this call (e.g. via ``app.db.rls.CROSS_TENANT_SENTINEL``) --
+  running it under a single-tenant GUC scope would silently return a
+  prev_hash that skips every other tenant's more-recent rows and fork the
+  chain. This module deliberately does not bake that scope in itself (it's
+  a generic writer/verifier, and scope selection is the caller's call to
+  make, matching the ``persist_extracted_material``/``_cross_tenant_scope()``
+  precedent in ``app.workers.joiner_secret_emitter`` /
+  ``app.grpc_server``) -- ``AuditChainWriter`` (the only in-scope live
+  caller) applies it.
+* Constructor keyword is still named ``db_session`` for source
+  compatibility with the three still-dead external call sites
+  (``app.api.audit._build_audit_writer``, ``app.api.joiner_secrets
+  ._build_audit_writer``, ``app.grpc_server.AuditServicer.AppendEvent``) --
+  all three always raise ``RuntimeError`` from their own ``_get_db_session()``
+  (``DB_SESSION_FACTORY`` is never wired into the app factory) before ever
+  reaching this constructor, so they remain equally dead either way; keeping
+  the keyword name avoids forcing an unrelated edit onto those three
+  out-of-scope files. Despite the name, the value must now be a penguin-dal
+  ``DB`` instance (e.g. ``app.models.get_db()``), not a SQLAlchemy Session.
 """
+
+from __future__ import annotations
 
 import hashlib
 import json
@@ -13,17 +47,20 @@ import secrets
 import threading as _threading
 import time
 import uuid
+from contextlib import contextmanager
+from collections.abc import Iterator
 from datetime import datetime, timezone
-from typing import Any, Callable, Optional
+from typing import Any, Callable, Optional, cast
 
 from pydantic import BaseModel
 
+from app.db.rls import CROSS_TENANT_SENTINEL, get_current_tenant, set_current_tenant
 
-GENESIS_ID = uuid.UUID('00000000-0000-7000-8000-000000000000')
-ZERO_HASH = b'\x00' * 32
+GENESIS_ID = uuid.UUID("00000000-0000-7000-8000-000000000000")
+ZERO_HASH = b"\x00" * 32
 
 _uuidv7_lock = _threading.Lock()
-_uuidv7_state: dict = {"last_ms": 0, "seq": 0}
+_uuidv7_state: dict[str, int] = {"last_ms": 0, "seq": 0}
 
 
 def generate_uuidv7() -> uuid.UUID:
@@ -53,9 +90,10 @@ def generate_uuidv7() -> uuid.UUID:
 
 def canonicalize_record(fields: dict[str, Any]) -> bytes:
     """RFC 8785 JCS: sorted keys, compact JSON, reject NaN/Inf."""
+
     def check_valid(obj: Any) -> Any:
         if isinstance(obj, float):
-            if obj != obj or obj == float('inf') or obj == float('-inf'):
+            if obj != obj or obj == float("inf") or obj == float("-inf"):
                 raise ValueError(f"NaN/Inf not allowed in JCS: {obj}")
         elif isinstance(obj, dict):
             return {k: check_valid(v) for k, v in obj.items()}
@@ -65,9 +103,8 @@ def canonicalize_record(fields: dict[str, Any]) -> bytes:
 
     check_valid(fields)
     return json.dumps(
-        fields, sort_keys=True, separators=(',', ':'),
-        ensure_ascii=False, default=str
-    ).encode('utf-8')
+        fields, sort_keys=True, separators=(",", ":"), ensure_ascii=False, default=str
+    ).encode("utf-8")
 
 
 def compute_chain_hash(prev_hash: bytes, record_fields: dict[str, Any]) -> bytes:
@@ -80,6 +117,7 @@ def compute_chain_hash(prev_hash: bytes, record_fields: dict[str, Any]) -> bytes
 
 class AuditEvent(BaseModel):
     """Audit event record."""
+
     id: uuid.UUID
     ts: datetime
     cluster_id: str
@@ -99,6 +137,42 @@ class AuditEvent(BaseModel):
     signature: Optional[bytes] = None
 
 
+@contextmanager
+def _cross_tenant_scope() -> Iterator[None]:
+    """Push the RLS cross-tenant sentinel for one cluster-global DB unit.
+
+    Used only by :func:`insert_genesis_row` -- a one-time, cluster-bootstrap
+    operation with no tenant of its own (its INSERT carries no ``tenant_id``
+    column at all, so the row's ``tenant_id`` is NULL; the baseline
+    ``tenant_isolation`` policy's ``USING (current_setting(...) IN
+    (tenant_id, '__default__', '__all__'))`` never matches a NULL
+    ``tenant_id`` against an ordinary per-tenant setting, only against the
+    literal ``'__default__'``/``'__all__'`` sentinels -- so both the
+    idempotency SELECT and the INSERT itself need this scope to work at
+    all, let alone correctly). See module docstring for why
+    ``AuditEventWriter``/``verify_chain`` leave this to their callers
+    instead of self-applying it.
+    """
+    previous = get_current_tenant()
+    set_current_tenant(CROSS_TENANT_SENTINEL)
+    try:
+        yield
+    finally:
+        set_current_tenant(previous)
+
+
+def _as_bytes32(value: Any, fallback: bytes) -> bytes:
+    """Normalise a driver-returned hash column to ``bytes``, or ``fallback``.
+
+    psycopg2 can hand back ``bytea`` columns as ``bytes`` or ``memoryview``
+    depending on driver configuration; ``compute_chain_hash``/Pydantic's
+    ``bytes`` field both need a real ``bytes`` object.
+    """
+    if isinstance(value, (bytes, bytearray, memoryview)) and len(value) == 32:
+        return bytes(value)
+    return fallback
+
+
 class AuditEventWriter:
     """Single-writer leader: appends audit events with chain hash."""
 
@@ -108,14 +182,19 @@ class AuditEventWriter:
         cluster_id: str,
         signer: Optional[Callable[[bytes], bytes]] = None,
     ) -> None:
-        """Initialize writer. signer: optional Vault-transit Ed25519 signer."""
-        self.db_session = db_session
+        """Initialize writer. signer: optional Vault-transit Ed25519 signer.
+
+        ``db_session``: a penguin-dal ``DB`` instance (see module docstring
+        for why the parameter keeps this legacy name).
+        """
+        self.db = db_session
         self.cluster_id = cluster_id
         self.signer = signer
 
     def append(
         self,
         *,
+        tx: Optional[Any] = None,
         actor_sub: str,
         action: str,
         resource_kind: str,
@@ -128,75 +207,126 @@ class AuditEventWriter:
         source_ip: Optional[str] = None,
         user_agent: Optional[str] = None,
     ) -> AuditEvent:
-        """Append audit event; fetch latest hash; compute chain hash; optionally sign."""
-        from sqlalchemy import text
+        """Append audit event; fetch latest hash; compute chain hash; optionally sign.
 
+        ``tx``: an already-open penguin-dal ``Tx`` (``DB.transaction()``) to
+        run the read+insert on -- pass this when the caller also needs to
+        hold a Postgres advisory lock (or any other statement) on the same
+        pinned connection for the duration (see ``AuditChainWriter
+        .append_event()``). If omitted, a private transaction is opened here
+        so the read+insert still commit/rollback together as one unit.
+        """
+        if tx is not None:
+            return self._append_on_tx(
+                tx,
+                actor_sub=actor_sub,
+                action=action,
+                resource_kind=resource_kind,
+                resource_id=resource_id,
+                tenant_id=tenant_id,
+                actor_scope=actor_scope,
+                before=before,
+                after=after,
+                request_id=request_id,
+                source_ip=source_ip,
+                user_agent=user_agent,
+            )
+        with self.db.transaction() as opened_tx:
+            return self._append_on_tx(
+                opened_tx,
+                actor_sub=actor_sub,
+                action=action,
+                resource_kind=resource_kind,
+                resource_id=resource_id,
+                tenant_id=tenant_id,
+                actor_scope=actor_scope,
+                before=before,
+                after=after,
+                request_id=request_id,
+                source_ip=source_ip,
+                user_agent=user_agent,
+            )
+
+    def _append_on_tx(
+        self,
+        tx: Any,
+        *,
+        actor_sub: str,
+        action: str,
+        resource_kind: str,
+        resource_id: Optional[str],
+        tenant_id: Optional[str],
+        actor_scope: Optional[list[str]],
+        before: Optional[dict[str, Any]],
+        after: Optional[dict[str, Any]],
+        request_id: Optional[str],
+        source_ip: Optional[str],
+        user_agent: Optional[str],
+    ) -> AuditEvent:
         actor_scope = actor_scope or []
 
-        row = self.db_session.execute(
-            text('SELECT hash FROM audit_events ORDER BY ts DESC, id DESC LIMIT 1')
-        ).first()
-        prev_hash_raw = row[0] if row else None
-        prev_hash = (
-            prev_hash_raw
-            if isinstance(prev_hash_raw, (bytes, bytearray)) and len(prev_hash_raw) == 32
-            else ZERO_HASH
+        prev_rows = cast(
+            "list[tuple[Any, ...]]",
+            tx.executesql(
+                "SELECT hash FROM audit_events ORDER BY ts DESC, id DESC LIMIT 1"
+            ),
         )
+        prev_hash_raw = prev_rows[0][0] if prev_rows else None
+        prev_hash = _as_bytes32(prev_hash_raw, ZERO_HASH)
 
         event_id = generate_uuidv7()
         ts_utc = datetime.now(timezone.utc)
 
         record_fields = {
-            'id': str(event_id),
-            'ts': ts_utc.isoformat(),
-            'cluster_id': self.cluster_id,
-            'tenant_id': tenant_id,
-            'actor_sub': actor_sub,
-            'actor_scope': actor_scope,
-            'action': action,
-            'resource_kind': resource_kind,
-            'resource_id': resource_id,
-            'before_json': before,
-            'after_json': after,
-            'request_id': request_id,
-            'source_ip': source_ip,
-            'user_agent': user_agent,
+            "id": str(event_id),
+            "ts": ts_utc.isoformat(),
+            "cluster_id": self.cluster_id,
+            "tenant_id": tenant_id,
+            "actor_sub": actor_sub,
+            "actor_scope": actor_scope,
+            "action": action,
+            "resource_kind": resource_kind,
+            "resource_id": resource_id,
+            "before_json": before,
+            "after_json": after,
+            "request_id": request_id,
+            "source_ip": source_ip,
+            "user_agent": user_agent,
         }
 
         chain_hash = compute_chain_hash(prev_hash, record_fields)
         signature = self.signer(chain_hash) if self.signer else None
 
-        stmt = text('''
+        tx.executesql(
+            """
             INSERT INTO audit_events
             (id, ts, cluster_id, tenant_id, actor_sub, actor_scope, action,
              resource_kind, resource_id, before_json, after_json, request_id,
              source_ip, user_agent, prev_hash, hash, signature)
             VALUES
-            (:id, :ts, :cluster_id, :tenant_id, :actor_sub, :actor_scope,
-             :action, :resource_kind, :resource_id, :before_json, :after_json,
-             :request_id, :source_ip, :user_agent, :prev_hash, :hash, :signature)
-        ''')
-
-        self.db_session.execute(
-            stmt,
+            (%(id)s, %(ts)s, %(cluster_id)s, %(tenant_id)s, %(actor_sub)s,
+             %(actor_scope)s, %(action)s, %(resource_kind)s, %(resource_id)s,
+             %(before_json)s, %(after_json)s, %(request_id)s, %(source_ip)s,
+             %(user_agent)s, %(prev_hash)s, %(hash)s, %(signature)s)
+            """,
             {
-                'id': str(event_id),
-                'ts': ts_utc,
-                'cluster_id': self.cluster_id,
-                'tenant_id': tenant_id,
-                'actor_sub': actor_sub,
-                'actor_scope': json.dumps(actor_scope),
-                'action': action,
-                'resource_kind': resource_kind,
-                'resource_id': resource_id,
-                'before_json': json.dumps(before) if before else None,
-                'after_json': json.dumps(after) if after else None,
-                'request_id': request_id,
-                'source_ip': source_ip,
-                'user_agent': user_agent,
-                'prev_hash': prev_hash,
-                'hash': chain_hash,
-                'signature': signature,
+                "id": str(event_id),
+                "ts": ts_utc,
+                "cluster_id": self.cluster_id,
+                "tenant_id": tenant_id,
+                "actor_sub": actor_sub,
+                "actor_scope": json.dumps(actor_scope),
+                "action": action,
+                "resource_kind": resource_kind,
+                "resource_id": resource_id,
+                "before_json": json.dumps(before) if before else None,
+                "after_json": json.dumps(after) if after else None,
+                "request_id": request_id,
+                "source_ip": source_ip,
+                "user_agent": user_agent,
+                "prev_hash": prev_hash,
+                "hash": chain_hash,
+                "signature": signature,
             },
         )
 
@@ -222,138 +352,179 @@ class AuditEventWriter:
 
 
 def verify_chain(
-    db_session: Any,
+    db: Any,
     since: Optional[datetime] = None,
     to: Optional[datetime] = None,
 ) -> dict[str, Any]:
-    """Verify chain integrity: recompute hashes, detect breaks."""
-    from sqlalchemy import text
+    """Verify chain integrity: recompute hashes, detect breaks.
 
+    Read-only -- a single SELECT, no multi-statement transaction needed.
+    ``db`` is a penguin-dal ``DB`` (or ``Tx``, either exposes
+    ``executesql``). This spans the whole ``audit_events`` table across all
+    tenants matched by ``since``/``to`` only; callers running this under a
+    background/worker context (no per-request tenant) MUST wrap it in
+    ``app.db.rls``'s cross-tenant sentinel themselves (see module docstring)
+    -- otherwise RLS fail-closes to zero rows and this silently reports a
+    false "0 rows checked, 0 breaks" instead of actually verifying anything.
+    ``AuditChainWriter.verify_chain_scheduled`` (the only in-scope caller)
+    does this.
+    """
     query = (
-        'SELECT id, ts, cluster_id, tenant_id, actor_sub, actor_scope, action, '
-        'resource_kind, resource_id, before_json, after_json, request_id, '
-        'source_ip, user_agent, prev_hash, hash FROM audit_events'
+        "SELECT id, ts, cluster_id, tenant_id, actor_sub, actor_scope, action, "
+        "resource_kind, resource_id, before_json, after_json, request_id, "
+        "source_ip, user_agent, prev_hash, hash FROM audit_events"
     )
-    params = {}
+    params: dict[str, Any] = {}
     conditions = []
 
     if since:
-        conditions.append('ts >= :since')
-        params['since'] = since
+        conditions.append("ts >= %(since)s")
+        params["since"] = since
     if to:
-        conditions.append('ts <= :to')
-        params['to'] = to
+        conditions.append("ts <= %(to)s")
+        params["to"] = to
 
     if conditions:
-        query += ' WHERE ' + ' AND '.join(conditions)
+        query += " WHERE " + " AND ".join(conditions)
 
-    query += ' ORDER BY ts ASC, id ASC'
+    query += " ORDER BY ts ASC, id ASC"
 
-    rows = db_session.execute(text(query), params).fetchall()
+    rows = cast(
+        "list[tuple[Any, ...]]",
+        db.executesql(query, params if params else None),
+    )
 
     rows_checked = 0
     breaks = 0
-    first_break_id = None
-    last_break_id = None
+    first_break_id: Optional[Any] = None
+    last_break_id: Optional[Any] = None
 
     for row in rows:
         (
-            event_id, ts, cluster_id, tenant_id, actor_sub, actor_scope, action,
-            resource_kind, resource_id, before_json, after_json, request_id,
-            source_ip, user_agent, stored_prev, stored_hash,
+            event_id,
+            ts,
+            cluster_id,
+            tenant_id,
+            actor_sub,
+            actor_scope,
+            action,
+            resource_kind,
+            resource_id,
+            before_json,
+            after_json,
+            request_id,
+            source_ip,
+            user_agent,
+            stored_prev,
+            stored_hash,
         ) = row
         record_fields = {
-            'id': str(event_id),
-            'ts': ts.isoformat() if hasattr(ts, 'isoformat') else str(ts),
-            'cluster_id': cluster_id or '',
-            'tenant_id': tenant_id,
-            'actor_sub': actor_sub,
-            'actor_scope': actor_scope if isinstance(actor_scope, list) else [],
-            'action': action,
-            'resource_kind': resource_kind,
-            'resource_id': resource_id,
-            'before_json': before_json,
-            'after_json': after_json,
-            'request_id': request_id,
-            'source_ip': source_ip,
-            'user_agent': user_agent,
+            "id": str(event_id),
+            "ts": ts.isoformat() if hasattr(ts, "isoformat") else str(ts),
+            "cluster_id": cluster_id or "",
+            "tenant_id": tenant_id,
+            "actor_sub": actor_sub,
+            "actor_scope": actor_scope if isinstance(actor_scope, list) else [],
+            "action": action,
+            "resource_kind": resource_kind,
+            "resource_id": resource_id,
+            "before_json": before_json,
+            "after_json": after_json,
+            "request_id": request_id,
+            "source_ip": source_ip,
+            "user_agent": user_agent,
         }
 
-        computed_hash = compute_chain_hash(stored_prev, record_fields)
+        is_binary = (bytes, bytearray, memoryview)
+        stored_prev_bytes = (
+            bytes(stored_prev) if isinstance(stored_prev, is_binary) else stored_prev
+        )
+        computed_hash = compute_chain_hash(stored_prev_bytes, record_fields)
         rows_checked += 1
 
-        if computed_hash != stored_hash:
+        stored_hash_bytes = (
+            bytes(stored_hash) if isinstance(stored_hash, is_binary) else stored_hash
+        )
+        if computed_hash != stored_hash_bytes:
             breaks += 1
             if first_break_id is None:
                 first_break_id = event_id
             last_break_id = event_id
 
     return {
-        'rows_checked': rows_checked,
-        'breaks': breaks,
-        'first_break_id': first_break_id,
-        'last_break_id': last_break_id,
+        "rows_checked": rows_checked,
+        "breaks": breaks,
+        "first_break_id": first_break_id,
+        "last_break_id": last_break_id,
     }
 
 
-def insert_genesis_row(db_session: Any, cluster_id: str) -> AuditEvent:
-    """Idempotent genesis: returns existing or inserts new."""
-    from sqlalchemy import text
+def insert_genesis_row(db: Any, cluster_id: str) -> AuditEvent:
+    """Idempotent genesis: returns existing or inserts new.
 
-    row = db_session.execute(
-        text('SELECT hash FROM audit_events WHERE id = :id'),
-        {'id': str(GENESIS_ID)},
-    ).first()
+    Cluster-global bootstrap operation (no tenant of its own) -- see
+    ``_cross_tenant_scope()`` docstring for why this always needs the
+    cross-tenant RLS sentinel, regardless of caller context. Wrapped in a
+    single ``db.transaction()`` so the idempotency check and the insert
+    commit/rollback together.
+    """
+    with _cross_tenant_scope(), db.transaction() as tx:
+        rows = cast(
+            "list[tuple[Any, ...]]",
+            tx.executesql(
+                "SELECT hash FROM audit_events WHERE id = %(id)s",
+                {"id": str(GENESIS_ID)},
+            ),
+        )
 
-    if row:
+        if rows:
+            existing_hash = _as_bytes32(rows[0][0], ZERO_HASH)
+            return AuditEvent(
+                id=GENESIS_ID,
+                ts=datetime.now(timezone.utc),
+                cluster_id=cluster_id,
+                actor_sub="system",
+                actor_scope=["system:admin"],
+                action="cluster_init",
+                resource_kind="cluster",
+                prev_hash=ZERO_HASH,
+                hash=existing_hash,
+            )
+
+        genesis_hash = hashlib.sha256(
+            b"gough-cluster-genesis:" + cluster_id.encode("utf-8")
+        ).digest()
+
+        tx.executesql(
+            """
+            INSERT INTO audit_events
+            (id, ts, cluster_id, actor_sub, actor_scope, action, resource_kind,
+             prev_hash, hash)
+            VALUES
+            (%(id)s, %(ts)s, %(cluster_id)s, %(actor_sub)s, %(actor_scope)s,
+             %(action)s, %(resource_kind)s, %(prev_hash)s, %(hash)s)
+            """,
+            {
+                "id": str(GENESIS_ID),
+                "ts": datetime.now(timezone.utc),
+                "cluster_id": cluster_id,
+                "actor_sub": "system",
+                "actor_scope": json.dumps(["system:admin"]),
+                "action": "cluster_init",
+                "resource_kind": "cluster",
+                "prev_hash": ZERO_HASH,
+                "hash": genesis_hash,
+            },
+        )
+
         return AuditEvent(
             id=GENESIS_ID,
             ts=datetime.now(timezone.utc),
             cluster_id=cluster_id,
-            actor_sub='system',
-            actor_scope=['system:admin'],
-            action='cluster_init',
-            resource_kind='cluster',
+            actor_sub="system",
+            actor_scope=["system:admin"],
+            action="cluster_init",
+            resource_kind="cluster",
             prev_hash=ZERO_HASH,
-            hash=row[0],
+            hash=genesis_hash,
         )
-
-    genesis_hash = hashlib.sha256(
-        b'gough-cluster-genesis:' + cluster_id.encode('utf-8')
-    ).digest()
-
-    stmt = text('''
-        INSERT INTO audit_events
-        (id, ts, cluster_id, actor_sub, actor_scope, action, resource_kind,
-         prev_hash, hash)
-        VALUES
-        (:id, :ts, :cluster_id, :actor_sub, :actor_scope, :action,
-         :resource_kind, :prev_hash, :hash)
-    ''')
-
-    db_session.execute(
-        stmt,
-        {
-            'id': str(GENESIS_ID),
-            'ts': datetime.now(timezone.utc),
-            'cluster_id': cluster_id,
-            'actor_sub': 'system',
-            'actor_scope': json.dumps(['system:admin']),
-            'action': 'cluster_init',
-            'resource_kind': 'cluster',
-            'prev_hash': ZERO_HASH,
-            'hash': genesis_hash,
-        },
-    )
-
-    return AuditEvent(
-        id=GENESIS_ID,
-        ts=datetime.now(timezone.utc),
-        cluster_id=cluster_id,
-        actor_sub='system',
-        actor_scope=['system:admin'],
-        action='cluster_init',
-        resource_kind='cluster',
-        prev_hash=ZERO_HASH,
-        hash=genesis_hash,
-    )

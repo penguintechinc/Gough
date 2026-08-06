@@ -1,14 +1,21 @@
-"""Tests for the generic leader-lease primitive."""
+"""Tests for the generic leader-lease primitive.
+
+Real-Postgres tests (via the ``pg_db`` fixture from ``tests/pg_fixtures.py``)
+exercise ``acquire``/``renew``/``release``/``is_leader``/``wait_for_leader``
+against the actual ``leader_leases`` table + baseline schema/grants, and
+prove mutual exclusion under genuine concurrent Postgres connections (not
+just sequential mock calls) — see ``test_concurrent_acquirers_only_one_wins``.
+"""
 
 from __future__ import annotations
 
+import os
 import threading
-import uuid
 from datetime import datetime, timedelta, timezone
-from typing import Any, Optional
-from unittest.mock import MagicMock
+from typing import Optional
 
 import pytest
+from penguin_dal import DB
 
 from app.workers import leader_lease as ll
 from app.workers.leader_lease import (
@@ -22,267 +29,254 @@ from app.workers.leader_lease import (
 )
 
 
-class _LeaseRow:
-    """In-memory row mimicking a SQLAlchemy Row with mapping access."""
-
-    def __init__(self, **kwargs: Any) -> None:
-        self.data = kwargs
-
-    @property
-    def _mapping(self) -> dict[str, Any]:
-        return self.data
-
-    def __getitem__(self, item: int) -> Any:
-        order = ["lease_name", "holder_id", "acquired_at", "expires_at", "version"]
-        return self.data[order[item]]
-
-
-class FakeSession:
-    """Minimal fake SQLAlchemy session that backs ``leader_leases`` with a dict.
-
-    Implements just enough of the ``execute(text(...), params)`` protocol to
-    satisfy the leader-lease primitive. Thread-safe via a coarse lock so the
-    contention test below is meaningful.
-    """
-
-    def __init__(self, rows: Optional[dict[str, dict[str, Any]]] = None) -> None:
-        self.rows = rows if rows is not None else {}
-        self.lock = threading.Lock()
-
-    def execute(self, statement: Any, params: Optional[dict[str, Any]] = None) -> Any:
-        sql = str(statement).strip().lower()
-        params = params or {}
-        with self.lock:
-            if sql.startswith("select lease_name"):
-                row = self.rows.get(params["name"])
-                if row is None:
-                    return MagicMock(first=MagicMock(return_value=None))
-                lease_row = _LeaseRow(**row)
-                return MagicMock(first=MagicMock(return_value=lease_row))
-            if sql.startswith("select holder_id"):
-                row = self.rows.get(params["name"])
-                if row is None:
-                    return MagicMock(first=MagicMock(return_value=None))
-                return MagicMock(
-                    first=MagicMock(return_value=_LeaseRow(**row))
-                )
-            if sql.startswith("insert into leader_leases"):
-                if params["name"] in self.rows:
-                    raise RuntimeError("duplicate lease row (simulated IntegrityError)")
-                self.rows[params["name"]] = {
-                    "lease_name": params["name"],
-                    "holder_id": params["holder"],
-                    "acquired_at": params["acquired"],
-                    "expires_at": params["expires"],
-                    "version": 1,
-                }
-                result = MagicMock()
-                result.rowcount = 1
-                return result
-            if sql.startswith("update leader_leases set holder_id = :holder"):
-                # acquire CAS update
-                row = self.rows.get(params["name"])
-                if row is None or row["version"] != params["old_version"]:
-                    result = MagicMock()
-                    result.rowcount = 0
-                    return result
-                row["holder_id"] = params["holder"]
-                row["acquired_at"] = params["acquired"]
-                row["expires_at"] = params["expires"]
-                row["version"] = params["new_version"]
-                result = MagicMock()
-                result.rowcount = 1
-                return result
-            if sql.startswith("update leader_leases set expires_at = :expires"):
-                row = self.rows.get(params["name"])
-                if (
-                    row is None
-                    or row["holder_id"] != params["holder"]
-                    or row["version"] != params["old_version"]
-                ):
-                    result = MagicMock()
-                    result.rowcount = 0
-                    return result
-                row["expires_at"] = params["expires"]
-                row["version"] = params["new_version"]
-                result = MagicMock()
-                result.rowcount = 1
-                return result
-            if sql.startswith("update leader_leases set holder_id = null"):
-                row = self.rows.get(params["name"])
-                if (
-                    row is None
-                    or row["holder_id"] != params["holder"]
-                    or row["version"] != params["old_version"]
-                ):
-                    result = MagicMock()
-                    result.rowcount = 0
-                    return result
-                row["holder_id"] = None
-                row["expires_at"] = params["now"]
-                row["version"] = row["version"] + 1
-                result = MagicMock()
-                result.rowcount = 1
-                return result
-            raise AssertionError(f"unexpected SQL: {sql}")
-
-    def commit(self) -> None:
-        pass
-
-    def rollback(self) -> None:
-        pass
-
-    def close(self) -> None:
-        pass
-
-
 # ---------------------------------------------------------------------------
-# acquire / renew / release / is_leader
+# Pure helper — no DB.
 # ---------------------------------------------------------------------------
-
-
-def test_acquire_inserts_row_when_missing() -> None:
-    session = FakeSession()
-    handle = acquire(session, "audit_chain_writer", ttl_seconds=60, holder_id="A")
-    assert handle is not None
-    assert handle.holder_id == "A"
-    assert handle.version == 1
-    assert handle.expires_at > handle.acquired_at
-
-
-def test_acquire_rejects_when_other_holder_active() -> None:
-    session = FakeSession()
-    a = acquire(session, "lease", ttl_seconds=60, holder_id="A")
-    assert a is not None
-    b = acquire(session, "lease", ttl_seconds=60, holder_id="B")
-    assert b is None, "B must not steal an active lease from A"
-
-
-def test_acquire_takes_over_after_expiry() -> None:
-    past = datetime.now(timezone.utc) - timedelta(minutes=5)
-    session = FakeSession(rows={
-        "lease": {
-            "lease_name": "lease",
-            "holder_id": "A",
-            "acquired_at": past,
-            "expires_at": past,
-            "version": 7,
-        }
-    })
-    handle = acquire(session, "lease", ttl_seconds=60, holder_id="B")
-    assert handle is not None
-    assert handle.holder_id == "B"
-    assert handle.version == 8
-
-
-def test_acquire_returns_handle_for_self() -> None:
-    session = FakeSession()
-    a1 = acquire(session, "lease", ttl_seconds=60, holder_id="A")
-    a2 = acquire(session, "lease", ttl_seconds=60, holder_id="A")
-    assert a1 is not None and a2 is not None
-    assert a2.version > a1.version
-
-
-def test_renew_extends_expiry() -> None:
-    session = FakeSession()
-    h = acquire(session, "lease", ttl_seconds=60, holder_id="A")
-    assert h is not None
-    h2 = renew(session, h)
-    assert h2.version == h.version + 1
-    assert h2.expires_at >= h.expires_at
-
-
-def test_renew_raises_when_lease_lost() -> None:
-    session = FakeSession()
-    h = acquire(session, "lease", ttl_seconds=60, holder_id="A")
-    assert h is not None
-    # Simulate B stealing it after expiry by mutating state.
-    session.rows["lease"]["holder_id"] = "B"
-    session.rows["lease"]["version"] = h.version + 5
-    with pytest.raises(LeaseLostError):
-        renew(session, h)
-
-
-def test_release_clears_holder_and_returns_true() -> None:
-    session = FakeSession()
-    h = acquire(session, "lease", ttl_seconds=60, holder_id="A")
-    assert h is not None
-    ok = release(session, h)
-    assert ok is True
-    assert session.rows["lease"]["holder_id"] is None
-
-
-def test_release_returns_false_if_not_held() -> None:
-    session = FakeSession()
-    h = acquire(session, "lease", ttl_seconds=60, holder_id="A")
-    assert h is not None
-    # Steal it.
-    session.rows["lease"]["holder_id"] = "B"
-    session.rows["lease"]["version"] = h.version + 1
-    assert release(session, h) is False
-
-
-def test_is_leader_true_for_active_handle() -> None:
-    session = FakeSession()
-    h = acquire(session, "lease", ttl_seconds=60, holder_id="A")
-    assert h is not None
-    assert is_leader(session, h) is True
-
-
-def test_is_leader_false_after_release() -> None:
-    session = FakeSession()
-    h = acquire(session, "lease", ttl_seconds=60, holder_id="A")
-    assert h is not None
-    release(session, h)
-    assert is_leader(session, h) is False
-
-
-def test_is_leader_false_when_expired() -> None:
-    session = FakeSession()
-    h = acquire(session, "lease", ttl_seconds=60, holder_id="A")
-    assert h is not None
-    session.rows["lease"]["expires_at"] = datetime.now(timezone.utc) - timedelta(seconds=1)
-    assert is_leader(session, h) is False
-
-
-def test_acquire_invalid_ttl_rejected() -> None:
-    with pytest.raises(ValueError):
-        acquire(FakeSession(), "lease", ttl_seconds=0, holder_id="A")
 
 
 def test_default_holder_id_includes_pid() -> None:
     holder = ll._default_holder_id()
     assert "/" in holder
-    assert str(__import__("os").getpid()) in holder
+    assert str(os.getpid()) in holder
 
 
-def test_two_concurrent_acquirers_only_one_succeeds() -> None:
-    """Threaded contention: only one of N callers gets the lease."""
+def test_default_holder_id_unique_per_call() -> None:
+    """The random suffix means two calls never collide."""
+    assert ll._default_holder_id() != ll._default_holder_id()
 
-    session = FakeSession()
+
+# ---------------------------------------------------------------------------
+# acquire / renew / release / is_leader — real Postgres.
+# ---------------------------------------------------------------------------
+
+
+def test_acquire_inserts_row_when_missing(pg_db: DB) -> None:
+    handle = acquire(pg_db, "audit_chain_writer", ttl_seconds=60, holder_id="A")
+    assert handle is not None
+    assert handle.holder_id == "A"
+    assert handle.version == 1
+    assert handle.expires_at > handle.acquired_at
+
+    rows = pg_db.executesql(
+        "SELECT holder_id, version FROM leader_leases WHERE lease_name = %(name)s",
+        {"name": "audit_chain_writer"},
+    )
+    assert rows == [("A", 1)]
+
+
+def test_acquire_rejects_when_other_holder_active(pg_db: DB) -> None:
+    a = acquire(pg_db, "lease", ttl_seconds=60, holder_id="A")
+    assert a is not None
+    b = acquire(pg_db, "lease", ttl_seconds=60, holder_id="B")
+    assert b is None, "B must not steal an active lease from A"
+
+
+def test_acquire_takes_over_after_expiry(pg_db: DB) -> None:
+    past = datetime.now(timezone.utc) - timedelta(minutes=5)
+    pg_db.executesql(
+        "INSERT INTO leader_leases (lease_name, holder_id, acquired_at, expires_at, version) "
+        "VALUES (%(name)s, %(holder)s, %(acquired)s, %(expires)s, %(version)s)",
+        {
+            "name": "lease",
+            "holder": "A",
+            "acquired": past,
+            "expires": past,
+            "version": 7,
+        },
+    )
+
+    handle = acquire(pg_db, "lease", ttl_seconds=60, holder_id="B")
+    assert handle is not None
+    assert handle.holder_id == "B"
+    assert handle.version == 8
+
+
+def test_acquire_returns_handle_for_self(pg_db: DB) -> None:
+    a1 = acquire(pg_db, "lease", ttl_seconds=60, holder_id="A")
+    a2 = acquire(pg_db, "lease", ttl_seconds=60, holder_id="A")
+    assert a1 is not None and a2 is not None
+    assert a2.version > a1.version
+
+
+def test_acquire_invalid_ttl_rejected(pg_db: DB) -> None:
+    with pytest.raises(ValueError):
+        acquire(pg_db, "lease", ttl_seconds=0, holder_id="A")
+
+
+def test_renew_extends_expiry(pg_db: DB) -> None:
+    h = acquire(pg_db, "lease", ttl_seconds=60, holder_id="A")
+    assert h is not None
+    h2 = renew(pg_db, h)
+    assert h2.version == h.version + 1
+    assert h2.expires_at >= h.expires_at
+
+
+def test_renew_raises_when_lease_lost(pg_db: DB) -> None:
+    h = acquire(pg_db, "lease", ttl_seconds=60, holder_id="A")
+    assert h is not None
+    # Simulate B stealing it after expiry by mutating state directly.
+    pg_db.executesql(
+        "UPDATE leader_leases SET holder_id = %(holder)s, version = %(version)s "
+        "WHERE lease_name = %(name)s",
+        {"holder": "B", "version": h.version + 5, "name": "lease"},
+    )
+    with pytest.raises(LeaseLostError):
+        renew(pg_db, h)
+
+
+def test_release_clears_holder_and_returns_true(pg_db: DB) -> None:
+    h = acquire(pg_db, "lease", ttl_seconds=60, holder_id="A")
+    assert h is not None
+    ok = release(pg_db, h)
+    assert ok is True
+
+    rows = pg_db.executesql(
+        "SELECT holder_id FROM leader_leases WHERE lease_name = %(name)s", {"name": "lease"}
+    )
+    assert rows == [(None,)]
+
+
+def test_release_returns_false_if_not_held(pg_db: DB) -> None:
+    h = acquire(pg_db, "lease", ttl_seconds=60, holder_id="A")
+    assert h is not None
+    # Steal it.
+    pg_db.executesql(
+        "UPDATE leader_leases SET holder_id = %(holder)s, version = %(version)s "
+        "WHERE lease_name = %(name)s",
+        {"holder": "B", "version": h.version + 1, "name": "lease"},
+    )
+    assert release(pg_db, h) is False
+
+
+def test_is_leader_true_for_active_handle(pg_db: DB) -> None:
+    h = acquire(pg_db, "lease", ttl_seconds=60, holder_id="A")
+    assert h is not None
+    assert is_leader(pg_db, h) is True
+
+
+def test_is_leader_false_after_release(pg_db: DB) -> None:
+    h = acquire(pg_db, "lease", ttl_seconds=60, holder_id="A")
+    assert h is not None
+    release(pg_db, h)
+    assert is_leader(pg_db, h) is False
+
+
+def test_is_leader_false_when_expired(pg_db: DB) -> None:
+    h = acquire(pg_db, "lease", ttl_seconds=60, holder_id="A")
+    assert h is not None
+    pg_db.executesql(
+        "UPDATE leader_leases SET expires_at = %(expires)s WHERE lease_name = %(name)s",
+        {"expires": datetime.now(timezone.utc) - timedelta(seconds=1), "name": "lease"},
+    )
+    assert is_leader(pg_db, h) is False
+
+
+def test_is_leader_false_for_missing_lease(pg_db: DB) -> None:
+    fake_handle = LeaderLeaseHandle(
+        lease_name="never-created",
+        holder_id="A",
+        ttl_seconds=60,
+        acquired_at=datetime.now(timezone.utc),
+        expires_at=datetime.now(timezone.utc) + timedelta(seconds=60),
+        version=1,
+    )
+    assert is_leader(pg_db, fake_handle) is False
+
+
+# ---------------------------------------------------------------------------
+# Mutual exclusion under genuine concurrency — the lock-serialization proof.
+# ---------------------------------------------------------------------------
+
+
+def test_concurrent_acquirers_only_one_wins(pg_db: DB) -> None:
+    """N threads race ``acquire()`` on the same unclaimed lease via real,
+    concurrent Postgres connections (drawn from ``pg_db``'s connection pool,
+    each ``executesql()`` call its own round-trip) -- not sequential mock
+    calls. Only one may win.
+
+    This is a genuine proof of the CAS mechanism, not the pg_advisory lock
+    (leader_leases carries no advisory lock -- see module docstring): if the
+    ``UPDATE ... WHERE version = :old_version`` CAS were broken (e.g. missing
+    the version predicate, or split across a read+write that wasn't
+    atomically re-checked), concurrent threads reading the same
+    pre-acquisition state would race past the check and more than one would
+    successfully "win" the lease.
+    """
+
+    barrier = threading.Barrier(10)
     results: list[Optional[LeaderLeaseHandle]] = []
-    barrier = threading.Barrier(8)
+    lock = threading.Lock()
 
     def worker(name: str) -> None:
         barrier.wait()
-        h = acquire(session, "race", ttl_seconds=60, holder_id=name)
-        results.append(h)
+        h = acquire(pg_db, "race", ttl_seconds=60, holder_id=name)
+        with lock:
+            results.append(h)
 
-    threads = [threading.Thread(target=worker, args=(f"replica-{i}",)) for i in range(8)]
+    threads = [threading.Thread(target=worker, args=(f"replica-{i}",)) for i in range(10)]
     for t in threads:
         t.start()
     for t in threads:
         t.join()
 
     successes = [r for r in results if r is not None]
-    assert len(successes) == 1, f"expected one winner, got {len(successes)}"
+    assert len(successes) == 1, f"expected exactly one winner, got {len(successes)}"
+
+    rows = pg_db.executesql(
+        "SELECT holder_id, version FROM leader_leases WHERE lease_name = %(name)s",
+        {"name": "race"},
+    )
+    assert rows == [(successes[0].holder_id, 1)]
 
 
-def test_wait_for_leader_returns_when_acquired() -> None:
-    session = FakeSession()
+def test_concurrent_cas_on_expired_lease_only_one_wins(pg_db: DB) -> None:
+    """Same proof, but racing to steal an already-expired lease (CAS on an
+    existing row, not the INSERT-race path)."""
 
-    def factory() -> FakeSession:
-        return session
+    past = datetime.now(timezone.utc) - timedelta(minutes=5)
+    pg_db.executesql(
+        "INSERT INTO leader_leases (lease_name, holder_id, acquired_at, expires_at, version) "
+        "VALUES (%(name)s, %(holder)s, %(acquired)s, %(expires)s, %(version)s)",
+        {
+            "name": "expired-race",
+            "holder": "stale-holder",
+            "acquired": past,
+            "expires": past,
+            "version": 3,
+        },
+    )
+
+    barrier = threading.Barrier(10)
+    results: list[Optional[LeaderLeaseHandle]] = []
+    lock = threading.Lock()
+
+    def worker(name: str) -> None:
+        barrier.wait()
+        h = acquire(pg_db, "expired-race", ttl_seconds=60, holder_id=name)
+        with lock:
+            results.append(h)
+
+    threads = [
+        threading.Thread(target=worker, args=(f"replica-{i}",)) for i in range(10)
+    ]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+
+    successes = [r for r in results if r is not None]
+    assert len(successes) == 1, f"expected exactly one winner, got {len(successes)}"
+    assert successes[0].version == 4
+
+
+# ---------------------------------------------------------------------------
+# wait_for_leader
+# ---------------------------------------------------------------------------
+
+
+def test_wait_for_leader_returns_when_acquired(pg_url: str, pg_db: DB) -> None:
+    def factory() -> DB:
+        return DB(pg_url, pool_size=1, reflect=True)
 
     handle = wait_for_leader(
         factory,
@@ -296,19 +290,11 @@ def test_wait_for_leader_returns_when_acquired() -> None:
     assert handle.holder_id == "A"
 
 
-def test_wait_for_leader_raises_after_max_attempts() -> None:
-    session = FakeSession(rows={
-        "lease": {
-            "lease_name": "lease",
-            "holder_id": "B",
-            "acquired_at": datetime.now(timezone.utc),
-            "expires_at": datetime.now(timezone.utc) + timedelta(hours=1),
-            "version": 99,
-        }
-    })
+def test_wait_for_leader_raises_after_max_attempts(pg_url: str, pg_db: DB) -> None:
+    acquire(pg_db, "lease", ttl_seconds=3600, holder_id="B")
 
-    def factory() -> FakeSession:
-        return session
+    def factory() -> DB:
+        return DB(pg_url, pool_size=1, reflect=True)
 
     with pytest.raises(ll.LeaderLeaseError):
         wait_for_leader(
@@ -319,14 +305,3 @@ def test_wait_for_leader_raises_after_max_attempts() -> None:
             holder_id="A",
             max_attempts=2,
         )
-
-
-def test_row_to_dict_handles_tuple_fallback() -> None:
-    tup = ("name", "holder", None, None, 1)
-    d = ll._row_to_dict(tup)
-    assert d["lease_name"] == "name"
-    assert d["holder_id"] == "holder"
-
-
-def test_row_to_dict_returns_empty_for_none() -> None:
-    assert ll._row_to_dict(None) == {}

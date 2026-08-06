@@ -18,6 +18,8 @@ import base64
 import importlib
 import json
 import uuid
+from collections.abc import Iterator
+from contextlib import contextmanager
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from typing import Any, Optional
@@ -36,7 +38,6 @@ from app.api.audit import (
 )
 from app.security.credentials import CredentialType, Principal
 from app.security.tenant import TenantContext
-
 
 # =============================================================================
 # Fixtures
@@ -133,12 +134,48 @@ class FakeQuery:
         return iter(self._rows)
 
 
+class _FakeTx:
+    """Minimal penguin-dal ``Tx`` stand-in for ``AuditEventWriter.append()``.
+
+    Only implements what ``AuditEventWriter._append_on_tx`` actually calls:
+    a chain-head ``SELECT`` (always answered "no prior rows" -- these tests
+    don't assert anything about the writer's own self-audit-log row, only
+    about the export stream/footer/NATS behavior) and the subsequent
+    ``INSERT`` (recorded, not persisted anywhere real).
+    """
+
+    def __init__(self, session: "FakeSession") -> None:
+        self._session = session
+
+    def executesql(self, query: str, placeholders: Any = None, **_: Any) -> Any:
+        stripped = query.strip().upper()
+        if stripped.startswith("SELECT"):
+            return []
+        self._session.inserted.append((query, placeholders))
+        return None
+
+
 class FakeSession:
+    """Dual-interface test double -- see ``_build_app`` docstring for why
+    this needs to satisfy both a SQLAlchemy-``Connection``-shaped
+    ``execute()`` (``set_tenant_guc``) and a penguin-dal-``DB``-shaped
+    ``transaction()`` (``AuditEventWriter``/``verify_chain``) on the SAME
+    object -- a real object of either type could never do both.
+    """
+
     def __init__(self, rows: list[Any]) -> None:
         self.rows = rows
+        self.inserted: list[tuple[str, Any]] = []
 
     def execute(self, *_: Any, **__: Any) -> Any:
         return MagicMock()
+
+    def executesql(self, query: str, placeholders: Any = None, **kwargs: Any) -> Any:
+        return _FakeTx(self).executesql(query, placeholders, **kwargs)
+
+    @contextmanager
+    def transaction(self) -> Iterator["_FakeTx"]:
+        yield _FakeTx(self)
 
     def query(self, _model: Any) -> FakeQuery:
         return FakeQuery(self.rows)
@@ -193,10 +230,21 @@ def _build_app(
 ) -> Quart:
     """Build a Quart app with ``audit_bp`` registered.
 
-    ``rows``/``FakeSession`` back the still-SQLAlchemy-session-based paths
-    (``g.db_session``, used by ``verify_chain``/``AuditEventWriter``). Pass
-    ``dal_db`` (a real ``pg_db``) + ``monkeypatch`` together to also patch
-    ``audit_module.get_db`` for handlers converted to the penguin-dal
+    ``rows``/``FakeSession`` back the still-SQLAlchemy-session-shaped path
+    (``g.db_session``, via ``_get_db_session()``) that ``set_tenant_guc()``
+    (a real ``Connection.execute()`` call) and ``AuditEventWriter``/
+    ``verify_chain`` (penguin-dal ``.transaction()``/``Tx.executesql()``,
+    Task 8a) both read off the SAME ``db_session`` variable in
+    ``export_audit_log``/``verify_audit_chain`` despite needing genuinely
+    different, mutually-incompatible APIs -- a real SQLAlchemy Session and a
+    real penguin-dal ``DB`` can't both satisfy this at once, which is a
+    pre-existing inconsistency in ``app.api.audit`` itself (out of scope for
+    this fixture to fix; flagged in the Task 8a report). ``FakeSession``
+    implements both surfaces as a test double so this endpoint's other
+    behavior (scope/MFA enforcement, JSONL stream shape, footer signature,
+    NATS publish) is still testable without editing that production file.
+    Pass ``dal_db`` (a real ``pg_db``) + ``monkeypatch`` together to also
+    patch ``audit_module.get_db`` for handlers converted to the penguin-dal
     overlay (``list_audit_events`` / ``export_audit_log``'s export stream).
 
     ``rls_scoped=True`` additionally wires ``app.db.rls``'s pool
@@ -276,9 +324,7 @@ class TestSerializerAuditEvent:
         row = _make_row(hash=b"\xab" * 32, prev_hash=b"\xcd" * 32)
         out = _serialize_audit_event(row)
         assert out["hash_b64"] == base64.b64encode(b"\xab" * 32).decode("ascii")
-        assert out["prev_hash_b64"] == base64.b64encode(b"\xcd" * 32).decode(
-            "ascii"
-        )
+        assert out["prev_hash_b64"] == base64.b64encode(b"\xcd" * 32).decode("ascii")
         assert out["signature_b64"] is None
 
     def test_serializer_includes_actor_scope(self) -> None:
@@ -435,13 +481,9 @@ class TestListAuditEvents:
         assert resp.status_code == 403
 
     async def test_list_cluster_id_filter_requires_superadmin(self) -> None:
-        app = _build_app(
-            rows=[], principal=_principal(scopes={"gough.audit.read"})
-        )
+        app = _build_app(rows=[], principal=_principal(scopes={"gough.audit.read"}))
         client = app.test_client()
-        resp = await client.get(
-            "/api/v1/audit/events?cluster_id=other-cluster"
-        )
+        resp = await client.get("/api/v1/audit/events?cluster_id=other-cluster")
         assert resp.status_code == 403
 
     async def test_list_cluster_id_filter_with_superadmin(
@@ -457,17 +499,13 @@ class TestListAuditEvents:
             monkeypatch=monkeypatch,
         )
         client = app.test_client()
-        resp = await client.get(
-            "/api/v1/audit/events?cluster_id=other-cluster"
-        )
+        resp = await client.get("/api/v1/audit/events?cluster_id=other-cluster")
         assert resp.status_code == 200
         body = await resp.get_json()
         assert body["count"] == 1
 
     async def test_list_invalid_cursor(self) -> None:
-        app = _build_app(
-            rows=[], principal=_principal(scopes={"gough.audit.read"})
-        )
+        app = _build_app(rows=[], principal=_principal(scopes={"gough.audit.read"}))
         client = app.test_client()
         resp = await client.get("/api/v1/audit/events?cursor=not-a-uuid")
         assert resp.status_code == 400
@@ -549,9 +587,7 @@ class TestVerifyAuditChain:
         )
         # Reset counter
         audit_chain_break_total._metrics.clear()
-        app = _build_app(
-            rows=[], principal=_principal(scopes={"gough.audit.read"})
-        )
+        app = _build_app(rows=[], principal=_principal(scopes={"gough.audit.read"}))
         client = app.test_client()
         resp = await client.post("/api/v1/audit/verify", json={})
         assert resp.status_code == 200
@@ -578,9 +614,7 @@ class TestVerifyAuditChain:
             },
         )
         audit_chain_break_total._metrics.clear()
-        app = _build_app(
-            rows=[], principal=_principal(scopes={"gough.audit.read"})
-        )
+        app = _build_app(rows=[], principal=_principal(scopes={"gough.audit.read"}))
         client = app.test_client()
         resp = await client.post(
             "/api/v1/audit/verify",
@@ -715,9 +749,7 @@ class TestStreamAuditEventsJsonl:
 @pytest.mark.asyncio
 class TestExportAuditLog:
     async def test_export_requires_superadmin(self) -> None:
-        app = _build_app(
-            rows=[], principal=_principal(scopes={"gough.audit.read"})
-        )
+        app = _build_app(rows=[], principal=_principal(scopes={"gough.audit.read"}))
         client = app.test_client()
         resp = await client.get("/api/v1/audit/export")
         assert resp.status_code == 403
@@ -725,9 +757,7 @@ class TestExportAuditLog:
     async def test_export_mfa_required_in_compliance_lane(self) -> None:
         app = _build_app(
             rows=[],
-            principal=_principal(
-                scopes={"gough.cluster.superadmin"}, mfa=False
-            ),
+            principal=_principal(scopes={"gough.cluster.superadmin"}, mfa=False),
             mfa_lane="fedramp",
         )
         client = app.test_client()
@@ -743,18 +773,14 @@ class TestExportAuditLog:
         nats_client.publish = MagicMock()
         app = _build_app(
             rows=[],
-            principal=_principal(
-                scopes={"gough.cluster.superadmin"}, mfa=True
-            ),
+            principal=_principal(scopes={"gough.cluster.superadmin"}, mfa=True),
             mfa_lane="fedramp",
             nats_client=nats_client,
             dal_db=pg_db,
             monkeypatch=monkeypatch,
         )
         client = app.test_client()
-        resp = await client.get(
-            "/api/v1/audit/export?target_sub=auditor@acme"
-        )
+        resp = await client.get("/api/v1/audit/export?target_sub=auditor@acme")
         assert resp.status_code == 200
         body = (await resp.get_data()).decode("utf-8").strip().splitlines()
         assert len(body) == 3  # 2 rows + footer
@@ -770,9 +796,7 @@ class TestExportAuditLog:
         assert ev["target_sub"] == "auditor@acme"
         # Content-Disposition for download
         assert "attachment" in resp.headers["Content-Disposition"]
-        assert "gough-audit-test-cluster.jsonl" in resp.headers[
-            "Content-Disposition"
-        ]
+        assert "gough-audit-test-cluster.jsonl" in resp.headers["Content-Disposition"]
 
     async def test_export_no_nats_client_does_not_fail(
         self, pg_db: Any, monkeypatch: pytest.MonkeyPatch
