@@ -230,6 +230,125 @@ async def test_rotate_keys_whitespace_handling(vault_app):
 
 
 # =============================================================================
+# Auth enforcement (F1/F2 fix round) — real decorators, not stubbed
+# =============================================================================
+#
+# Every test above (via ``vault_app``/``_build_vault_app_pg``) stubs
+# ``auth_required``/``require_scopes`` with passthroughs so it can focus on
+# the endpoint's own logic. Before the fix, ``rotate_keys`` had no decorator
+# at all -- an unauthenticated caller reached the handler and got a
+# misleading ``200 {"rotated": true, "revoked_count": 0}`` (RLS fails closed
+# to 0 rows without a tenant on the request), rather than being rejected.
+# These tests build their own standalone app and deliberately do NOT stub
+# either decorator, so they exercise the real ``@auth_required``/
+# ``@require_scopes("gough.cluster.superadmin")`` chain end-to-end.
+
+
+def _build_vault_app_real_auth():
+    """Build a Quart app with ``vault_bp`` wired to the REAL auth decorators.
+
+    No ``monkeypatch`` involved -- as long as no other test's monkeypatch of
+    ``app.middleware.auth_required``/``app.security.scope_enforcement.
+    require_scopes`` is still active (pytest's ``monkeypatch`` fixture
+    guarantees per-test teardown), reloading ``app.api.vault`` here picks up
+    the genuine, unpatched decorators.
+    """
+    import importlib
+    from quart import Quart
+    import app.api.vault as vault_mod
+
+    from prometheus_client import REGISTRY
+    for collector in list(set(REGISTRY._names_to_collectors.values())):
+        if hasattr(collector, "_name") and "gough_vault" in getattr(collector, "_name", ""):
+            try:
+                REGISTRY.unregister(collector)
+            except Exception:
+                pass
+    vault_mod = importlib.reload(vault_mod)
+
+    quart_app = Quart(__name__)
+    quart_app.config["JWT_SECRET_KEY"] = "test-secret"
+    quart_app.register_blueprint(vault_mod.vault_bp, url_prefix="/api/v1/vault")
+    return quart_app
+
+
+@pytest.mark.asyncio
+async def test_rotate_keys_unauthenticated_rejected():
+    """F2: no Authorization header at all -> 401, never reaches the handler
+    (not the pre-fix 200 with revoked_count: 0).
+    """
+    quart_app = _build_vault_app_real_auth()
+    client = quart_app.test_client()
+    response = await client.post(
+        "/api/v1/vault/rotate-keys",
+        data=json.dumps({"rotation_class": "joiner"}),
+        headers={"Content-Type": "application/json"},
+    )
+    assert response.status_code == 401
+    data = await response.get_json()
+    assert data.get("rotated") is not True
+
+
+@pytest.mark.asyncio
+async def test_rotate_keys_invalid_token_rejected():
+    """F2: a garbage bearer token (fails JWT decode) -> 401."""
+    quart_app = _build_vault_app_real_auth()
+    client = quart_app.test_client()
+    response = await client.post(
+        "/api/v1/vault/rotate-keys",
+        data=json.dumps({"rotation_class": "joiner"}),
+        headers={
+            "Content-Type": "application/json",
+            "Authorization": "Bearer not-a-real-jwt",
+        },
+    )
+    assert response.status_code == 401
+
+
+@pytest.mark.asyncio
+async def test_rotate_keys_insufficient_scope_rejected(monkeypatch):
+    """F2: authenticated but missing the superadmin scope -> 403, not 200.
+
+    Stubs only ``auth_required`` (a passthrough that trusts the
+    ``before_request``-injected ``g.current_user``, same seam ``vault_app``/
+    other test files use elsewhere in this suite) so the test can supply an
+    authenticated-but-under-scoped principal directly, without needing a
+    real signed JWT + DB-backed user lookup just to reach the real
+    ``@auth_required``'s success path. ``require_scopes`` is left real --
+    that's what this test is actually proving.
+    """
+    import app.middleware as mw_mod
+
+    def _auth_passthrough(*dargs: Any, **dkwargs: Any) -> Any:
+        if len(dargs) == 1 and callable(dargs[0]) and not dkwargs:
+            return dargs[0]
+        return lambda fn: fn
+
+    monkeypatch.setattr(mw_mod, "auth_required", _auth_passthrough)
+
+    quart_app = _build_vault_app_real_auth()
+
+    @quart_app.before_request
+    async def _inject_authenticated_no_scope() -> None:
+        from quart import g
+        g.current_user = {
+            "id": 1,
+            "username": "not-superadmin",
+            "_jwt_payload": {"sub": "1", "scope": "gough.cluster.read"},
+        }
+
+    client = quart_app.test_client()
+    response = await client.post(
+        "/api/v1/vault/rotate-keys",
+        data=json.dumps({"rotation_class": "joiner"}),
+        headers={"Content-Type": "application/json"},
+    )
+    assert response.status_code == 403
+    data = await response.get_json()
+    assert data.get("rotated") is not True
+
+
+# =============================================================================
 # Real-Postgres proof — penguin-dal conversion (Task 8b)
 # =============================================================================
 #
@@ -295,9 +414,18 @@ def _build_vault_app_pg(
     mirroring ``tenant_middleware``. Pass a ``pg_db_scoped`` fixture as
     ``dal_db`` when using this -- ``pg_db`` (the migration/table owner) is
     RLS-exempt and would prove nothing about scoping.
+
+    Stubs ``auth_required``/``require_scopes`` with passthroughs (F2 fix
+    round added ``@auth_required``/``@require_scopes("gough.cluster.
+    superadmin")`` to the route) -- these tests exercise the DB/RLS
+    conversion, not auth; auth enforcement itself is proven separately by
+    ``test_rotate_keys_unauthenticated_rejected``/
+    ``test_rotate_keys_insufficient_scope_rejected`` below, which
+    deliberately do NOT stub these.
     """
     from quart import Quart, g
     import app.middleware as mw_mod
+    import app.security.scope_enforcement as scope_mod
 
     def _passthrough(*dargs: Any, **dkwargs: Any) -> Any:
         if len(dargs) == 1 and callable(dargs[0]) and not dkwargs:
@@ -305,6 +433,7 @@ def _build_vault_app_pg(
         return lambda fn: fn
 
     monkeypatch.setattr(mw_mod, "auth_required", _passthrough)
+    monkeypatch.setattr(scope_mod, "require_scopes", _passthrough)
 
     import app.api.vault as vault_mod
 
@@ -373,6 +502,17 @@ async def test_rotate_keys_real_postgres_revokes_matching_secrets_only(
     )
     pg_db.commit()
 
+    # Capture the actual DB-stored value (not the Python-side one passed to
+    # the seed helper) so the post-operation comparison below isn't
+    # sensitive to any driver-level rounding -- an exact, not just
+    # not-None, comparison.
+    original_revoked_at = pg_db.executesql(
+        "SELECT revoked_at FROM joiner_secrets WHERE id = %(id)s",
+        {"id": already_revoked_id},
+        as_dict=True,
+    )[0]["revoked_at"]
+    assert original_revoked_at is not None
+
     quart_app = _build_vault_app_pg(dal_db=pg_db, monkeypatch=monkeypatch)
     client = quart_app.test_client()
     response = await client.post(
@@ -391,7 +531,9 @@ async def test_rotate_keys_real_postgres_revokes_matching_secrets_only(
         )
     }
     assert rows[target_id] is not None, "matching active row must be revoked"
-    assert rows[already_revoked_id] is not None, "already-revoked row must be left alone (not re-stamped)"
+    assert rows[already_revoked_id] == original_revoked_at, (
+        "already-revoked row's revoked_at must be UNCHANGED (not re-stamped) by rotate-keys"
+    )
     assert rows[expired_id] is None, "expired row must NOT be revoked"
     assert rows[other_class_id] is None, "different rotation_class must NOT be revoked"
 

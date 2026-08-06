@@ -7,7 +7,9 @@ from datetime import datetime, timezone
 from quart import Blueprint, current_app, jsonify, request
 from prometheus_client import Counter
 
+from ..middleware import auth_required
 from ..models import get_db
+from ..security.scope_enforcement import require_scopes
 
 # Prometheus metrics
 vault_key_rotation_total = Counter(
@@ -20,10 +22,27 @@ vault_bp = Blueprint("vault", __name__)
 
 
 @vault_bp.route("/rotate-keys", methods=["POST"])
+@auth_required
+@require_scopes("gough.cluster.superadmin")
 async def rotate_keys():
     """Operator-triggered key rotation endpoint.
 
-    Requires scope: gough.cluster.superadmin
+    Requires scope: gough.cluster.superadmin (enforced by the decorators
+    above -- mirrors every other superadmin-class endpoint in this codebase,
+    e.g. ``app.api.primary.force_recover_quorum``/``rotate_ipxe_ca``,
+    ``app.api.webhooks``' admin routes: ``@auth_required`` first so an
+    unauthenticated caller gets a clean 401 before anything else runs, then
+    ``@require_scopes(...)`` for the 403 insufficient-scope case).
+
+    Previously had no decorator at all (a stale ``TODO`` assumed the global
+    scope-enforcement middleware alone was sufficient) -- an unauthenticated
+    caller reached the handler, and since the (now-fixed) RLS-protected
+    query fails closed to 0 rows without a tenant on the request, got a
+    misleading ``200 {"rotated": true, "revoked_count": 0}`` instead of
+    being rejected. Fixed here with explicit per-route decorators so this
+    endpoint is safe regardless of whether the global middleware chain is
+    fully wired for a given caller (defense in depth, not a replacement for
+    it).
 
     Request body (JSON):
     {
@@ -38,9 +57,6 @@ async def rotate_keys():
       "revoked_count": 5
     }
     """
-    # TODO: Add scope validation once auth middleware is available
-    # For now, assume the request is authenticated via middleware
-
     data = await request.get_json()
     if not data:
         data = {}
