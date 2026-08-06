@@ -31,16 +31,46 @@ import json
 import logging
 import os
 import time
+from collections.abc import Iterator
+from contextlib import contextmanager
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from typing import Any, Callable, Optional
 
 from prometheus_client import Counter, Gauge
 
-from ..db.database import get_db
+from ..db.rls import CROSS_TENANT_SENTINEL, get_current_tenant, set_current_tenant
+from ..models import get_db
 from . import leader_lease as _leader_lease
 
 logger = logging.getLogger(__name__)
+
+
+@contextmanager
+def _cross_tenant_scope() -> Iterator[None]:
+    """Push the RLS cross-tenant sentinel for one sweep's DB work.
+
+    ``nodes``/``disks`` are RLS-protected (baseline migration ``rls_tables``
+    -- see ``alembic/versions/20260805_1000_baseline_full_schema.py``), and
+    the sweeper is a leader-only background worker that never runs inside
+    Quart's HTTP request pipeline -- ``app.db.rls``'s tenant ContextVar is
+    never set by anything upstream. The sweep is intentionally cluster-wide
+    (every ``ready`` node across every tenant, per the module docstring), so
+    this pushes the sentinel for the duration of ``_sweep()`` -- mirrors
+    ``app.workers.audit_chain_writer._cross_tenant_scope()`` /
+    ``app.grpc_server._cross_tenant_scope()`` (duplicated locally rather than
+    imported, matching this codebase's existing per-module convention).
+    Omitting this would silently fail-closed to zero visible nodes/disks now
+    that ``get_db()`` here resolves to the RLS-wired engine
+    (``app.models.get_db``, wired via ``install_rls_events``) instead of the
+    unwired ``app.db.database`` pool -- not raise, just sweep nothing, ever.
+    """
+    previous = get_current_tenant()
+    set_current_tenant(CROSS_TENANT_SENTINEL)
+    try:
+        yield
+    finally:
+        set_current_tenant(previous)
 
 
 # =============================================================================
@@ -226,33 +256,27 @@ class SMARTSweeper:
         """
         result = SweepResult()
         db = get_db()
-        engine = db.engine
 
-        with engine.connect() as conn:
-            handle = self._lease_mod.acquire(
-                conn, self.LEASE_NAME, ttl_seconds=ttl, holder_id=self._holder_id
-            )
-            try:
-                conn.commit()
-            except Exception:  # pragma: no cover — sqlite may not need it
-                pass
-            if handle is None:
-                logger.debug("smart_sweeper: lease not held — skipping sweep")
-                return result
+        # leader_lease.acquire()/release() take a penguin-dal DB directly
+        # (each of its statements is its own autocommitted db.executesql()
+        # call -- see that module's docstring) -- no raw engine.connect()
+        # or manual commit() needed.
+        handle = self._lease_mod.acquire(
+            db, self.LEASE_NAME, ttl_seconds=ttl, holder_id=self._holder_id
+        )
+        if handle is None:
+            logger.debug("smart_sweeper: lease not held — skipping sweep")
+            return result
 
         result.leader = True
         try:
-            self._sweep(db, result)
+            with _cross_tenant_scope():
+                self._sweep(db, result)
         finally:
-            with engine.connect() as conn:
-                try:
-                    self._lease_mod.release(conn, handle)
-                    try:
-                        conn.commit()
-                    except Exception:  # pragma: no cover
-                        pass
-                except Exception as exc:  # pragma: no cover - defensive
-                    logger.warning("smart_sweeper: failed to release lease: %s", exc)
+            try:
+                self._lease_mod.release(db, handle)
+            except Exception as exc:  # pragma: no cover - defensive
+                logger.warning("smart_sweeper: failed to release lease: %s", exc)
         return result
 
     def run_forever(self, interval_seconds: int = 900) -> None:

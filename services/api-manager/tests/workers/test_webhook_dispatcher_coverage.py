@@ -1,6 +1,9 @@
 """Extended coverage tests for webhook_dispatcher.py missed lines."""
 
 import json
+from datetime import datetime, timezone
+from typing import Any
+
 import pytest
 from unittest.mock import MagicMock, AsyncMock, patch
 import httpx
@@ -245,7 +248,7 @@ class TestWebhookDispatcherEndpointLoading:
     def test_load_endpoints_db_error(self):
         """_load_endpoints returns empty on DB exception."""
         mock_db = MagicMock()
-        mock_db.execute.side_effect = Exception("DB error")
+        mock_db.executesql.side_effect = Exception("DB error")
 
         dispatcher = WebhookDispatcher(db_session=mock_db, vault_client=MagicMock())
 
@@ -257,12 +260,15 @@ class TestWebhookDispatcherEndpointLoading:
     def test_load_endpoints_json_parse_error(self):
         """_load_endpoints handles malformed event_filter JSON."""
         mock_db = MagicMock()
-        mock_row = (
-            "ep1", "tenant1", "http://example.com", "hmac_sha256",
-            '{"invalid": json}',  # Malformed JSON
-            True,
-        )
-        mock_db.execute.return_value.fetchall.return_value = [mock_row]
+        mock_row = {
+            "id": "ep1",
+            "tenant_id": "tenant1",
+            "url": "http://example.com",
+            "signing_mode": "hmac_sha256",
+            "event_filter": '{"invalid": json}',  # Malformed JSON
+            "active": True,
+        }
+        mock_db.executesql.return_value = [mock_row]
 
         dispatcher = WebhookDispatcher(db_session=mock_db, vault_client=MagicMock())
 
@@ -270,6 +276,33 @@ class TestWebhookDispatcherEndpointLoading:
         assert len(endpoints) == 1
         # Should default to empty tuple
         assert endpoints[0].event_filter == ()
+
+    def test_load_endpoints_scopes_and_restores_tenant_guc(self):
+        """_load_endpoints pushes the tenant onto the RLS ContextVar for the
+        read and restores whatever was set beforehand -- regression test for
+        the RLS scoping added alongside the executesql() conversion.
+        """
+        from app.db.rls import get_current_tenant, set_current_tenant
+
+        seen_tenant_during_call = {}
+
+        mock_db = MagicMock()
+
+        def _fake_executesql(*args, **kwargs):
+            seen_tenant_during_call["value"] = get_current_tenant()
+            return []
+
+        mock_db.executesql.side_effect = _fake_executesql
+
+        dispatcher = WebhookDispatcher(db_session=mock_db, vault_client=MagicMock())
+
+        set_current_tenant("previous-tenant")
+        try:
+            list(dispatcher._load_endpoints("tenant1"))
+            assert seen_tenant_during_call["value"] == "tenant1"
+            assert get_current_tenant() == "previous-tenant"
+        finally:
+            set_current_tenant(None)
 
 
 @pytest.mark.asyncio
@@ -478,3 +511,112 @@ class TestWebhookDispatcherClientManagement:
 
         assert dispatcher._owns_http is True
         await dispatcher.aclose()
+
+
+# =============================================================================
+# Real-Postgres RLS proof (Task 8b) — webhook_endpoints is RLS-protected
+# =============================================================================
+#
+# webhook_endpoints was added to the baseline migration's `rls_tables` in
+# Task 6b. This dispatcher is a background worker invoked outside Quart's
+# HTTP request pipeline, so app.db.rls's tenant ContextVar is never set by
+# anything upstream -- an unset GUC fails RLS closed to zero rows. dispatch()
+# always resolves exactly one tenant_id per call, so `_load_endpoints` scopes
+# the GUC to that single tenant for the read (rather than the cross-tenant
+# sentinel `app.grpc_server`/`app.workers.audit_chain_writer` use for units
+# that genuinely span tenants) -- these tests prove that against a real,
+# RLS-enforced connection (`pg_db_scoped`), not just a MagicMock.
+
+
+def _seed_webhook_endpoint(db: Any, tenant_id: str, url: str) -> int:
+    now = datetime.now(timezone.utc)
+    return int(
+        db.webhook_endpoints.insert(
+            tenant_id=tenant_id,
+            url=url,
+            signing_mode="hmac_sha256",
+            active=True,
+            event_filter=[],
+            retry_policy={"mode": "standard"},
+            created_at=now,
+            updated_at=now,
+        )
+    )
+
+
+class TestWebhookDispatcherEndpointLoadingRLS:
+    """``_load_endpoints`` against real Postgres, with RLS genuinely enforced."""
+
+    def test_scoped_role_sees_only_the_requested_tenant(self, pg_db, pg_db_scoped) -> None:
+        """Proves the per-tenant GUC push lets the scoped, non-owner
+        ``api-manager-rw`` role (RLS-enforced, unlike ``pg_db``'s
+        table-owner connection) see the tenant it's dispatching for, and
+        never another tenant's endpoints in the same query -- instead of
+        silently seeing zero endpoints for everyone (fail-closed) or every
+        tenant's endpoints at once (over-broad).
+        """
+        from app.db.rls import install_rls_events, set_current_tenant
+
+        install_rls_events(pg_db_scoped.engine)
+        _seed_webhook_endpoint(pg_db, "tenant-a", "https://a.example.com/hook")
+        _seed_webhook_endpoint(pg_db, "tenant-b", "https://b.example.com/hook")
+        pg_db.commit()
+
+        dispatcher = WebhookDispatcher(db_session=pg_db_scoped, vault_client=MagicMock())
+        try:
+            endpoints_a = list(dispatcher._load_endpoints("tenant-a"))
+            endpoints_b = list(dispatcher._load_endpoints("tenant-b"))
+        finally:
+            set_current_tenant(None)
+
+        assert [e.url for e in endpoints_a] == ["https://a.example.com/hook"]
+        assert [e.url for e in endpoints_b] == ["https://b.example.com/hook"]
+
+    def test_load_endpoints_restores_previous_tenant_guc(self, pg_db, pg_db_scoped) -> None:
+        """_load_endpoints must restore whatever tenant was set before it
+        ran, not leave its own tenant pushed -- proven by a subsequent read
+        under the restored (different) tenant seeing only that tenant's row.
+        """
+        from app.db.rls import install_rls_events, set_current_tenant
+
+        install_rls_events(pg_db_scoped.engine)
+        _seed_webhook_endpoint(pg_db, "tenant-a", "https://a.example.com/hook")
+        _seed_webhook_endpoint(pg_db, "tenant-c", "https://c.example.com/hook")
+        pg_db.commit()
+
+        dispatcher = WebhookDispatcher(db_session=pg_db_scoped, vault_client=MagicMock())
+        set_current_tenant("tenant-c")
+        try:
+            list(dispatcher._load_endpoints("tenant-a"))
+            rows = pg_db_scoped.executesql(
+                "SELECT url FROM webhook_endpoints WHERE active = TRUE"
+            )
+        finally:
+            set_current_tenant(None)
+
+        assert rows == [("https://c.example.com/hook",)], (
+            "_load_endpoints must restore the caller's previous tenant GUC afterwards"
+        )
+
+    def test_fails_closed_without_scoping(self, pg_db, pg_db_scoped) -> None:
+        """Negative control: the exact failure mode the per-tenant GUC push
+        in ``_load_endpoints`` prevents -- reading ``webhook_endpoints``
+        under an unset tenant GUC (the scoped role's default) sees zero
+        rows even though a real, matching row exists. Without the fix in
+        ``_load_endpoints``, every ``dispatch()`` call would silently
+        deliver to nobody.
+        """
+        from app.db.rls import install_rls_events, set_current_tenant
+
+        install_rls_events(pg_db_scoped.engine)
+        _seed_webhook_endpoint(pg_db, "tenant-a", "https://a.example.com/hook")
+        pg_db.commit()
+
+        set_current_tenant(None)
+        rows = pg_db_scoped.executesql(
+            "SELECT COUNT(*) FROM webhook_endpoints WHERE tenant_id = %(t)s AND active = TRUE",
+            {"t": "tenant-a"},
+        )
+        assert rows[0][0] == 0, (
+            "unset tenant GUC must fail closed on RLS-protected webhook_endpoints"
+        )
