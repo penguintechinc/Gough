@@ -68,8 +68,16 @@ class TestValidateDatabaseSchema:
 
     @patch("app.models_sqlalchemy.get_sqlalchemy_engine")
     @patch("sqlalchemy.inspect")
-    def test_validate_database_schema_success(self, mock_inspect_cls, mock_get_engine):
-        """Test validate_database_schema() returns True when schema valid."""
+    @patch("app.models.DB")
+    def test_validate_database_schema_success(self, mock_db_cls, mock_inspect_cls, mock_get_engine):
+        """Test validate_database_schema() returns True when schema valid.
+
+        The admin-exists check (former ``engine.connect()`` + raw
+        ``text("SELECT COUNT(*) ...")``) is now a penguin-dal runtime query
+        against a short-lived ``DB`` instance (task-7b) -- mock the ``DB``
+        class itself and its ``count()`` chain instead of a SQLAlchemy
+        connection/cursor.
+        """
         mock_engine = MagicMock()
         mock_get_engine.return_value = mock_engine
 
@@ -90,17 +98,16 @@ class TestValidateDatabaseSchema:
             {"name": "fs_uniquifier"},
         ]
 
-        # Mock admin exists check
-        mock_conn = MagicMock()
-        mock_engine.connect.return_value.__enter__.return_value = mock_conn
-        mock_result = MagicMock()
-        mock_result.scalar.return_value = 1
-        mock_conn.execute.return_value = mock_result
+        # Mock admin exists check: check_db(query).count() -> 1
+        mock_check_db = MagicMock()
+        mock_db_cls.return_value = mock_check_db
+        mock_check_db.return_value.count.return_value = 1
 
         with patch("builtins.print"):
             result = validate_database_schema("sqlite:///test.db")
 
         assert result is True
+        mock_check_db.close.assert_called_once()
 
     @patch("app.models_sqlalchemy.get_sqlalchemy_engine")
     @patch("sqlalchemy.inspect")
@@ -151,8 +158,14 @@ class TestValidateDatabaseSchema:
 
     @patch("app.models_sqlalchemy.get_sqlalchemy_engine")
     @patch("sqlalchemy.inspect")
-    def test_validate_database_schema_no_admin(self, mock_inspect_cls, mock_get_engine):
-        """Test validate_database_schema() returns False when admin missing."""
+    @patch("app.models.DB")
+    def test_validate_database_schema_no_admin(self, mock_db_cls, mock_inspect_cls, mock_get_engine):
+        """Test validate_database_schema() returns False when admin missing.
+
+        See ``test_validate_database_schema_success`` docstring for why the
+        admin-exists check now mocks ``app.models.DB`` rather than a
+        SQLAlchemy connection.
+        """
         mock_engine = MagicMock()
         mock_get_engine.return_value = mock_engine
 
@@ -171,17 +184,61 @@ class TestValidateDatabaseSchema:
             {"name": "fs_uniquifier"},
         ]
 
-        # No admin exists (count = 0)
-        mock_conn = MagicMock()
-        mock_engine.connect.return_value.__enter__.return_value = mock_conn
-        mock_result = MagicMock()
-        mock_result.scalar.return_value = 0  # No admin
-        mock_conn.execute.return_value = mock_result
+        # No admin exists: check_db(query).count() -> 0
+        mock_check_db = MagicMock()
+        mock_db_cls.return_value = mock_check_db
+        mock_check_db.return_value.count.return_value = 0
 
         with patch("builtins.print"):
             result = validate_database_schema("sqlite:///test.db")
 
         assert result is False
+        mock_check_db.close.assert_called_once()
+
+
+class TestValidateDatabaseSchemaRealPostgres:
+    """Real-Postgres proof of the admin-exists penguin-dal conversion (task-7b).
+
+    Unlike the mock-based tests above, this exercises the real
+    ``penguin_dal.DB(...).count()`` call end to end against Postgres --
+    proving the conversion actually queries the right table/column, not
+    just that ``app.models.DB`` gets constructed.
+
+    ``pg_url``'s Postgres instance is session-scoped and shared with the M1
+    Alembic-baseline fixtures (``pg_db``/``pg_db_scoped``) -- ``auth_user``
+    is a separate, non-Alembic-managed table set (see ``app.models.init_db``:
+    SQLAlchemy ``Base.metadata`` for legacy auth tables, Alembic for the M1
+    baseline), so creating it here doesn't collide with the M1 schema.
+    ``pg_db``'s per-test TRUNCATE reflects and wipes every table it finds,
+    including ``auth_user`` if a prior test already created it -- this test
+    doesn't assume ``auth_user`` starts empty/absent; it explicitly deletes
+    any pre-existing admin row before asserting the "missing" branch.
+    """
+
+    def test_admin_missing_then_present(self, pg_url: str) -> None:
+        from sqlalchemy.orm import sessionmaker
+
+        from app import models_m1  # noqa: F401 — registers M1 ORM classes on Base.metadata
+        from app.models_sqlalchemy import AuthUser, Base, create_all_tables, get_sqlalchemy_engine
+
+        engine = get_sqlalchemy_engine(pg_url)
+        Base.metadata.create_all(engine)  # schema only — no seed data yet
+
+        session = sessionmaker(bind=engine)()
+        try:
+            session.query(AuthUser).filter_by(email="admin@gough.local").delete()
+            session.commit()
+        finally:
+            session.close()
+
+        with patch("builtins.print"):
+            assert validate_database_schema(pg_url) is False
+
+        with patch("builtins.print"):
+            create_all_tables(pg_url)  # seeds the default admin@gough.local row
+
+        with patch("builtins.print"):
+            assert validate_database_schema(pg_url) is True
 
 
 class TestInitDb:
