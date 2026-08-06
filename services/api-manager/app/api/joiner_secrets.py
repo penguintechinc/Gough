@@ -2,8 +2,9 @@
 
 Per Gough spec Sprint 4 (Biome Model -> Joiner Secrets). All endpoints are
 tenant-scoped; cluster-id from the URL is filtered against the JWT's tenant
-claim through Layer 4 RLS (the GUC ``app.current_tenant`` is set by
-``app.security.tenant.set_tenant_guc``).
+claim through Layer 4 RLS (the GUC ``app.current_tenant`` is pushed via the
+``contextvars.ContextVar`` in ``app.db.rls``, applied to every penguin-dal
+connection on pool checkout -- see ``app.security.tenant.tenant_middleware``).
 
 Response payloads NEVER expose any portion of the encrypted envelope. The
 fields ``ciphertext``, ``dek_wrapped``, ``iv``, and ``auth_tag`` are read
@@ -34,7 +35,6 @@ from app.security.credentials import (
 )
 from app.security.joiner_envelope import zero_bytes
 from app.security.scope_enforcement import require_scopes
-from app.security.tenant import set_tenant_guc
 from app.workers.joiner_secret_emitter import (
     ExtractedMaterial,
     persist_extracted_material,
@@ -57,24 +57,6 @@ DEFAULT_MFA_REQUIRED_LANES: frozenset[str] = frozenset({"fedramp", "hipaa", "pci
 # =============================================================================
 # Helpers
 # =============================================================================
-
-
-def _get_db_session() -> Any:
-    """Return the SQLAlchemy session attached to ``flask.g`` or the app.
-
-    The Quart factory binds either ``g.db_session`` (request scope) or
-    ``current_app.db_session_factory()`` for ad-hoc use. This wrapper is the
-    single point of indirection so tests can monkey-patch ``g.db_session``.
-    """
-    sess = g.get("db_session", None)
-    if sess is not None:
-        return sess
-    factory = current_app.config.get("DB_SESSION_FACTORY")
-    if factory is None:
-        raise RuntimeError("No DB session bound to request context")
-    sess = factory()
-    g.db_session = sess
-    return sess
 
 
 def _get_tenant_id() -> str:
@@ -112,7 +94,15 @@ def _get_actor_scope() -> list[str]:
 
 
 def _build_audit_writer(cluster_id: uuid.UUID) -> AuditEventWriter:
-    """Construct an AuditEventWriter bound to the cluster + Vault transit signer."""
+    """Construct an AuditEventWriter bound to the cluster + Vault transit signer.
+
+    ``AuditEventWriter`` (``app.security.audit_chain``, Task 8a) takes a
+    penguin-dal ``DB`` instance despite the constructor keyword still being
+    named ``db_session`` -- ``get_db()`` is the same connection-pool-backed
+    instance the ContextVar-wired RLS events (``app.db.rls``) apply the
+    tenant GUC to on checkout, so the writer's chain-head read + insert are
+    tenant-scoped exactly like every other penguin-dal call in this module.
+    """
     vault_client = current_app.config.get("VAULT_CLIENT")
     signer = None
     if vault_client is not None:
@@ -127,7 +117,7 @@ def _build_audit_writer(cluster_id: uuid.UUID) -> AuditEventWriter:
         signer = _signer
 
     return AuditEventWriter(
-        db_session=_get_db_session(),
+        db_session=get_db(),
         cluster_id=str(cluster_id),
         signer=signer,
     )
@@ -235,11 +225,10 @@ async def list_joiner_secrets(cluster_id: uuid.UUID):
         scope: optional filter
         status: ``active|expiring-soon|revoked`` filter
 
-    Runtime read via the penguin-dal overlay (``get_db()``) -- no other
-    SQLAlchemy-session-bound call in this handler, so (matching
-    ``list_audit_events``) it does not call
-    ``set_tenant_guc``/``_get_db_session()`` either; tenant isolation is the
-    explicit ``tenant_id ==`` filter below, same as every other
+    Runtime read via the penguin-dal overlay (``get_db()``) -- tenant
+    isolation is both the explicit ``tenant_id ==`` filter below
+    (Layer 1/2 app-level scoping) and RLS via the ContextVar the tenant
+    middleware already set (``app.db.rls``), same as every other
     penguin-dal-backed API module in this service.
     """
     tenant_id = _get_tenant_id()
@@ -433,7 +422,14 @@ async def rotate_joiner_secret(cluster_id: uuid.UUID, js_id: uuid.UUID):
 )
 @require_scopes("gough.cluster.admin")
 async def revoke_joiner_secret(cluster_id: uuid.UUID, js_id: uuid.UUID):
-    """Revoke a joiner secret (sets ``revoked_at``; never hard-deletes)."""
+    """Revoke a joiner secret (sets ``revoked_at``; never hard-deletes).
+
+    The revoke-mark and the self-audit-log write (via ``_build_audit_writer``
+    -> ``AuditEventWriter``) both go through the same penguin-dal overlay
+    (``get_db()``) now -- tenant scoping comes from RLS via the ContextVar
+    the tenant middleware already set (``app.db.rls``), same as every other
+    penguin-dal-backed handler in this module. No explicit GUC call needed.
+    """
     tenant_id = _get_tenant_id()
     body = await request.get_json(silent=True) or {}
     reason = body.get("reason")
@@ -443,9 +439,6 @@ async def revoke_joiner_secret(cluster_id: uuid.UUID, js_id: uuid.UUID):
             400,
         )
 
-    # Same split as rotate_joiner_secret: penguin-dal for the runtime
-    # lookup/mark, `_get_db_session()` kept for the out-of-scope
-    # AuditEventWriter call below.
     db = get_db()
     row: Any = (
         db(
@@ -464,9 +457,6 @@ async def revoke_joiner_secret(cluster_id: uuid.UUID, js_id: uuid.UUID):
     now = datetime.now(timezone.utc)
     db(db.joiner_secrets.id == str(js_id)).update(revoked_at=now)
     row.revoked_at = now
-
-    db_session = _get_db_session()
-    set_tenant_guc(db_session, tenant_id)
 
     audit_writer = _build_audit_writer(cluster_id)
     audit_writer.append(

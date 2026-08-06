@@ -6,20 +6,26 @@ enables RLS + a ``tenant_isolation`` policy on every tenant-scoped table::
     USING (current_setting('app.current_tenant', true) IN (tenant_id, '__default__', '__all__'))
 
 but nothing ever attached the ``app.current_tenant`` GUC to the connection the
-app's queries actually run on. ``app.security.tenant.set_tenant_guc()`` sets
-it transaction-locally (``set_config(..., true)``) on a connection object the
-caller has to pass in -- none of penguin-dal's request-scoped query paths
-ever did, so for the scoped ``api-manager-rw`` role (table owners are
-RLS-exempt, which is why this went unnoticed) RLS silently filtered every
-row to zero and the app has been relying entirely on its own app-level
-tenant filters.
+app's queries actually run on. ``app.security.tenant.set_tenant_guc()`` (now
+removed -- see below) set it transaction-locally (``set_config(..., true)``)
+on a connection object the caller had to pass in -- none of penguin-dal's
+request-scoped query paths ever did, so for the scoped ``api-manager-rw``
+role (table owners are RLS-exempt, which is why this went unnoticed) RLS
+silently filtered every row to zero and the app has been relying entirely on
+its own app-level tenant filters.
 
 This module closes that gap for the request-path connection pool -- the
 engine backing ``app.config["db"]`` (``app.models.get_db()``, wired via
 ``install_rls_events`` in ``app.models.init_db``) -- by hanging the GUC
-set/reset off that pool's own ``checkout``/``checkin`` events, rather than
-by having every call site thread a connection through ``set_tenant_guc`` by
-hand. It does NOT cover the separate thread-local ``DB`` pool in
+set/reset off that pool's own ``checkout``/``checkin`` events, rather than by
+having every call site thread a connection through a helper like the old
+``set_tenant_guc`` by hand. That function's last three call sites
+(``app.api.audit.verify_audit_chain``/``export_audit_log``,
+``app.api.joiner_secrets.revoke_joiner_secret``) were deleted in the FIX #7a
+cleanup, and the function itself was removed from
+``app.security.tenant`` -- this module (installed once, at engine-init time)
+is now the sole mechanism that applies the GUC. It does NOT cover the
+separate thread-local ``DB`` pool in
 ``app.db.database`` (``get_db()`` there, keyed off ``DATABASE_URL``) --
 that pool has no RLS wiring at all today; nothing in this codebase should
 be using it for tenant-scoped reads until it's either wired the same way or

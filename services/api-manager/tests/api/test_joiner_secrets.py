@@ -230,11 +230,16 @@ def _build_app(
 ) -> Quart:
     """Build a Quart app with ``joiner_secrets_bp`` registered.
 
-    ``rows``/``FakeSession`` back the still-SQLAlchemy-session-based paths
-    (``g.db_session``, used by ``AuditEventWriter``). Pass ``dal_db`` (a
-    real ``pg_db``) + ``monkeypatch`` together to also patch
-    ``joiner_module.get_db`` for the penguin-dal-converted
-    lookup/list/revoke-mark logic.
+    ``rows``/``FakeSession``/``DB_SESSION_FACTORY``/``g.db_session`` are
+    legacy scaffolding from before FIX #7a's cleanup -- ``AuditEventWriter``
+    (via ``_build_audit_writer``) now gets its ``DB`` from ``get_db()`` like
+    every other penguin-dal call in this module, so nothing in production
+    code reads ``g.db_session``/``DB_SESSION_FACTORY`` anymore. Left wired
+    here (harmless, unused) rather than ripped out as a separate cleanup.
+    Pass ``dal_db`` (a real ``pg_db``) + ``monkeypatch`` together to patch
+    ``joiner_module.get_db`` for the penguin-dal-backed
+    lookup/list/revoke-mark/audit-write logic -- required for any test that
+    reaches ``revoke_joiner_secret``'s audit-writer call.
 
     ``rls_scoped=True`` additionally wires ``app.db.rls``'s pool
     checkout/checkin GUC events onto ``dal_db.engine`` and pushes
@@ -839,9 +844,11 @@ class TestRotateJoinerSecret:
 
 @pytest.mark.asyncio
 class TestRevokeJoinerSecret:
-    """Same split as TestRotateJoinerSecret: lookup + revoke-mark via
-    penguin-dal (``pg_db``), ``AuditEventWriter`` stays on the SQLAlchemy
-    session. ``test_revoke_missing_reason``/``test_revoke_requires_admin_scope``
+    """Lookup + revoke-mark + the self-audit-log write (``AuditEventWriter``
+    via ``_build_audit_writer``) all go through the penguin-dal overlay
+    (``get_db()``, patched via ``dal_db=pg_db``) now (FIX #7a cleanup) --
+    every non-error-path test here needs ``dal_db``/``monkeypatch``.
+    ``test_revoke_missing_reason``/``test_revoke_requires_admin_scope``
     return before ``get_db()`` is called, so they're unchanged.
     """
 
@@ -864,6 +871,77 @@ class TestRevokeJoinerSecret:
         for forbidden in SECRET_FIELDS_MUST_BE_ABSENT:
             assert forbidden not in body["revoked"]
         assert body["revoked"]["status"] == "revoked"
+
+    async def test_revoke_self_audit_write_succeeds_under_rls_and_is_tenant_scoped(
+        self, pg_db: Any, pg_db_scoped: Any, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Regression for the ``set_tenant_guc`` removal (FIX #7a cleanup).
+
+        The self-audit-log write inside ``revoke_joiner_secret``
+        (``_build_audit_writer`` -> ``AuditEventWriter.append()``) used to
+        run through ``set_tenant_guc(_get_db_session(), tenant_id)`` --
+        ``_get_db_session()`` always raised ``RuntimeError`` in production
+        (``DB_SESSION_FACTORY`` is never wired into ``create_app()``), so
+        this write never actually happened outside of tests. Exercised here
+        against the real, non-owner ``api-manager-rw`` role
+        (``pg_db_scoped``, not the RLS-exempt ``pg_db`` owner) to prove two
+        things at once: the write succeeds under genuine RLS enforcement
+        (the ``tenant_isolation`` policy's ``USING`` clause doubles as its
+        ``WITH CHECK`` since the baseline migration defines no separate one
+        -- the requesting tenant's own INSERT must satisfy it), and a
+        different tenant's RLS-scoped connection cannot see the row --
+        i.e. removing ``set_tenant_guc`` did not weaken isolation, because
+        the ContextVar pool-checkout event (``app.db.rls``) covers it.
+        """
+        cluster_id = uuid.uuid4()
+        secret_id = _seed_joiner_secret(
+            pg_db, cluster_id=cluster_id, tenant_id="tenant-a"
+        )
+        principal = _principal(scopes={"gough.cluster.admin"}, tenant="tenant-a")
+        app = _build_app(
+            rows=[],
+            principal=principal,
+            dal_db=pg_db_scoped,
+            monkeypatch=monkeypatch,
+            rls_scoped=True,
+        )
+        client = app.test_client()
+        resp = await client.delete(
+            f"/api/v1/clusters/{cluster_id}/joiner-secrets/{secret_id}",
+            json={"reason": "rls regression check"},
+        )
+        assert resp.status_code == 200
+
+        # Read back via the owner role (RLS-exempt) -- proves the row was
+        # actually persisted, carrying the requesting tenant's own
+        # tenant_id, not silently dropped or mis-scoped.
+        written = (
+            pg_db(
+                (pg_db.audit_events.action == "joiner.secret.revoke")
+                & (pg_db.audit_events.resource_id == secret_id)
+            )
+            .select()
+            .first()
+        )
+        assert written is not None
+        assert written.tenant_id == "tenant-a"
+
+        # A different tenant's RLS-scoped connection must NOT see it.
+        from app.db.rls import set_current_tenant
+
+        set_current_tenant("tenant-b")
+        try:
+            invisible = (
+                pg_db_scoped(
+                    (pg_db_scoped.audit_events.action == "joiner.secret.revoke")
+                    & (pg_db_scoped.audit_events.resource_id == secret_id)
+                )
+                .select()
+                .first()
+            )
+        finally:
+            set_current_tenant(None)
+        assert invisible is None
 
     async def test_revoke_missing_reason(self) -> None:
         cluster_id = uuid.uuid4()

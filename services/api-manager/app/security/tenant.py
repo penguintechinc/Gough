@@ -8,7 +8,6 @@ from __future__ import annotations
 
 from typing import Optional
 from pydantic import BaseModel, Field
-from sqlalchemy import text
 from quart import g
 
 
@@ -100,34 +99,6 @@ def assert_tenant_match(token_tenant: str, body_tenant: Optional[str]) -> None:
             f"Request body tenant_id ({body_tenant}) "
             f"does not match JWT tenant ({token_tenant})"
         )
-
-
-# ==============================================================================
-# PostgreSQL GUC Management
-# ==============================================================================
-
-def set_tenant_guc(db_connection, tenant_id: str) -> None:
-    """Set PostgreSQL 'app.current_tenant' GUC for RLS policies.
-
-    Executes: SELECT set_config('app.current_tenant', :tenant_id, true)
-    - Third argument 'true' = local scope (transaction-scoped).
-    - Uses parameterized query to prevent SQL injection.
-
-    Sync function: penguin-dal is the runtime authority per backend-database.md
-    and is sync. The Quart middleware that calls this is `async def` but runs
-    this single statement directly because the operation is microseconds and
-    blocks the event loop only briefly — switching to an async SQLAlchemy
-    engine is M2 work tied to penguin-dal's async upgrade.
-
-    Args:
-        db_connection: SQLAlchemy connection object (sync).
-        tenant_id: Tenant ID to set in GUC.
-
-    Raises:
-        Exception: If set_config fails (database error).
-    """
-    query = text("SELECT set_config('app.current_tenant', :tenant_id, true)")
-    db_connection.execute(query, {"tenant_id": tenant_id})
 
 
 # ==============================================================================

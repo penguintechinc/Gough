@@ -156,11 +156,18 @@ class _FakeTx:
 
 
 class FakeSession:
-    """Dual-interface test double -- see ``_build_app`` docstring for why
-    this needs to satisfy both a SQLAlchemy-``Connection``-shaped
-    ``execute()`` (``set_tenant_guc``) and a penguin-dal-``DB``-shaped
-    ``transaction()`` (``AuditEventWriter``/``verify_chain``) on the SAME
-    object -- a real object of either type could never do both.
+    """Legacy dual-interface test double.
+
+    Predates the FIX #7a cleanup that removed ``set_tenant_guc`` and
+    converted ``verify_audit_chain``/``export_audit_log``/
+    ``_build_audit_writer`` to ``get_db()`` (penguin-dal, ContextVar-wired
+    RLS) -- nothing in ``app.api.audit`` reads ``g.db_session`` anymore, so
+    the ``execute()`` half of this double (originally there for
+    ``set_tenant_guc``) is now unused. Left wired via
+    ``DB_SESSION_FACTORY``/``g.db_session`` in ``_build_app`` (harmless) and
+    the ``transaction()``/``executesql()`` half (``_FakeTx``) is kept in
+    case a future test wants a lightweight penguin-dal stand-in that
+    doesn't need a real Postgres instance.
     """
 
     def __init__(self, rows: list[Any]) -> None:
@@ -230,22 +237,18 @@ def _build_app(
 ) -> Quart:
     """Build a Quart app with ``audit_bp`` registered.
 
-    ``rows``/``FakeSession`` back the still-SQLAlchemy-session-shaped path
-    (``g.db_session``, via ``_get_db_session()``) that ``set_tenant_guc()``
-    (a real ``Connection.execute()`` call) and ``AuditEventWriter``/
-    ``verify_chain`` (penguin-dal ``.transaction()``/``Tx.executesql()``,
-    Task 8a) both read off the SAME ``db_session`` variable in
-    ``export_audit_log``/``verify_audit_chain`` despite needing genuinely
-    different, mutually-incompatible APIs -- a real SQLAlchemy Session and a
-    real penguin-dal ``DB`` can't both satisfy this at once, which is a
-    pre-existing inconsistency in ``app.api.audit`` itself (out of scope for
-    this fixture to fix; flagged in the Task 8a report). ``FakeSession``
-    implements both surfaces as a test double so this endpoint's other
-    behavior (scope/MFA enforcement, JSONL stream shape, footer signature,
-    NATS publish) is still testable without editing that production file.
-    Pass ``dal_db`` (a real ``pg_db``) + ``monkeypatch`` together to also
-    patch ``audit_module.get_db`` for handlers converted to the penguin-dal
-    overlay (``list_audit_events`` / ``export_audit_log``'s export stream).
+    ``rows``/``FakeSession``/``DB_SESSION_FACTORY``/``g.db_session`` are
+    legacy scaffolding, predating the FIX #7a cleanup that removed
+    ``set_tenant_guc`` and converted ``verify_audit_chain``/
+    ``export_audit_log``/``_build_audit_writer`` to ``get_db()`` (the same
+    penguin-dal overlay ``list_audit_events`` already used, ContextVar-wired
+    RLS via ``app.db.rls``). Nothing in ``app.api.audit`` reads
+    ``g.db_session``/``DB_SESSION_FACTORY`` anymore; left wired here
+    (harmless, unused) rather than ripped out as a separate cleanup. Pass
+    ``dal_db`` (a real ``pg_db``) + ``monkeypatch`` together to patch
+    ``audit_module.get_db`` -- required for any test that reaches
+    ``list_audit_events``, ``verify_audit_chain``, or ``export_audit_log``'s
+    export-stream / self-audit-write logic.
 
     ``rls_scoped=True`` additionally wires ``app.db.rls``'s pool
     checkout/checkin GUC events onto ``dal_db.engine`` and pushes
@@ -635,6 +638,45 @@ class TestVerifyAuditChain:
         resp = await client.post("/api/v1/audit/verify", json={})
         assert resp.status_code == 403
 
+    async def test_verify_rls_scopes_to_requesting_tenant(
+        self, pg_db: Any, pg_db_scoped: Any, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Regression for the ``set_tenant_guc`` removal (FIX #7a cleanup).
+
+        ``verify_audit_chain`` used to call
+        ``set_tenant_guc(_get_db_session(), tenant_id)`` before
+        ``verify_chain`` -- ``_get_db_session()`` always raised
+        ``RuntimeError`` in production (``DB_SESSION_FACTORY`` is never
+        wired into ``create_app()``), so this endpoint never actually ran a
+        real query outside of tests that monkeypatch ``verify_chain``
+        entirely (see ``test_verify_clean_chain`` above). Exercised here
+        for real against the non-owner ``api-manager-rw`` role
+        (``pg_db_scoped``), with ``verify_chain`` NOT monkeypatched,
+        proving RLS -- via the ContextVar the tenant middleware sets
+        (``app.db.rls``) -- scopes the read to the requesting tenant's own
+        rows: not another tenant's, and not zero (fail-closed) either.
+        Chain-hash validity itself is covered separately by
+        ``test_verify_tampered_increments_counter``; ``_seed_audit_event``'s
+        dummy ``hash``/``prev_hash`` values aren't cryptographically linked,
+        so ``breaks`` isn't asserted here -- only row-count tenant scoping.
+        """
+        _seed_audit_event(pg_db, tenant_id="tenant-a", action="a.action")
+        _seed_audit_event(pg_db, tenant_id="tenant-a", action="a.action.2")
+        _seed_audit_event(pg_db, tenant_id="tenant-b", action="b.action")
+
+        app = _build_app(
+            rows=[],
+            principal=_principal(scopes={"gough.audit.read"}, tenant="tenant-a"),
+            dal_db=pg_db_scoped,
+            monkeypatch=monkeypatch,
+            rls_scoped=True,
+        )
+        client = app.test_client()
+        resp = await client.post("/api/v1/audit/verify", json={})
+        assert resp.status_code == 200
+        body = await resp.get_json()
+        assert body["rows_checked"] == 2
+
 
 # =============================================================================
 # Streaming export internals
@@ -767,6 +809,16 @@ class TestExportAuditLog:
     async def test_export_streams_jsonl_and_signs(
         self, pg_db: Any, monkeypatch: pytest.MonkeyPatch
     ) -> None:
+        """2 seeded rows + footer, PLUS the endpoint's own self-audit-log
+        row (``action="audit.log.export"``) -- since FIX #7a's cleanup,
+        ``_build_audit_writer`` writes that row via ``get_db()`` (patched
+        to this same real ``pg_db``) *before* the export stream is built,
+        so the stream (deliberately cross-tenant/unfiltered, see
+        ``_stream_audit_events_jsonl``) now genuinely includes it. Before
+        that cleanup this write silently went to a ``FakeSession`` double
+        instead of real Postgres, so it never showed up here -- 4 lines is
+        the corrected count, not a regression.
+        """
         _seed_audit_event(pg_db)
         _seed_audit_event(pg_db)
         nats_client = MagicMock()
@@ -783,9 +835,12 @@ class TestExportAuditLog:
         resp = await client.get("/api/v1/audit/export?target_sub=auditor@acme")
         assert resp.status_code == 200
         body = (await resp.get_data()).decode("utf-8").strip().splitlines()
-        assert len(body) == 3  # 2 rows + footer
+        assert len(body) == 4  # 2 seeded rows + self-audit-log row + footer
+        actions = [json.loads(line)["action"] for line in body[:-1]]
+        assert "audit.log.export" in actions
         footer = json.loads(body[-1])
         assert footer["_signature"] is True
+        assert footer["rows_exported"] == 3
         assert footer["target_sub"] == "auditor@acme"
         assert footer["signature"] == "vault:v1:export-signature"
         # NATS publish was called with the right subject
@@ -828,6 +883,69 @@ class TestExportAuditLog:
         client = app.test_client()
         resp = await client.get("/api/v1/audit/export")
         assert resp.status_code == 200
+
+    async def test_export_self_audit_write_succeeds_under_rls_and_is_tenant_scoped(
+        self, pg_db: Any, pg_db_scoped: Any, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Regression for the ``set_tenant_guc`` removal (FIX #7a cleanup).
+
+        The self-audit-log write inside ``export_audit_log``
+        (``_build_audit_writer`` -> ``AuditEventWriter.append()``) used to
+        run through ``set_tenant_guc(_get_db_session(), tenant_id)`` --
+        ``_get_db_session()`` always raised ``RuntimeError`` in production
+        (``DB_SESSION_FACTORY`` is never wired into ``create_app()``), so
+        this write never actually happened outside of tests. Exercised here
+        against the real, non-owner ``api-manager-rw`` role
+        (``pg_db_scoped``) to prove the write succeeds under genuine RLS
+        enforcement and is correctly scoped to the requesting tenant -- a
+        different tenant's RLS-scoped connection cannot see the row.
+
+        The export STREAM itself remaining single-tenant-scoped under a
+        non-``cross_tenant`` token (rather than seeing every tenant) is a
+        separate, pre-existing, already-flagged gap -- see
+        ``app.security.audit_chain``'s module docstring -- not exercised
+        here; this test is only about the self-audit-write's isolation.
+        """
+        principal = _principal(
+            scopes={"gough.cluster.superadmin"}, mfa=True, tenant="tenant-a"
+        )
+        app = _build_app(
+            rows=[],
+            principal=principal,
+            dal_db=pg_db_scoped,
+            monkeypatch=monkeypatch,
+            rls_scoped=True,
+        )
+        client = app.test_client()
+        resp = await client.get("/api/v1/audit/export?target_sub=auditor@acme")
+        assert resp.status_code == 200
+        await resp.get_data()  # drain the stream
+
+        written = (
+            pg_db(
+                (pg_db.audit_events.action == "audit.log.export")
+                & (pg_db.audit_events.tenant_id == "tenant-a")
+            )
+            .select()
+            .first()
+        )
+        assert written is not None
+
+        from app.db.rls import set_current_tenant
+
+        set_current_tenant("tenant-b")
+        try:
+            invisible = (
+                pg_db_scoped(
+                    (pg_db_scoped.audit_events.action == "audit.log.export")
+                    & (pg_db_scoped.audit_events.id == written.id)
+                )
+                .select()
+                .first()
+            )
+        finally:
+            set_current_tenant(None)
+        assert invisible is None
 
 
 # =============================================================================

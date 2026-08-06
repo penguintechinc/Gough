@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import pytest
-from unittest.mock import MagicMock
 
 from app.security.scope_policy import assert_policy_well_formed, SCOPE_POLICY, ANONYMOUS_PATHS
 from app.security.tenant import (
@@ -144,21 +143,3 @@ class TestTenantContextModel:
         """Test tenant_id min_length validation."""
         with pytest.raises(Exception):  # Pydantic validation error
             TenantContext(tenant_id="")
-
-
-class TestTenantMiddlewareLogic:
-    """Tests for tenant middleware (lines 187-193 when used in integration)."""
-
-    def test_set_tenant_guc_mock(self):
-        """Test set_tenant_guc constructs correct SQL."""
-        from app.security.tenant import set_tenant_guc
-        from sqlalchemy import text
-
-        # Mock connection
-        conn = MagicMock()
-        set_tenant_guc(conn, "test-tenant")
-
-        # Verify execute was called
-        conn.execute.assert_called_once()
-        call_args = conn.execute.call_args
-        assert call_args[0][1]["tenant_id"] == "test-tenant"

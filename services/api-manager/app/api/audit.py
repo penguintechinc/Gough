@@ -37,7 +37,6 @@ from app.security.audit_chain import (
     verify_chain,
 )
 from app.security.scope_enforcement import require_scopes
-from app.security.tenant import set_tenant_guc
 
 from ..models import get_db
 
@@ -67,6 +66,16 @@ MAX_PAGE_SIZE = 1000
 
 
 def _get_db_session() -> Any:
+    """Return a SQLAlchemy-session-shaped object bound to the request.
+
+    No longer used by any handler in this module (FIX #6a/#7a converted
+    ``verify_audit_chain``/``export_audit_log``/``_build_audit_writer`` to
+    penguin-dal's ``get_db()`` + the ContextVar-wired RLS pool events --
+    see ``app.db.rls``). Kept only because ``app.grpc_server``'s
+    ``AuditServicer.AppendEvent`` still imports it directly; that handler
+    remains documented out-of-scope dead code (``DB_SESSION_FACTORY`` is
+    never wired into ``create_app()``, so this always raises below).
+    """
     sess = g.get("db_session", None)
     if sess is not None:
         return sess
@@ -180,6 +189,15 @@ def _serialize_audit_event(row: Any) -> dict[str, Any]:
 
 
 def _build_audit_writer(cluster_id: str) -> AuditEventWriter:
+    """Construct an ``AuditEventWriter`` bound to the penguin-dal overlay.
+
+    ``AuditEventWriter`` (``app.security.audit_chain``, Task 8a) takes a
+    penguin-dal ``DB`` instance despite the constructor keyword still being
+    named ``db_session`` -- ``get_db()`` is the same connection-pool-backed
+    instance the ContextVar-wired RLS events (``app.db.rls``) apply the
+    tenant GUC to on checkout, so the writer's chain-head read + insert are
+    tenant-scoped exactly like every other penguin-dal call in this module.
+    """
     vault_client = current_app.config.get("VAULT_CLIENT")
     signer = None
     if vault_client is not None:
@@ -193,7 +211,7 @@ def _build_audit_writer(cluster_id: str) -> AuditEventWriter:
 
         signer = _signer
     return AuditEventWriter(
-        db_session=_get_db_session(), cluster_id=cluster_id, signer=signer
+        db_session=get_db(), cluster_id=cluster_id, signer=signer
     )
 
 
@@ -317,14 +335,24 @@ async def list_audit_events():
 @audit_bp.route("/verify", methods=["POST"])
 @require_scopes("gough.audit.read")
 async def verify_audit_chain():
-    """Verify hash chain integrity over an optional time window."""
+    """Verify hash chain integrity over an optional time window.
+
+    Reads via the penguin-dal overlay (``get_db()``) -- tenant isolation is
+    enforced by RLS through the ContextVar the tenant middleware already set
+    (``app.db.rls``), not by an explicit call here, matching every other
+    penguin-dal-backed handler in this module. A non-superadmin caller's
+    verification is therefore naturally scoped to their own tenant's rows.
+    """
     body = await request.get_json(silent=True) or {}
     since = _parse_iso8601(body.get("since"))
     to = _parse_iso8601(body.get("to"))
 
-    tenant_id = _get_tenant_id()
-    db = _get_db_session()
-    set_tenant_guc(db, tenant_id)
+    # Preserved from the pre-conversion behavior even though the returned
+    # tenant_id is no longer needed here (RLS applies it via the ContextVar):
+    # raises PermissionError if the request has no tenant_context/principal,
+    # same defense-in-depth check every other handler in this module makes.
+    _get_tenant_id()
+    db = get_db()
 
     result = verify_chain(db, since=since, to=to)
 
@@ -426,7 +454,21 @@ def _stream_audit_events_jsonl(
 @audit_bp.route("/export", methods=["GET"])
 @require_scopes("gough.cluster.superadmin")
 async def export_audit_log():
-    """Stream audit log as JSONL with Vault-transit signed footer."""
+    """Stream audit log as JSONL with Vault-transit signed footer.
+
+    The self-audit-log write below (``audit_writer.append(...)``) and the
+    export stream read both go through the penguin-dal overlay now
+    (``_build_audit_writer`` -> ``get_db()`` / ``dal_db = get_db()``) --
+    tenant scoping for the write comes from RLS via the ContextVar the
+    tenant middleware set (``app.db.rls``), same as every other
+    penguin-dal-backed handler; no explicit GUC call needed here. The
+    export stream itself remains deliberately cross-tenant (see
+    ``_stream_audit_events_jsonl``'s docstring) -- callers whose token
+    carries ``cross_tenant=True`` get the RLS cross-tenant sentinel pushed
+    by the tenant middleware, which is required for both the export
+    stream and the chain-head lookup inside ``audit_writer.append()`` to
+    see the true global chain head rather than silently forking it.
+    """
     tenant_id = _get_tenant_id()
     mfa_block_required = _mfa_required_for_tenant(tenant_id) and not _request_has_mfa()
     if mfa_block_required:
@@ -436,13 +478,6 @@ async def export_audit_log():
             ),
             401,
         )
-
-    # This session is only needed for the SQLAlchemy-session-based
-    # AuditEventWriter below (app.security.audit_chain, out of scope for the
-    # penguin-dal conversion) -- unrelated to the penguin-dal read used for
-    # the actual export stream a few lines down.
-    db_session = _get_db_session()
-    set_tenant_guc(db_session, tenant_id)
 
     target_sub = request.args.get("target_sub")
     cluster_id_label = current_app.config.get("CLUSTER_ID", "unknown")

@@ -27,16 +27,30 @@ penguin-dal conversion notes (Task 8a):
   precedent in ``app.workers.joiner_secret_emitter`` /
   ``app.grpc_server``) -- ``AuditChainWriter`` (the only in-scope live
   caller) applies it.
-* Constructor keyword is still named ``db_session`` for source
-  compatibility with the three still-dead external call sites
-  (``app.api.audit._build_audit_writer``, ``app.api.joiner_secrets
-  ._build_audit_writer``, ``app.grpc_server.AuditServicer.AppendEvent``) --
-  all three always raise ``RuntimeError`` from their own ``_get_db_session()``
-  (``DB_SESSION_FACTORY`` is never wired into the app factory) before ever
-  reaching this constructor, so they remain equally dead either way; keeping
-  the keyword name avoids forcing an unrelated edit onto those three
-  out-of-scope files. Despite the name, the value must now be a penguin-dal
-  ``DB`` instance (e.g. ``app.models.get_db()``), not a SQLAlchemy Session.
+* Constructor keyword is still named ``db_session`` for source compatibility.
+  ``app.api.audit._build_audit_writer`` and ``app.api.joiner_secrets
+  ._build_audit_writer`` (FIX #7a cleanup) now pass ``app.models.get_db()``
+  -- both are LIVE callers reachable from ``export_audit_log`` /
+  ``revoke_joiner_secret`` respectively, no longer the dead
+  always-``RuntimeError`` paths they were before that cleanup.
+  ``app.grpc_server.AuditServicer.AppendEvent`` still passes its own
+  ``_get_db_session()`` (imported from ``app.api.audit``, kept there for
+  this reason) and remains dead -- ``DB_SESSION_FACTORY`` is never wired
+  into the app factory, out of scope for both this file and that one.
+  Despite the keyword name, the value must be a penguin-dal ``DB`` instance,
+  not a SQLAlchemy Session.
+* Follow-up flagged, not fixed here: ``export_audit_log``'s self-audit-log
+  write and ``revoke_joiner_secret``'s both call ``AuditEventWriter.append()``
+  without wrapping it in ``app.db.rls.CROSS_TENANT_SENTINEL`` the way
+  ``AuditChainWriter`` (the background worker) does -- see the chain-head
+  lookup note above. They rely entirely on the ContextVar the tenant
+  middleware set from the caller's own JWT (their own tenant, or the
+  sentinel only if that JWT carries ``cross_tenant=True``), matching the
+  pre-conversion ``set_tenant_guc(db, tenant_id)`` behavior exactly (that
+  also used the caller's own ``tenant_id``, never the sentinel) -- so this
+  isn't a regression, but it means a superadmin ``/export`` call without a
+  ``cross_tenant=True`` token still risks forking the chain head the same
+  way it always could have, now that the call path is actually reachable.
 """
 
 from __future__ import annotations
