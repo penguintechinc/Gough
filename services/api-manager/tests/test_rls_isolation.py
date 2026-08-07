@@ -526,3 +526,351 @@ def test_api_manager_rw_can_insert_into_every_insert_granted_table_kind(
         )
     finally:
         set_current_tenant(None)
+
+
+# =============================================================================
+# gh-21 -- four orphan tables gained RLS as part of the same task that added
+# their schemas: clusters (SECURITY-CRITICAL -- see
+# tests/api/test_clusters_pg.py for the app-level IDOR regression test this
+# table's existence closes; the tests below are the DB-level RLS proof, same
+# division of labor as biomes/webhook_endpoints above vs. their own endpoint
+# tests), storage_quotas + storage_quota_requests (RLS is the PRIMARY
+# tenant-isolation enforcement for these two -- app.api.storage trusts a
+# caller-supplied/request-body tenant_id with no cross-check of its own),
+# and biome_groups (tenant_id is a new, currently-always-'__default__'
+# column -- seeded here with real per-test tenant ids via the table OWNER,
+# which bypasses INSERT-time RLS, so the SELECT-side isolation this section
+# actually tests is unaffected by that default).
+# =============================================================================
+
+
+def _seed_cluster(owner_db: DB, *, cluster_id: str, name: str, tenant_id: str) -> str:
+    """Insert a minimal ``clusters`` row as the table OWNER (bypasses RLS on insert)."""
+    from datetime import datetime, timezone
+
+    now = datetime.now(timezone.utc)
+    owner_db.clusters.insert(
+        id=cluster_id, tenant_id=tenant_id, name=name, created_at=now, updated_at=now,
+    )
+    return cluster_id
+
+
+@pytest.fixture
+def two_tenant_clusters(pg_db: DB) -> tuple[str, str]:
+    id_a = _seed_cluster(pg_db, cluster_id="cluster-a", name="cluster-a", tenant_id=TENANT_A)
+    id_b = _seed_cluster(pg_db, cluster_id="cluster-b", name="cluster-b", tenant_id=TENANT_B)
+    return id_a, id_b
+
+
+def test_clusters_tenant_a_sees_only_own_row(
+    pg_db_scoped: DB, two_tenant_clusters: tuple[str, str]
+) -> None:
+    install_rls_events(pg_db_scoped.engine)
+    set_current_tenant(TENANT_A)
+    try:
+        rows = pg_db_scoped(pg_db_scoped.clusters.id != None).select()  # noqa: E711
+    finally:
+        set_current_tenant(None)
+
+    tenant_ids = {row.tenant_id for row in rows}
+    assert tenant_ids == {TENANT_A}
+    assert len(rows) == 1
+
+
+def test_clusters_unset_tenant_is_fail_closed(
+    pg_db_scoped: DB, two_tenant_clusters: tuple[str, str]
+) -> None:
+    install_rls_events(pg_db_scoped.engine)
+    set_current_tenant(None)
+
+    rows = pg_db_scoped(pg_db_scoped.clusters.id != None).select()  # noqa: E711
+
+    assert len(rows) == 0
+
+
+def test_clusters_cross_tenant_sentinel_sees_all_rows(
+    pg_db_scoped: DB, two_tenant_clusters: tuple[str, str]
+) -> None:
+    install_rls_events(pg_db_scoped.engine)
+    set_current_tenant(CROSS_TENANT_SENTINEL)
+    try:
+        rows = pg_db_scoped(pg_db_scoped.clusters.id != None).select()  # noqa: E711
+    finally:
+        set_current_tenant(None)
+
+    tenant_ids = {row.tenant_id for row in rows}
+    assert tenant_ids == {TENANT_A, TENANT_B}
+    assert len(rows) == 2
+
+
+def test_clusters_owner_connection_is_rls_exempt(
+    pg_db: DB, two_tenant_clusters: tuple[str, str]
+) -> None:
+    rows = pg_db(pg_db.clusters.id != None).select()  # noqa: E711
+
+    tenant_ids = {row.tenant_id for row in rows}
+    assert tenant_ids == {TENANT_A, TENANT_B}
+
+
+def _seed_storage_quota(owner_db: DB, *, tenant_id: str, resource_type: str = "storage") -> str:
+    import uuid as _uuid
+
+    quota_id = str(_uuid.uuid4())
+    owner_db.storage_quotas.insert(
+        id=quota_id, tenant_id=tenant_id, resource_type=resource_type, unit="GB",
+    )
+    return quota_id
+
+
+@pytest.fixture
+def two_tenant_storage_quotas(pg_db: DB) -> tuple[str, str]:
+    id_a = _seed_storage_quota(pg_db, tenant_id=TENANT_A)
+    id_b = _seed_storage_quota(pg_db, tenant_id=TENANT_B)
+    return id_a, id_b
+
+
+def test_storage_quotas_tenant_a_sees_only_own_row(
+    pg_db_scoped: DB, two_tenant_storage_quotas: tuple[str, str]
+) -> None:
+    install_rls_events(pg_db_scoped.engine)
+    set_current_tenant(TENANT_A)
+    try:
+        rows = pg_db_scoped(pg_db_scoped.storage_quotas.id != None).select()  # noqa: E711
+    finally:
+        set_current_tenant(None)
+
+    tenant_ids = {row.tenant_id for row in rows}
+    assert tenant_ids == {TENANT_A}
+    assert len(rows) == 1
+
+
+def test_storage_quotas_unset_tenant_is_fail_closed(
+    pg_db_scoped: DB, two_tenant_storage_quotas: tuple[str, str]
+) -> None:
+    install_rls_events(pg_db_scoped.engine)
+    set_current_tenant(None)
+
+    rows = pg_db_scoped(pg_db_scoped.storage_quotas.id != None).select()  # noqa: E711
+
+    assert len(rows) == 0
+
+
+def test_storage_quotas_cross_tenant_sentinel_sees_all_rows(
+    pg_db_scoped: DB, two_tenant_storage_quotas: tuple[str, str]
+) -> None:
+    install_rls_events(pg_db_scoped.engine)
+    set_current_tenant(CROSS_TENANT_SENTINEL)
+    try:
+        rows = pg_db_scoped(pg_db_scoped.storage_quotas.id != None).select()  # noqa: E711
+    finally:
+        set_current_tenant(None)
+
+    tenant_ids = {row.tenant_id for row in rows}
+    assert tenant_ids == {TENANT_A, TENANT_B}
+    assert len(rows) == 2
+
+
+def test_storage_quotas_owner_connection_is_rls_exempt(
+    pg_db: DB, two_tenant_storage_quotas: tuple[str, str]
+) -> None:
+    rows = pg_db(pg_db.storage_quotas.id != None).select()  # noqa: E711
+
+    tenant_ids = {row.tenant_id for row in rows}
+    assert tenant_ids == {TENANT_A, TENANT_B}
+
+
+def _seed_storage_quota_request(owner_db: DB, *, tenant_id: str) -> str:
+    import uuid as _uuid
+
+    req_id = str(_uuid.uuid4())
+    owner_db.storage_quota_requests.insert(
+        id=req_id, tenant_id=tenant_id, resource_type="storage",
+        requested_value=100, unit="GB", justification="need more",
+    )
+    return req_id
+
+
+@pytest.fixture
+def two_tenant_storage_quota_requests(pg_db: DB) -> tuple[str, str]:
+    id_a = _seed_storage_quota_request(pg_db, tenant_id=TENANT_A)
+    id_b = _seed_storage_quota_request(pg_db, tenant_id=TENANT_B)
+    return id_a, id_b
+
+
+def test_storage_quota_requests_tenant_a_sees_only_own_row(
+    pg_db_scoped: DB, two_tenant_storage_quota_requests: tuple[str, str]
+) -> None:
+    install_rls_events(pg_db_scoped.engine)
+    set_current_tenant(TENANT_A)
+    try:
+        rows = pg_db_scoped(pg_db_scoped.storage_quota_requests.id != None).select()  # noqa: E711
+    finally:
+        set_current_tenant(None)
+
+    tenant_ids = {row.tenant_id for row in rows}
+    assert tenant_ids == {TENANT_A}
+    assert len(rows) == 1
+
+
+def test_storage_quota_requests_unset_tenant_is_fail_closed(
+    pg_db_scoped: DB, two_tenant_storage_quota_requests: tuple[str, str]
+) -> None:
+    install_rls_events(pg_db_scoped.engine)
+    set_current_tenant(None)
+
+    rows = pg_db_scoped(pg_db_scoped.storage_quota_requests.id != None).select()  # noqa: E711
+
+    assert len(rows) == 0
+
+
+def test_storage_quota_requests_cross_tenant_sentinel_sees_all_rows(
+    pg_db_scoped: DB, two_tenant_storage_quota_requests: tuple[str, str]
+) -> None:
+    install_rls_events(pg_db_scoped.engine)
+    set_current_tenant(CROSS_TENANT_SENTINEL)
+    try:
+        rows = pg_db_scoped(pg_db_scoped.storage_quota_requests.id != None).select()  # noqa: E711
+    finally:
+        set_current_tenant(None)
+
+    tenant_ids = {row.tenant_id for row in rows}
+    assert tenant_ids == {TENANT_A, TENANT_B}
+    assert len(rows) == 2
+
+
+def test_storage_quota_requests_owner_connection_is_rls_exempt(
+    pg_db: DB, two_tenant_storage_quota_requests: tuple[str, str]
+) -> None:
+    rows = pg_db(pg_db.storage_quota_requests.id != None).select()  # noqa: E711
+
+    tenant_ids = {row.tenant_id for row in rows}
+    assert tenant_ids == {TENANT_A, TENANT_B}
+
+
+def test_storage_quota_requests_with_check_rejects_mismatched_tenant_insert(
+    pg_db_scoped: DB,
+) -> None:
+    """SECURITY (gh-21): the profile's stated enforcement mechanism --
+    ``app.api.storage.request_storage_quota`` takes ``tenant_id`` straight
+    from the request body with no cross-check against the caller's own
+    token. This proves the RLS WITH CHECK side (not just USING/SELECT-side
+    filtering exercised above) actually rejects an INSERT whose tenant_id
+    doesn't match the connection's GUC -- the generic ``tenant_isolation``
+    policy has no separate WITH CHECK clause, so Postgres reuses its USING
+    expression for both, and a mismatched insert must fail rather than
+    silently write a row for an arbitrary tenant.
+    """
+    import uuid as _uuid
+
+    import pytest as _pytest
+    from sqlalchemy.exc import ProgrammingError
+
+    install_rls_events(pg_db_scoped.engine)
+    set_current_tenant(TENANT_A)
+    try:
+        with _pytest.raises(ProgrammingError, match="row-level security"):
+            pg_db_scoped.storage_quota_requests.insert(
+                id=str(_uuid.uuid4()), tenant_id=TENANT_B, resource_type="storage",
+                requested_value=50, unit="GB", justification="cross-tenant attempt",
+            )
+    finally:
+        set_current_tenant(None)
+
+
+def _seed_biome_group(owner_db: DB, *, name: str, tenant_id: str) -> int:
+    return int(
+        owner_db.biome_groups.insert(
+            tenant_id=tenant_id, name=name, display_name=name, biomes=[],
+        )
+    )
+
+
+@pytest.fixture
+def two_tenant_biome_groups(pg_db: DB) -> tuple[int, int]:
+    id_a = _seed_biome_group(pg_db, name="group-a", tenant_id=TENANT_A)
+    id_b = _seed_biome_group(pg_db, name="group-b", tenant_id=TENANT_B)
+    return id_a, id_b
+
+
+def test_biome_groups_tenant_a_sees_only_own_row(
+    pg_db_scoped: DB, two_tenant_biome_groups: tuple[int, int]
+) -> None:
+    install_rls_events(pg_db_scoped.engine)
+    set_current_tenant(TENANT_A)
+    try:
+        rows = pg_db_scoped(pg_db_scoped.biome_groups.id > 0).select()
+    finally:
+        set_current_tenant(None)
+
+    tenant_ids = {row.tenant_id for row in rows}
+    assert tenant_ids == {TENANT_A}
+    assert len(rows) == 1
+
+
+def test_biome_groups_unset_tenant_is_fail_closed(
+    pg_db_scoped: DB, two_tenant_biome_groups: tuple[int, int]
+) -> None:
+    install_rls_events(pg_db_scoped.engine)
+    set_current_tenant(None)
+
+    rows = pg_db_scoped(pg_db_scoped.biome_groups.id > 0).select()
+
+    assert len(rows) == 0
+
+
+def test_biome_groups_cross_tenant_sentinel_sees_all_rows(
+    pg_db_scoped: DB, two_tenant_biome_groups: tuple[int, int]
+) -> None:
+    install_rls_events(pg_db_scoped.engine)
+    set_current_tenant(CROSS_TENANT_SENTINEL)
+    try:
+        rows = pg_db_scoped(pg_db_scoped.biome_groups.id > 0).select()
+    finally:
+        set_current_tenant(None)
+
+    tenant_ids = {row.tenant_id for row in rows}
+    assert tenant_ids == {TENANT_A, TENANT_B}
+    assert len(rows) == 2
+
+
+def test_biome_groups_owner_connection_is_rls_exempt(
+    pg_db: DB, two_tenant_biome_groups: tuple[int, int]
+) -> None:
+    rows = pg_db(pg_db.biome_groups.id > 0).select()
+
+    tenant_ids = {row.tenant_id for row in rows}
+    assert tenant_ids == {TENANT_A, TENANT_B}
+
+
+# =============================================================================
+# gh-21 -- extends the gh-22 FIX 5 sequence-sweep regression above to two
+# newcomers from this task's ``api_manager_insert_tables`` addition:
+# ``ipxe_images`` (SERIAL-PK, needed the sequence grant) and
+# ``storage_quotas`` (UUID-PK, never needed one) -- same "one SERIAL + one
+# non-SERIAL" pairing the original FIX 5 test used, proving the sweep picked
+# up this task's tables the same way it already covered node_events/nodes.
+# =============================================================================
+
+
+def test_api_manager_rw_can_insert_into_gh21_orphan_serial_and_uuid_pk_tables(
+    pg_db_scoped: DB,
+) -> None:
+    import uuid as _uuid
+
+    install_rls_events(pg_db_scoped.engine)
+    set_current_tenant(TENANT_A)
+    try:
+        image_id = pg_db_scoped.ipxe_images.insert(
+            name="ubuntu-24.04-seq-probe", display_name="Ubuntu 24.04",
+            os_version="24.04", architecture="amd64",
+            kernel_path="minio://kernel", initrd_path="minio://initrd",
+        )
+        assert len(pg_db_scoped(pg_db_scoped.ipxe_images.id == image_id).select()) == 1
+
+        quota_id = str(_uuid.uuid4())
+        pg_db_scoped.storage_quotas.insert(
+            id=quota_id, tenant_id=TENANT_A, resource_type="storage", unit="GB",
+        )
+        assert len(pg_db_scoped(pg_db_scoped.storage_quotas.id == quota_id).select()) == 1
+    finally:
+        set_current_tenant(None)

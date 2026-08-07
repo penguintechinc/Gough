@@ -577,7 +577,16 @@ class TestBiomeListFiltering:
 
 @pytest.fixture()
 def dal_with_biome_groups(dal_with_eggs):
-    """Ensure biome_groups table exists."""
+    """Ensure biome_groups table exists.
+
+    Shape corrected (gh-21) to match what app.api.biomes' handlers and the
+    real app.models_m1.BiomeGroup schema actually use -- ``display_name``
+    (required by create_biome_group), ``biomes`` (not ``biome_ids``), and
+    ``is_default``, matching tests/api/test_biomes.py's ``dal_with_groups``
+    fixture. The previous shape here (``biome_ids``, no ``display_name``)
+    never matched runtime behavior; harmless only because neither test using
+    this fixture (below) ever reaches an actual insert.
+    """
     from penguin_dal import Field
 
     if "biome_groups" not in dal_with_eggs._metadata.tables:
@@ -585,8 +594,10 @@ def dal_with_biome_groups(dal_with_eggs):
             "biome_groups",
             Field("tenant_id", "string", default="__default__"),
             Field("name", "string", notnull=True),
+            Field("display_name", "string"),
             Field("description", "string"),
-            Field("biome_ids", "json"),
+            Field("biomes", "json"),
+            Field("is_default", "boolean", default=False),
             Field("created_at", "datetime"),
             Field("updated_at", "datetime"),
             migrate=True,
