@@ -411,3 +411,118 @@ def test_node_events_insert_and_select_succeed_as_scoped_role(
     assert len(rows) == 1
     assert rows[0].stage == "boot"
     assert rows[0].tenant_id == TENANT_A
+
+
+# =============================================================================
+# gh-22 FIX 5 -- class-level regression, not just node_events. FIX 4's
+# node_events-specific sequence grant fixed one instance of a pattern that
+# turned out to affect every SERIAL-PK table "api-manager-rw" has INSERT on
+# (confirmed identically on ``nodes`` while implementing FIX 5): the
+# baseline migration now derives and grants USAGE+SELECT on each such
+# table's PK sequence dynamically (``_grant_insert_table_sequences`` in the
+# migration, via ``pg_get_serial_sequence``) rather than a one-off hand
+# grant. This is the test that would have caught the pattern across the
+# whole set instead of one table at a time: INSERT (+ a follow-up read-back)
+# as the real scoped role under an ordinary tenant GUC, on a representative
+# mix of SERIAL-PK tables (nodes, webhook_endpoints, node_events) AND
+# UUID-PK tables with no sequence at all (audit_events, joiner_secrets) --
+# the latter two prove the fix doesn't depend on a sequence existing, i.e.
+# the "no sequence" case is handled gracefully both by the migration's
+# derivation and by this test covering it explicitly.
+# =============================================================================
+
+
+def test_api_manager_rw_can_insert_into_every_insert_granted_table_kind(
+    pg_db: DB, pg_db_scoped: DB
+) -> None:
+    """Regression: gh-22 FIX 5. Exercises INSERT-as-scoped-role across both
+    SERIAL-PK tables (needed the sequence grant) and UUID-PK tables (never
+    needed one) to prove the class of bug is closed, not just node_events.
+    """
+    import uuid
+    from datetime import datetime, timedelta, timezone
+
+    from app.security.audit_chain import AuditEventWriter
+
+    now = datetime.now(timezone.utc)
+
+    # FK/seed targets, inserted as the table owner (pg_db) -- these aren't
+    # what's under test here (node/biome INSERT-as-scoped-role is already
+    # covered above / by test_tenant_a_sees_only_own_row).
+    node_id = _seed_node(pg_db, name="probe-node", tenant_id=TENANT_A)
+    biome_id = int(pg_db.biomes.insert(name="probe-biome", tenant_id=TENANT_A))
+
+    install_rls_events(pg_db_scoped.engine)
+    set_current_tenant(TENANT_A)
+    try:
+        # --- SERIAL-PK tables: needed the FIX 5 sequence grant ---
+        new_node_id = pg_db_scoped.nodes.insert(
+            name="scoped-node",
+            state="new",
+            tenant_id=TENANT_A,
+            created_at=now,
+            updated_at=now,
+        )
+        assert len(pg_db_scoped(pg_db_scoped.nodes.id == new_node_id).select()) == 1
+
+        new_webhook_id = pg_db_scoped.webhook_endpoints.insert(
+            tenant_id=TENANT_A,
+            url="https://scoped.example.com/hook",
+            signing_mode="ed25519",
+            active=True,
+            event_filter=[],
+            retry_policy={"mode": "standard"},
+            created_at=now,
+            updated_at=now,
+        )
+        assert (
+            len(
+                pg_db_scoped(
+                    pg_db_scoped.webhook_endpoints.id == new_webhook_id
+                ).select()
+            )
+            == 1
+        )
+
+        new_event_id = _seed_node_event(
+            pg_db_scoped, node_id=node_id, tenant_id=TENANT_A, stage="probe"
+        )
+        assert (
+            len(pg_db_scoped(pg_db_scoped.node_events.id == new_event_id).select())
+            == 1
+        )
+
+        # --- UUID-PK tables: no sequence involved, must keep working ---
+        writer = AuditEventWriter(pg_db_scoped, "probe-cluster")
+        audit_event = writer.append(
+            actor_sub="probe@example.com",
+            action="probe.insert",
+            resource_kind="probe",
+            tenant_id=TENANT_A,
+        )
+        assert audit_event.id is not None
+
+        js_id = str(uuid.uuid4())
+        pg_db_scoped.joiner_secrets.insert(
+            id=js_id,
+            cluster_id=str(uuid.uuid4()),
+            tenant_id=TENANT_A,
+            biome_kind="vault",
+            emitter_biome_id=biome_id,
+            extractor_name="kubeadm_join_token",
+            scope="cluster",
+            ciphertext=b"secret-bytes",
+            iv=b"IIIIIIIIIIII",
+            auth_tag=b"TTTTTTTTTTTTTTTT",
+            dek_wrapped=b"vault:v1:DEK",
+            vault_kek_name="probe-kek",
+            ttl_seconds=3600,
+            expires_at=now + timedelta(hours=1),
+            rotation_class="vault-unseal",
+            created_at=now,
+        )
+        assert (
+            len(pg_db_scoped(pg_db_scoped.joiner_secrets.id == js_id).select()) == 1
+        )
+    finally:
+        set_current_tenant(None)
