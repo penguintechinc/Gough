@@ -271,16 +271,27 @@ def upgrade() -> None:
         """)
 
     # node_events has its own bespoke RLS policy (distinct name and USING
-    # clause, allowing a '__super__' override), carried over from
-    # 20260429_0900_node_events -- it was intentionally never part of the
-    # generic rls_tables loop above.
+    # clause), carried over from 20260429_0900_node_events -- it was
+    # intentionally never part of the generic rls_tables loop above.
+    #
+    # FIX (gh-22): the cross-tenant override sentinel here now matches the
+    # app-wide one (app.db.rls.CROSS_TENANT_SENTINEL == '__all__'). The
+    # original carried-over policy checked for '__super__' instead, which
+    # nothing in the codebase ever sets -- app.db.rls.set_current_tenant()
+    # only ever pushes a real tenant id or CROSS_TENANT_SENTINEL
+    # ('__all__'), so a cross-tenant/super-admin caller got zero bypass on
+    # this table specifically while getting one on every other RLS-enabled
+    # table via the generic tenant_isolation policy above. Editing the
+    # baseline in place is correct here -- Gough has never gone to
+    # production, this migration has never applied against a real database
+    # (see module docstring).
     op.execute('ALTER TABLE node_events ENABLE ROW LEVEL SECURITY')
     op.execute("""
         CREATE POLICY node_events_tenant_isolation
           ON node_events
           USING (
             tenant_id = current_setting('app.current_tenant', true)
-            OR current_setting('app.current_tenant', true) = '__super__'
+            OR current_setting('app.current_tenant', true) = '__all__'
           )
     """)
 

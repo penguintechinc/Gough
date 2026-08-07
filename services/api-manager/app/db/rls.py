@@ -73,13 +73,13 @@ _UNSET_TENANT_GUC: str = ""
 # row's own tenant_id -- this is intentional, it's how a super-admin token
 # (``TenantContext.cross_tenant=True``) sees across tenants.
 #
-# NOTE: ``node_events`` carries its own bespoke policy that recognizes
-# '__super__' instead of '__all__' for the same purpose (see the baseline
-# migration's ``node_events_tenant_isolation`` policy). That is a
-# pre-existing inconsistency in the schema this task did not introduce and
-# is out of scope to change here -- cross-tenant callers querying
-# node_events specifically will not currently get the bypass this sentinel
-# grants everywhere else. Flagged for a follow-up task.
+# FIX (gh-22): ``node_events`` used to carry its own bespoke policy that
+# recognized '__super__' instead of '__all__' for the same purpose (see the
+# baseline migration's ``node_events_tenant_isolation`` policy) -- nothing
+# in this codebase ever set that sentinel, so cross-tenant callers got zero
+# RLS bypass on node_events specifically while getting one on every other
+# table via this sentinel. The baseline migration's policy now matches
+# '__all__' like everywhere else.
 CROSS_TENANT_SENTINEL: str = "__all__"
 
 _current_tenant: ContextVar[str | None] = ContextVar("gough_rls_current_tenant", default=None)
