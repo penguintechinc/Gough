@@ -6,11 +6,13 @@ Handles user login, logout, token refresh, and password reset flows.
 
 from quart import Blueprint, request, jsonify, current_app
 from datetime import datetime, timedelta
+from typing import Any
 import jwt
 import bcrypt
 import secrets
 from functools import wraps
 
+from ..db.run_db import run_db
 from ..models import get_db
 from ..security_datastore import PyDALUser, PyDALRole
 
@@ -137,16 +139,23 @@ def require_auth(f):
         if not payload:
             return jsonify({"error": "Invalid or expired token"}), 401
 
-        # Get user from database
+        # Get user from database + roles. Regression: gh-22. User fetch +
+        # roles fetch is one unit of work -- off the event loop via
+        # run_db() instead of blocking the request coroutine inline.
         db = get_db()
-        user_row = db(db.auth_user.id == payload.get("user_id")).select().first()
+        user_datastore = current_app.user_datastore
 
-        if not user_row or not user_row.active:
+        def _load_user() -> tuple[Any, Any]:
+            row = db(db.auth_user.id == payload.get("user_id")).select().first()
+            if not row or not row.active:
+                return None, None
+            return row, user_datastore._get_user_roles(row.id)
+
+        user_row, roles = await run_db(_load_user)
+
+        if not user_row:
             return jsonify({"error": "User not found or inactive"}), 401
 
-        # Get user roles
-        user_datastore = current_app.user_datastore
-        roles = user_datastore._get_user_roles(user_row.id)
         user = PyDALUser(user_row, roles=roles)
 
         # Store user in request context
@@ -204,9 +213,10 @@ async def login():
     if not email or not password:
         return jsonify({"error": "Email and password required"}), 400
 
-    # Find user
+    # Find user. Regression: gh-22. Off the event loop via run_db()
+    # instead of blocking the request coroutine inline.
     db = get_db()
-    user_row = db(db.auth_user.email == email).select().first()
+    user_row = await run_db(lambda: db(db.auth_user.email == email).select().first())
 
     if not user_row:
         return jsonify({"error": "Invalid email or password"}), 401
@@ -219,24 +229,32 @@ async def login():
     if not user_row.active:
         return jsonify({"error": "User account is inactive"}), 403
 
-    # Update login tracking
+    # Regression: gh-22. Login-tracking update + commit + refresh-token
+    # insert + roles fetch is one unit of work -- stays in one run_db()
+    # closure per the house rule (see app/db/run_db.py).
     client_ip = request.remote_addr or "unknown"
-    db(db.auth_user.id == user_row.id).update(
-        last_login_at=user_row.current_login_at,
-        current_login_at=datetime.utcnow(),
-        last_login_ip=user_row.current_login_ip,
-        current_login_ip=client_ip,
-        login_count=user_row.login_count + 1,
-    )
-    db.commit()
-
-    # Generate tokens
-    access_token = generate_jwt_token(user_row.id, expires_in_minutes=30)
-    refresh_token = generate_refresh_token(user_row.id)
-
-    # Get user roles
     user_datastore = current_app.user_datastore
-    roles = user_datastore._get_user_roles(user_row.id)
+
+    def _finish_login() -> tuple[str, Any]:
+        db(db.auth_user.id == user_row.id).update(
+            last_login_at=user_row.current_login_at,
+            current_login_at=datetime.utcnow(),
+            last_login_ip=user_row.current_login_ip,
+            current_login_ip=client_ip,
+            login_count=user_row.login_count + 1,
+        )
+        db.commit()
+
+        # generate_refresh_token() issues its own insert+commit
+        refresh_token = generate_refresh_token(user_row.id)
+        roles = user_datastore._get_user_roles(user_row.id)
+        return refresh_token, roles
+
+    refresh_token, roles = await run_db(_finish_login)
+
+    # Generate access token (pure JWT encode, no DB)
+    access_token = generate_jwt_token(user_row.id, expires_in_minutes=30)
+
     user = PyDALUser(user_row, roles=roles)
 
     # Build response
@@ -277,24 +295,32 @@ async def refresh():
     # For now, we'll verify against stored tokens
     db = get_db()
 
-    # Find valid token record
-    token_record = db(
-        (db.auth_refresh_tokens.revoked == False)
-        & (db.auth_refresh_tokens.expires_at > datetime.utcnow())
-    ).select()
+    # Regression: gh-22. Token-record scan + matching-user fetch is one
+    # unit of work -- off the event loop via run_db() instead of blocking
+    # the request coroutine inline.
+    def _verify_and_load_user() -> tuple[str, Any]:
+        # Find valid token record
+        token_record = db(
+            (db.auth_refresh_tokens.revoked == False)
+            & (db.auth_refresh_tokens.expires_at > datetime.utcnow())
+        ).select()
 
-    # Find matching token by hash
-    user_id = None
-    for record in token_record:
-        if bcrypt.checkpw(refresh_token.encode(), record.token_hash.encode()):
-            user_id = record.user_id
-            break
+        # Find matching token by hash
+        user_id = None
+        for record in token_record:
+            if bcrypt.checkpw(refresh_token.encode(), record.token_hash.encode()):
+                user_id = record.user_id
+                break
 
-    if not user_id:
+        if not user_id:
+            return "invalid_token", None
+
+        return "ok", db(db.auth_user.id == user_id).select().first()
+
+    status, user_row = await run_db(_verify_and_load_user)
+
+    if status == "invalid_token":
         return jsonify({"error": "Invalid or expired refresh token"}), 401
-
-    # Get user
-    user_row = db(db.auth_user.id == user_id).select().first()
 
     if not user_row or not user_row.active:
         return jsonify({"error": "User not found or inactive"}), 401
@@ -317,8 +343,9 @@ async def logout():
     refresh_token = data.get("refresh_token", "")
 
     if refresh_token:
-        # Revoke the refresh token
-        revoke_refresh_token(request.user.id, refresh_token)
+        # Revoke the refresh token. Regression: gh-22. Off the event loop
+        # via run_db() instead of blocking the request coroutine inline.
+        await run_db(lambda: revoke_refresh_token(request.user.id, refresh_token))
 
     return jsonify({"message": "Logged out successfully"}), 200
 
@@ -373,9 +400,10 @@ async def change_password():
     if len(new_password) < 8:
         return jsonify({"error": "Password must be at least 8 characters"}), 400
 
-    # Get user from database
+    # Get user from database. Regression: gh-22. Off the event loop via
+    # run_db() instead of blocking the request coroutine inline.
     db = get_db()
-    user_row = db(db.auth_user.id == request.user.id).select().first()
+    user_row = await run_db(lambda: db(db.auth_user.id == request.user.id).select().first())
 
     if not user_row:
         return jsonify({"error": "User not found"}), 404
@@ -384,13 +412,19 @@ async def change_password():
     if not verify_password(current_password, user_row.password):
         return jsonify({"error": "Invalid current password"}), 401
 
-    # Update password
+    # Update password. Regression: gh-22. Update + commit is one unit of
+    # work -- off the event loop via run_db() instead of blocking the
+    # request coroutine inline.
     new_hash = hash_password(new_password)
-    db(db.auth_user.id == user_row.id).update(
-        password=new_hash,
-        updated_at=datetime.utcnow(),
-    )
-    db.commit()
+
+    def _apply_password_change() -> None:
+        db(db.auth_user.id == user_row.id).update(
+            password=new_hash,
+            updated_at=datetime.utcnow(),
+        )
+        db.commit()
+
+    await run_db(_apply_password_change)
 
     return jsonify({"message": "Password changed successfully"}), 200
 
@@ -415,9 +449,10 @@ async def request_password_reset():
     if not email:
         return jsonify({"error": "Email required"}), 400
 
-    # Find user
+    # Find user. Regression: gh-22. Off the event loop via run_db() instead
+    # of blocking the request coroutine inline.
     db = get_db()
-    user_row = db(db.auth_user.email == email).select().first()
+    user_row = await run_db(lambda: db(db.auth_user.email == email).select().first())
 
     # Always return success for security (don't leak user existence)
     if not user_row:
@@ -426,20 +461,26 @@ async def request_password_reset():
     # Generate reset token (valid for 24 hours)
     reset_token = secrets.token_urlsafe(32)
     reset_hash = bcrypt.hashpw(reset_token.encode(), bcrypt.gensalt()).decode()
-
-    # Revoke any existing reset tokens for this user
-    db(db.auth_password_resets.user_id == user_row.id).delete()
-
-    # Store reset token with expiration
     expires_at = datetime.utcnow() + timedelta(hours=24)
-    db.auth_password_resets.insert(
-        user_id=user_row.id,
-        token_hash=reset_hash,
-        expires_at=expires_at,
-        used=False,
-        created_at=datetime.utcnow(),
-    )
-    db.commit()
+
+    # Regression: gh-22. Revoke-existing + insert-new + commit is one unit
+    # of work -- stays in one run_db() closure per the house rule (see
+    # app/db/run_db.py).
+    def _store_reset_token() -> None:
+        # Revoke any existing reset tokens for this user
+        db(db.auth_password_resets.user_id == user_row.id).delete()
+
+        # Store reset token with expiration
+        db.auth_password_resets.insert(
+            user_id=user_row.id,
+            token_hash=reset_hash,
+            expires_at=expires_at,
+            used=False,
+            created_at=datetime.utcnow(),
+        )
+        db.commit()
+
+    await run_db(_store_reset_token)
 
     # In production, send email with reset link containing reset_token
     # For now, just log the token
@@ -474,41 +515,55 @@ async def reset_password():
     if len(new_password) < 8:
         return jsonify({"error": "Password must be at least 8 characters"}), 400
 
-    # Find valid reset token
+    # Find valid reset token + matching user. Regression: gh-22. Off the
+    # event loop via run_db() instead of blocking the request coroutine
+    # inline.
     db = get_db()
-    token_records = db(
-        (db.auth_password_resets.used == False)
-        & (db.auth_password_resets.expires_at > datetime.utcnow())
-    ).select()
 
-    # Find matching token by hash
-    user_id = None
-    token_record_id = None
-    for record in token_records:
-        if bcrypt.checkpw(reset_token.encode(), record.token_hash.encode()):
-            user_id = record.user_id
-            token_record_id = record.id
-            break
+    def _verify_reset_token() -> tuple[str, Any, Any]:
+        token_records = db(
+            (db.auth_password_resets.used == False)
+            & (db.auth_password_resets.expires_at > datetime.utcnow())
+        ).select()
 
-    if not user_id:
+        # Find matching token by hash
+        user_id = None
+        token_record_id = None
+        for record in token_records:
+            if bcrypt.checkpw(reset_token.encode(), record.token_hash.encode()):
+                user_id = record.user_id
+                token_record_id = record.id
+                break
+
+        if not user_id:
+            return "invalid_token", None, None
+
+        return "ok", db(db.auth_user.id == user_id).select().first(), token_record_id
+
+    status, user_row, token_record_id = await run_db(_verify_reset_token)
+
+    if status == "invalid_token":
         return jsonify({"error": "Invalid or expired reset token"}), 401
-
-    # Get user
-    user_row = db(db.auth_user.id == user_id).select().first()
 
     if not user_row:
         return jsonify({"error": "User not found"}), 404
 
-    # Update password
+    # Regression: gh-22. Password update + mark-token-used + commit is one
+    # unit of work -- stays in one run_db() closure per the house rule
+    # (see app/db/run_db.py).
     new_hash = hash_password(new_password)
-    db(db.auth_user.id == user_id).update(
-        password=new_hash,
-        updated_at=datetime.utcnow(),
-    )
 
-    # Mark reset token as used
-    db(db.auth_password_resets.id == token_record_id).update(used=True)
-    db.commit()
+    def _apply_reset() -> None:
+        db(db.auth_user.id == user_row.id).update(
+            password=new_hash,
+            updated_at=datetime.utcnow(),
+        )
+
+        # Mark reset token as used
+        db(db.auth_password_resets.id == token_record_id).update(used=True)
+        db.commit()
+
+    await run_db(_apply_reset)
 
     return jsonify({"message": "Password reset successfully"}), 200
 
