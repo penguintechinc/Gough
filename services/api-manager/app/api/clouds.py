@@ -6,9 +6,11 @@ Provides REST API for managing cloud providers and machines.
 from __future__ import annotations
 
 import logging
+from typing import Any
 
 from quart import Blueprint, jsonify, request
 
+from ..db.run_db import run_db
 from ..middleware import auth_required, roles_accepted, roles_required
 from ..clouds import (
     CLOUD_REGISTRY,
@@ -341,8 +343,10 @@ async def list_machines(provider_id: int):
             cloud.authenticate()
             machines = cloud.list_machines()
 
-            # Sync to database
-            _sync_machines_to_db(db, provider_id, machines)
+            # Sync to database -- one run_db() closure for the whole sync
+            # (existing-machines scan + per-machine insert/update/delete),
+            # not left blocking the event loop inline (gh-22).
+            await run_db(lambda: _sync_machines_to_db(db, provider_id, machines))
 
             return jsonify({
                 "machines": [m.to_dict() for m in machines],
@@ -739,7 +743,20 @@ async def list_regions(provider_id: int):
 
 
 def _sync_machines_to_db(db, provider_id: int, machines: list) -> None:
-    """Sync machines from cloud API to database."""
+    """Sync machines from cloud API to database.
+
+    Regression: gh-22. This used to run its unbounded existing-machines
+    SELECT plus a per-machine insert/update/delete loop synchronously,
+    inline in the request coroutine -- callers now run this whole function
+    as a single ``run_db()`` closure (see ``list_machines`` above) instead
+    of leaving it blocking the event loop. New-machine inserts and
+    stale-machine deletes are batched into one statement each (trivially
+    batchable: same field set / a single ``IN`` predicate); per-machine
+    updates are NOT batched -- each row's field values differ, and
+    penguin-dal has no bulk-UPDATE-with-per-row-values primitive, so
+    batching those would mean hand-rolling a ``CASE WHEN`` statement, which
+    is out of scope for this sweep.
+    """
     # Get existing machines
     existing = {
         m.cloud_id: m.id
@@ -747,6 +764,7 @@ def _sync_machines_to_db(db, provider_id: int, machines: list) -> None:
     }
 
     cloud_ids = set()
+    new_rows: list[dict[str, Any]] = []
 
     for machine in machines:
         cloud_ids.add(machine.id)
@@ -762,8 +780,7 @@ def _sync_machines_to_db(db, provider_id: int, machines: list) -> None:
                 tags=machine.tags,
             )
         else:
-            # Insert new
-            db.cloud_machines.insert(
+            new_rows.append(dict(
                 provider_id=provider_id,
                 cloud_id=machine.id,
                 name=machine.name,
@@ -775,14 +792,18 @@ def _sync_machines_to_db(db, provider_id: int, machines: list) -> None:
                 private_ips=machine.private_ips,
                 tags=machine.tags,
                 extra=machine.extra,
-            )
+            ))
 
-    # Remove machines that no longer exist in cloud
-    for cloud_id in existing:
-        if cloud_id not in cloud_ids:
-            db(
-                (db.cloud_machines.provider_id == provider_id) & (
-                    db.cloud_machines.cloud_id == cloud_id)
-            ).delete()
+    if new_rows:
+        db.cloud_machines.bulk_insert(new_rows)
+
+    # Remove machines that no longer exist in cloud -- one batched DELETE
+    # instead of one per stale machine.
+    stale_cloud_ids = [cid for cid in existing if cid not in cloud_ids]
+    if stale_cloud_ids:
+        db(
+            (db.cloud_machines.provider_id == provider_id)
+            & (db.cloud_machines.cloud_id.belongs(stale_cloud_ids))
+        ).delete()
 
     db.commit()

@@ -1245,3 +1245,138 @@ async def test_list_regions_success(clouds_client, dal_with_clouds):
         assert response.status_code == 200
         data = await response.get_json()
         assert len(data["regions"]) > 0
+
+
+# =============================================================================
+# _sync_machines_to_db batching (gh-22)
+# =============================================================================
+
+
+def _make_machine(*, machine_id, name, state="running"):
+    from app.clouds import Machine, MachineState
+
+    return Machine(
+        id=machine_id,
+        name=name,
+        state=MachineState(state),
+        provider="aws",
+        provider_id="1",
+        region="us-east-1",
+        image="ubuntu-24.04",
+        size="t3.medium",
+        public_ips=["1.2.3.4"],
+        private_ips=["10.0.0.1"],
+        tags={"env": "test"},
+        extra={},
+    )
+
+
+class TestSyncMachinesToDbBatching:
+    """# regression: gh-22
+
+    ``_sync_machines_to_db`` used to insert/delete one row at a time in a
+    Python loop; new-machine inserts now go through a single
+    ``bulk_insert()`` call and stale-machine deletes through a single
+    ``belongs()``-scoped DELETE. Runs against the real (sqlite) ``dal``
+    fixture, not mocks, so the batched SQL actually executes and the
+    resulting table state is asserted -- not just "a mock was called".
+    """
+
+    def test_inserts_new_machines_via_bulk_insert(self, dal_with_clouds) -> None:
+        import app.api.clouds as clouds_mod
+
+        now = datetime.now(timezone.utc)
+        provider_id = dal_with_clouds.cloud_providers.insert(
+            name="Test", provider_type="aws", config={}, status="connected",
+            enabled=True, created_at=now, updated_at=now,
+        )
+        dal_with_clouds.commit()
+
+        machines = [
+            _make_machine(machine_id="i-1", name="host-1"),
+            _make_machine(machine_id="i-2", name="host-2"),
+        ]
+        clouds_mod._sync_machines_to_db(dal_with_clouds, provider_id, machines)
+
+        rows = dal_with_clouds(
+            dal_with_clouds.cloud_machines.provider_id == provider_id
+        ).select()
+        assert {r.cloud_id for r in rows} == {"i-1", "i-2"}
+
+    def test_updates_existing_machine_in_place(self, dal_with_clouds) -> None:
+        import app.api.clouds as clouds_mod
+
+        now = datetime.now(timezone.utc)
+        provider_id = dal_with_clouds.cloud_providers.insert(
+            name="Test", provider_type="aws", config={}, status="connected",
+            enabled=True, created_at=now, updated_at=now,
+        )
+        dal_with_clouds.cloud_machines.insert(
+            provider_id=provider_id, cloud_id="i-1", name="old-name",
+            state="stopped", created_at=now, updated_at=now,
+        )
+        dal_with_clouds.commit()
+
+        clouds_mod._sync_machines_to_db(
+            dal_with_clouds, provider_id, [_make_machine(machine_id="i-1", name="new-name")]
+        )
+
+        rows = dal_with_clouds(
+            dal_with_clouds.cloud_machines.provider_id == provider_id
+        ).select()
+        assert len(rows) == 1  # updated in place, not duplicated
+        assert rows[0].name == "new-name"
+        assert rows[0].state == "running"
+
+    def test_deletes_stale_machines_via_batched_delete(self, dal_with_clouds) -> None:
+        import app.api.clouds as clouds_mod
+
+        now = datetime.now(timezone.utc)
+        provider_id = dal_with_clouds.cloud_providers.insert(
+            name="Test", provider_type="aws", config={}, status="connected",
+            enabled=True, created_at=now, updated_at=now,
+        )
+        dal_with_clouds.cloud_machines.insert(
+            provider_id=provider_id, cloud_id="i-gone-1", name="gone-1",
+            created_at=now, updated_at=now,
+        )
+        dal_with_clouds.cloud_machines.insert(
+            provider_id=provider_id, cloud_id="i-gone-2", name="gone-2",
+            created_at=now, updated_at=now,
+        )
+        dal_with_clouds.cloud_machines.insert(
+            provider_id=provider_id, cloud_id="i-stays", name="stays",
+            created_at=now, updated_at=now,
+        )
+        dal_with_clouds.commit()
+
+        # Cloud API now reports only "i-stays" -- both "i-gone-*" rows are stale.
+        clouds_mod._sync_machines_to_db(
+            dal_with_clouds, provider_id, [_make_machine(machine_id="i-stays", name="stays")]
+        )
+
+        rows = dal_with_clouds(
+            dal_with_clouds.cloud_machines.provider_id == provider_id
+        ).select()
+        assert {r.cloud_id for r in rows} == {"i-stays"}
+
+    def test_empty_machine_list_deletes_all_existing(self, dal_with_clouds) -> None:
+        import app.api.clouds as clouds_mod
+
+        now = datetime.now(timezone.utc)
+        provider_id = dal_with_clouds.cloud_providers.insert(
+            name="Test", provider_type="aws", config={}, status="connected",
+            enabled=True, created_at=now, updated_at=now,
+        )
+        dal_with_clouds.cloud_machines.insert(
+            provider_id=provider_id, cloud_id="i-1", name="host-1",
+            created_at=now, updated_at=now,
+        )
+        dal_with_clouds.commit()
+
+        clouds_mod._sync_machines_to_db(dal_with_clouds, provider_id, [])
+
+        rows = dal_with_clouds(
+            dal_with_clouds.cloud_machines.provider_id == provider_id
+        ).select()
+        assert len(rows) == 0
