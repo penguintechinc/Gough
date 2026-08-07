@@ -8,31 +8,20 @@ dedicated RLS proof that ``_cross_tenant_scope()`` -- not an app-level filter
 Security (see ``app.grpc_server._cross_tenant_scope`` docstring).
 
 ``app.grpc_server`` imports ``gough.identity_pb2`` at module level (for
-``IdentityServicer``); that generated file's embedded ``FileDescriptorProto``
-is corrupted -- ``FileDescriptorProto().ParseFromString()`` raises "Wire
-format was corrupt" even standalone, independent of any protobuf/grpcio
-version skew (confirmed) -- and there is no ``.proto`` source anywhere in
-this repo to regenerate it from cleanly. This is a genuine, pre-existing,
-already-in-production bug: ``app/__init__.py``'s ``_start_grpc`` wraps the
-whole ``grpc_runner`` import in a bare ``try/except`` + ``logger.warning``,
-so the ENTIRE gRPC server -- every servicer, not just Identity -- silently
-fails to start in every deployed environment; the HTTP/REST app boots fine
-and masks it completely. Fixing the generated proto file is build-tooling,
-out of scope for this task (not ``grpc_server.py``, ``joiner_secret_emitter
-.py``, or a test file). ``_ensure_identity_pb2_importable()`` below installs
-a minimal stand-in for ``gough.identity_pb2``/``gough.identity_pb2_grpc``
-ONLY if the real import still fails, so ``app.grpc_server`` (and therefore
-every servicer defined in it) can be imported and tested despite the
-corrupted file -- and so this shim becomes an inert no-op automatically the
-day someone fixes the real generated file.
+``IdentityServicer``). That generated file was hand-fabricated rather than
+buf-generated and its embedded descriptor was internally inconsistent
+("TypeError: Couldn't parse file content!") -- this masked the fact that
+every servicer in this module, not just Identity, was silently failing to
+start in every deployment (``app/__init__.py``'s ``_start_grpc`` swallowed
+the whole ``grpc_runner`` import into a warning log). Fixed by regenerating
+all stubs from ``proto/v1/gough/*.proto`` via ``buf generate`` (gh-22); the
+real ``gough.identity_pb2``/``identity_pb2_grpc`` now import cleanly, so
+this module imports ``app.grpc_server`` directly with no stand-in shim.
 """
 
 from __future__ import annotations
 
 import json
-import os
-import sys
-import types
 import uuid
 from datetime import datetime, timedelta, timezone
 from typing import Any
@@ -41,73 +30,12 @@ from unittest.mock import Mock
 import pytest
 from quart import Quart
 
-
-def _ensure_identity_pb2_importable() -> None:
-    """Install a minimal ``gough.identity_pb2``/``identity_pb2_grpc`` stand-in.
-
-    Only runs if the real generated modules still fail to import (see module
-    docstring) -- becomes a no-op the moment that file is regenerated
-    correctly. Never touches the real files on disk.
-    """
-    try:
-        import gough.identity_pb2  # noqa: F401
-        import gough.identity_pb2_grpc  # noqa: F401
-        return
-    except Exception:
-        pass
-
-    _grpc_pkg_dir = os.path.join(
-        os.path.dirname(__file__), "..", "app", "grpc"
-    )
-    _grpc_pkg_dir = os.path.abspath(_grpc_pkg_dir)
-    if _grpc_pkg_dir not in sys.path:
-        sys.path.insert(0, _grpc_pkg_dir)
-
-    import gough  # the real `app/grpc/gough` package -- ipxe_pb2 etc. parse fine
-
-    class _Msg:
-        """Minimal stand-in for a generated protobuf message class.
-
-        Supports only keyword-constructed attribute access, matching how
-        ``app.grpc_server`` and this test file use these two message types
-        -- never real wire serialization (nothing here sends an Identity
-        message over an actual socket).
-        """
-
-        def __init__(self, **kwargs: Any) -> None:
-            for key, value in kwargs.items():
-                setattr(self, key, value)
-
-    pb2 = types.ModuleType("gough.identity_pb2")
-    for name in (
-        "IssueSVIDRequest",
-        "IssueSVIDResponse",
-        "VerifyOTPNRequest",
-        "VerifyOTPNResponse",
-    ):
-        setattr(pb2, name, type(name, (_Msg,), {}))
-
-    pb2_grpc = types.ModuleType("gough.identity_pb2_grpc")
-
-    class IdentityServicer:
-        """Minimal stand-in base class (the real one is an ``object`` subclass)."""
-
-    pb2_grpc.IdentityServicer = IdentityServicer  # type: ignore[attr-defined]
-
-    sys.modules["gough.identity_pb2"] = pb2
-    sys.modules["gough.identity_pb2_grpc"] = pb2_grpc
-    gough.identity_pb2 = pb2  # type: ignore[attr-defined]
-    gough.identity_pb2_grpc = pb2_grpc  # type: ignore[attr-defined]
-
-
-_ensure_identity_pb2_importable()
-
-from app.grpc_server import (  # noqa: E402
+from app.grpc_server import (
     AuditServicer,
     IdentityServicer,
     JoinerSecretsServicer,
 )
-from app.security.joiner_envelope import EnvelopeCiphertext, encrypt_envelope  # noqa: E402
+from app.security.joiner_envelope import EnvelopeCiphertext, encrypt_envelope
 
 pytestmark = pytest.mark.asyncio
 

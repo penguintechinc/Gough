@@ -61,7 +61,7 @@ def add_IdentityServicer_to_server(servicer, server):
     server.add_registered_method_handlers('gough.v1.Identity', rpc_method_handlers)
 
 
-# This class is part of an EXPERIMENTAL API.
+ # This class is part of an EXPERIMENTAL API.
 class Identity(object):
     """Missing associated documentation comment in .proto file."""
 
