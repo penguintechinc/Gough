@@ -299,6 +299,38 @@ def upgrade() -> None:
     # not just INSERT. No UPDATE/DELETE grant -- neither is used anywhere.
     op.execute('GRANT SELECT, INSERT ON node_events TO "api-manager-rw"')
 
+    # --- gh-21: orphan tables (queried at runtime throughout app/api/ and
+    # app/permissions.py, but had no model/migration anywhere) -- per-table
+    # grants, matched to each table's approved profile in
+    # .superpowers/sdd/followups/orphan-schemas-brief.md. Not folded into the
+    # m1_tables loop above: several of these tables need a different verb
+    # set than that loop's uniform SELECT/INSERT/UPDATE (some need DELETE,
+    # boot_events needs no UPDATE at all), so bespoke GRANT lines keep each
+    # table's actual privilege set explicit and reviewable, same pattern
+    # already used above for webhook_endpoints/node_events. Added
+    # incrementally across several commits as each table's model lands;
+    # see this migration's git history for the per-table commit boundaries.
+    op.execute('GRANT SELECT, INSERT, UPDATE ON clusters TO "api-manager-rw"')
+    op.execute('GRANT SELECT, INSERT, UPDATE ON cluster_config TO "api-manager-rw"')
+    op.execute('GRANT SELECT, INSERT, UPDATE ON storage_quotas TO "api-manager-rw"')
+    op.execute('GRANT SELECT, INSERT, UPDATE ON storage_quota_requests TO "api-manager-rw"')
+    # deployment_logs is SELECT-only in app.api.biomes.get_deployment_logs
+    # today; INSERT is granted ahead of a future writer per the approved
+    # profile, same "future writer" rationale as clusters/storage_quotas
+    # above.
+    op.execute('GRANT SELECT, INSERT ON deployment_logs TO "api-manager-rw"')
+    op.execute('GRANT SELECT, INSERT, UPDATE, DELETE ON resource_permissions TO "api-manager-rw"')
+    op.execute('GRANT SELECT, INSERT, UPDATE, DELETE ON biome_groups TO "api-manager-rw"')
+    op.execute('GRANT SELECT, INSERT, UPDATE, DELETE ON ipxe_machines TO "api-manager-rw"')
+    op.execute('GRANT SELECT, INSERT, UPDATE, DELETE ON ipxe_images TO "api-manager-rw"')
+    op.execute('GRANT SELECT, INSERT, UPDATE, DELETE ON ipxe_boot_configs TO "api-manager-rw"')
+    op.execute('GRANT SELECT, INSERT, UPDATE ON ipxe_config TO "api-manager-rw"')
+    # boot_events is an append-only log written by app.api.ipxe._log_boot_event
+    # -- no UPDATE/DELETE anywhere in the codebase. Only api-manager-rw writes
+    # it today (no worker-ipxe code path touches boot_events), so unlike
+    # audit_events there is no matching worker-ipxe-rw INSERT grant here.
+    op.execute('GRANT SELECT, INSERT ON boot_events TO "api-manager-rw"')
+
     # gh-22 FIX 5: grant USAGE+SELECT on the PK sequence of every table each
     # role above was just given INSERT on -- see
     # ``_grant_insert_table_sequences``'s docstring for the full rationale
@@ -316,6 +348,29 @@ def upgrade() -> None:
         "audit_events",
         "webhook_endpoints",
         "node_events",
+        # gh-21 orphan tables -- every table given an INSERT grant above.
+        # clusters uses a non-SERIAL (String) PK, so pg_get_serial_sequence
+        # returns NULL for it and it's silently skipped by
+        # ``_grant_insert_table_sequences`` -- included anyway (rather than
+        # hand-picking only the SERIAL-PK ones) for the same reason
+        # worker-ipxe-rw's audit_events entry above is: a future INSERT
+        # target that changes PK strategy gets covered automatically.
+        "clusters",
+        "cluster_config",
+        # storage_quotas/storage_quota_requests use a UUID-as-String PK
+        # (app-generated uuid4), so pg_get_serial_sequence returns NULL for
+        # both -- included for the same "future-proof, don't hand-pick"
+        # reason as clusters above.
+        "storage_quotas",
+        "storage_quota_requests",
+        "deployment_logs",
+        "resource_permissions",
+        "biome_groups",
+        "ipxe_machines",
+        "ipxe_images",
+        "ipxe_boot_configs",
+        "ipxe_config",
+        "boot_events",
     ]
     _grant_insert_table_sequences(bind, api_manager_insert_tables, "api-manager-rw")
 
@@ -351,11 +406,25 @@ def upgrade() -> None:
     # has no tenant_id column (it's cluster-scoped, keyed by a unique
     # cluster_id, not tenant-scoped), so a tenant_isolation policy referencing
     # tenant_id would reference a column that doesn't exist.
+    # gh-21: clusters is SECURITY-CRITICAL here -- RLS is a second,
+    # defense-in-depth layer behind app.api.clusters._require_cluster_tenant's
+    # application-level check. cluster_config is intentionally NOT in this
+    # list (no tenant_id column -- cluster-scoped like migration_policy).
+    # storage_quotas/storage_quota_requests are the PRIMARY enforcement here
+    # (app.api.storage's handlers trust a caller-supplied/request-body
+    # tenant_id with no cross-check of their own -- see
+    # app.models_m1.StorageQuota/StorageQuotaRequest docstrings). biome_groups'
+    # tenant_id defaults to '__default__' (current handlers don't set it --
+    # see app.models_m1.BiomeGroup docstring), so every row is visible to the
+    # default tenant under this policy's IN (tenant_id, '__default__',
+    # '__all__') clause until a follow-up threads tenant through the handlers
+    # -- accepted interim behavior per the approved profile, not a bug here.
     rls_tables = ['nodes', 'disks', 'disk_plans', 'node_egg_assignments', 'biomes',
                   'storage_backends', 'migration_events',
                   'joiner_secrets', 'audit_events', 'dr_drills', 'slo_definitions',
                   'hardware_firmware', 'node_tags_operator', 'node_bmc',
-                  'webhook_endpoints']
+                  'webhook_endpoints',
+                  'clusters', 'storage_quotas', 'storage_quota_requests', 'biome_groups']
     for tbl in rls_tables:
         op.execute(f'ALTER TABLE {tbl} ENABLE ROW LEVEL SECURITY')
         op.execute(f"""

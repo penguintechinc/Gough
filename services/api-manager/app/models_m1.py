@@ -17,11 +17,13 @@ from sqlalchemy import (
     Integer,
     JSON,
     LargeBinary,
+    Numeric,
     String,
     Text,
     TypeDecorator,
     UniqueConstraint,
     Uuid,
+    func,
     text,
 )
 from sqlalchemy.dialects import postgresql
@@ -858,6 +860,374 @@ class WebhookEndpoint(Base):
     __table_args__ = (
         Index("ix_webhook_endpoints_tenant_id", "tenant_id"),
         Index("ix_webhook_endpoints_active", "active"),
+        {"extend_existing": True},
+    )
+
+
+# =============================================================================
+# Orphan Table Schemas (gh-21)
+# =============================================================================
+# The following twelve tables are queried at runtime throughout app/api/ (and
+# app/permissions.py) but had no SQLAlchemy model or migration anywhere in
+# the codebase -- see .superpowers/sdd/followups/orphan-schemas-brief.md for
+# the file:line usage recon each profile below is derived from. Declaring
+# them here registers them on the shared Base the same way every other M1
+# table is, so Base.metadata.create_all() (driven by the baseline migration)
+# creates them on a fresh database. Grants + RLS enablement live in the
+# baseline migration itself (SQLAlchemy metadata can't express GRANT/RLS).
+#
+# created_at/updated_at use ``server_default=func.now()`` (a genuine
+# database-side DEFAULT) rather than this file's more common Python-side
+# ``default=lambda: datetime.now(timezone.utc)`` pattern, for several of
+# these tables specifically because their INSERT call sites never pass
+# those columns (verified: ``app.api.ipxe.create_image``,
+# ``create_boot_config``, ``update_ipxe_config``'s create branch,
+# ``app.api.biomes.create_biome_group``) -- a Python-side-only default is
+# invisible to penguin-dal's reflected-table insert (the exact class of bug
+# already fixed for ``boot_events`` in the approved brief, and documented in
+# ``tests/test_rls_isolation.py``'s node/node_events seed-helper
+# docstrings). Applied uniformly across all twelve tables' created_at/
+# updated_at columns here rather than table-by-table, since "does today's
+# caller happen to pass it" is a fragile thing to keep in sync by hand.
+
+
+class Cluster(Base):
+    """Cluster registry -- the tenant-ownership anchor for every
+    ``/api/v1/clusters/<cluster_id>/*`` route.
+
+    SECURITY-CRITICAL (gh-21): missing this table was a fail-open
+    tenant-IDOR gate. ``app.api.clusters._require_cluster_tenant`` guards
+    every cluster-scoped route with ``if hasattr(db, "clusters"): ...`` --
+    with no ``clusters`` table at all, that check was always False, so the
+    tenant-ownership lookup was skipped entirely and cross-tenant requests
+    for someone else's cluster were never rejected. Creating this table
+    makes ``hasattr(db, "clusters")`` True, which is what turns the guard
+    on.
+    """
+
+    __tablename__ = "clusters"
+
+    id = Column(String(255), primary_key=True)
+    tenant_id = Column(String(255), nullable=False, server_default="__default__")
+    name = Column(String(255), nullable=False, unique=True)
+    description = Column(Text, nullable=True)
+    status = Column(String(32), nullable=False, server_default="ready")
+    created_at = Column(DateTime(timezone=True), nullable=False, server_default=func.now())
+    updated_at = Column(DateTime(timezone=True), nullable=False, server_default=func.now())
+
+    __table_args__ = (
+        Index("ix_clusters_tenant_id", "tenant_id"),
+        {"extend_existing": True},
+    )
+
+
+class ClusterConfig(Base):
+    """Schemaless key/value config document store scoped to a single cluster.
+
+    Backs the network-pools / baseline-topology / identity-plane / generic
+    config documents surfaced under ``/api/v1/clusters/<cluster_id>/*``
+    (``app.api.clusters._load_cluster_doc`` / ``_save_cluster_doc``)
+    without proliferating a dedicated table per document type. Cluster-
+    scoped, not tenant-scoped -- no RLS, same as ``migration_policy``.
+    """
+
+    __tablename__ = "cluster_config"
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    cluster_id = Column(String(255), ForeignKey("clusters.id", ondelete="CASCADE"), nullable=False)
+    key = Column(String(128), nullable=False)
+    value_json = Column(JSON, nullable=False)
+    created_at = Column(DateTime(timezone=True), nullable=False, server_default=func.now())
+    updated_at = Column(DateTime(timezone=True), nullable=False, server_default=func.now())
+
+    __table_args__ = (
+        UniqueConstraint("cluster_id", "key", name="uq_cluster_config_cluster_key"),
+        Index("ix_cluster_config_cluster_id", "cluster_id"),
+        {"extend_existing": True},
+    )
+
+
+class StorageQuota(Base):
+    """Per-tenant storage resource quota (limit/used) -- RLS-enforced.
+
+    SECURITY (gh-21): ``app.api.storage.list_storage_quotas`` filters by a
+    USER-SUPPLIED ``tenant_id`` query parameter with no cross-check against
+    the caller's own tenant -- RLS on this table is the actual enforcement
+    boundary, not the app-level filter.
+    """
+
+    __tablename__ = "storage_quotas"
+
+    id = Column(UUID(), primary_key=True)
+    tenant_id = Column(String(255), nullable=False)
+    resource_type = Column(String(64), nullable=False)
+    limit_value = Column(Numeric, nullable=True)
+    used_value = Column(Numeric, nullable=True)
+    unit = Column(String(16), nullable=False)
+    created_at = Column(DateTime(timezone=True), nullable=False, server_default=func.now())
+    updated_at = Column(DateTime(timezone=True), nullable=False, server_default=func.now())
+
+    __table_args__ = (
+        UniqueConstraint("tenant_id", "resource_type", name="uq_storage_quotas_tenant_resource"),
+        Index("ix_storage_quotas_tenant_id", "tenant_id"),
+        Index("ix_storage_quotas_created_at", "created_at"),
+        {"extend_existing": True},
+    )
+
+
+class StorageQuotaRequest(Base):
+    """Tenant-submitted storage quota increase request (INSERT-only from the API).
+
+    SECURITY (gh-21): ``tenant_id`` comes directly from the request body --
+    RLS WITH CHECK (the generic ``tenant_isolation`` policy's USING clause
+    doubles as WITH CHECK when no separate WITH CHECK is specified) is the
+    actual enforcement that a caller can't write a request under a
+    tenant_id other than their own token's tenant; the app layer does not
+    cross-check it today.
+    """
+
+    __tablename__ = "storage_quota_requests"
+
+    id = Column(UUID(), primary_key=True)
+    tenant_id = Column(String(255), nullable=False)
+    resource_type = Column(String(64), nullable=False)
+    requested_value = Column(Numeric, nullable=False)
+    unit = Column(String(16), nullable=False)
+    justification = Column(Text, nullable=False)
+    status = Column(String(16), nullable=False, server_default="pending")
+    created_at = Column(DateTime(timezone=True), nullable=False, server_default=func.now())
+    updated_at = Column(DateTime(timezone=True), nullable=False, server_default=func.now())
+
+    __table_args__ = (
+        Index("ix_storage_quota_requests_tenant_id", "tenant_id"),
+        Index("ix_storage_quota_requests_status", "status"),
+        {"extend_existing": True},
+    )
+
+
+class DeploymentLog(Base):
+    """Append-only per-deployment log stream (``GET /deployments/<id>/logs``).
+
+    SELECT-only in current code (``app.api.biomes.get_deployment_logs``); no
+    writer exists yet -- INSERT is granted for a future writer, matching the
+    approved profile.
+    """
+
+    __tablename__ = "deployment_logs"
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    deployment_id = Column(String(64), ForeignKey("deployments.id", ondelete="CASCADE"), nullable=False)
+    message = Column(Text, nullable=False)
+    level = Column(String(16), nullable=False, server_default="info")
+    created_at = Column(DateTime(timezone=True), nullable=False, server_default=func.now())
+
+    __table_args__ = (
+        Index("ix_deployment_logs_deployment_id", "deployment_id"),
+        Index("ix_deployment_logs_created_at", "created_at"),
+        {"extend_existing": True},
+    )
+
+
+class ResourcePermission(Base):
+    """Per-user, per-resource permission grant (comma-separated permission list).
+
+    Backs ``app.permissions.check_resource_permission`` -- ``permission`` is
+    intentionally a plain comma-separated String, not a JSON/array column:
+    the reader does ``permission in (perms.permission or "").split(",")``.
+    """
+
+    __tablename__ = "resource_permissions"
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    user_id = Column(Integer, ForeignKey("auth_user.id", ondelete="CASCADE"), nullable=False)
+    resource_type = Column(String(64), nullable=False)
+    resource_id = Column(Integer, nullable=False)
+    permission = Column(String(255), nullable=False)
+
+    __table_args__ = (
+        UniqueConstraint(
+            "user_id", "resource_type", "resource_id",
+            name="uq_resource_permissions_user_type_id",
+        ),
+        Index("ix_resource_permissions_user_id", "user_id"),
+        {"extend_existing": True},
+    )
+
+
+class BiomeGroup(Base):
+    """Named, ordered collection of biomes assigned to an iPXE boot config.
+
+    ``tenant_id`` is a NEW column (approved -- biomes is tenant-scoped);
+    current handlers never set it on create, so every row lands on the
+    ``server_default`` ('__default__') until a follow-up threads tenant
+    through ``app.api.biomes``'s group handlers -- with that default, RLS
+    still makes every row visible to the default tenant in the meantime,
+    which is the accepted interim behavior per the approved profile.
+    """
+
+    __tablename__ = "biome_groups"
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    tenant_id = Column(String(255), nullable=False, server_default="__default__")
+    name = Column(String(255), nullable=False, unique=True)
+    display_name = Column(String(255), nullable=False)
+    description = Column(Text, nullable=True)
+    biomes = Column(JSON, nullable=False)
+    is_default = Column(Boolean, nullable=False, server_default='false')
+    created_at = Column(DateTime(timezone=True), nullable=False, server_default=func.now())
+    updated_at = Column(DateTime(timezone=True), nullable=False, server_default=func.now())
+
+    __table_args__ = (
+        Index("ix_biome_groups_tenant_id", "tenant_id"),
+        {"extend_existing": True},
+    )
+
+
+class IpxeMachine(Base):
+    """Legacy MAAS-style bare-metal machine inventory for iPXE provisioning.
+
+    Distinct from ``nodes`` (the canonical M1 inventory table) --
+    ``app.api.ipxe._find_node_or_machine_by_mac`` checks ``nodes`` first and
+    falls back to this table, so both must exist for MAC resolution to keep
+    working across the transition period. No code path inserts new rows
+    today (status/assignment updates only) -- INSERT is granted for
+    out-of-band/future writer parity, matching the approved profile.
+    """
+
+    __tablename__ = "ipxe_machines"
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    system_id = Column(String(255), nullable=False, unique=True)
+    mac_address = Column(String(32), nullable=False)
+    status = Column(String(32), nullable=False)
+    zone = Column(String(255), nullable=True)
+    pool = Column(String(255), nullable=True)
+    boot_config_id = Column(Integer, ForeignKey("ipxe_boot_configs.id", ondelete="SET NULL"), nullable=True)
+    assigned_biomes = Column(JSON, nullable=True)
+    dmi_uuid = Column(String(64), nullable=True)
+    last_seen_at = Column(DateTime(timezone=True), nullable=True)
+    deployed_at = Column(DateTime(timezone=True), nullable=True)
+    elder_synced_at = Column(DateTime(timezone=True), nullable=True)
+    created_at = Column(DateTime(timezone=True), nullable=False, server_default=func.now())
+    updated_at = Column(DateTime(timezone=True), nullable=False, server_default=func.now())
+
+    __table_args__ = (
+        Index("ix_ipxe_machines_mac_address", "mac_address"),
+        Index("ix_ipxe_machines_status", "status"),
+        Index("ix_ipxe_machines_boot_config_id", "boot_config_id"),
+        {"extend_existing": True},
+    )
+
+
+class IpxeImage(Base):
+    """Boot image catalog (kernel/initrd/squashfs) for iPXE deployment."""
+
+    __tablename__ = "ipxe_images"
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    name = Column(String(255), nullable=False, unique=True)
+    display_name = Column(String(255), nullable=False)
+    os_name = Column(String(64), nullable=False, server_default="ubuntu")
+    os_version = Column(String(64), nullable=False)
+    architecture = Column(String(32), nullable=False)
+    kernel_path = Column(String(1024), nullable=False)
+    initrd_path = Column(String(1024), nullable=False)
+    squashfs_path = Column(String(1024), nullable=True)
+    kernel_params = Column(Text, nullable=True)
+    image_type = Column(String(32), nullable=False, server_default="minimal")
+    minio_bucket = Column(String(255), nullable=True)
+    checksum = Column(String(255), nullable=True)
+    is_default = Column(Boolean, nullable=False, server_default='false')
+    is_active = Column(Boolean, nullable=False, server_default='true')
+    size_bytes = Column(BigInteger, nullable=False, server_default='0')
+    created_at = Column(DateTime(timezone=True), nullable=False, server_default=func.now())
+    updated_at = Column(DateTime(timezone=True), nullable=False, server_default=func.now())
+
+    __table_args__ = (
+        Index("ix_ipxe_images_architecture", "architecture"),
+        {"extend_existing": True},
+    )
+
+
+class IpxeBootConfig(Base):
+    """Named iPXE boot configuration (script, boot order, default image/biome-group)."""
+
+    __tablename__ = "ipxe_boot_configs"
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    name = Column(String(255), nullable=False, unique=True)
+    description = Column(Text, nullable=True)
+    ipxe_script = Column(Text, nullable=True)
+    kernel_params = Column(Text, nullable=True)
+    boot_order = Column(JSON, nullable=False)
+    timeout_seconds = Column(Integer, nullable=False, server_default='30')
+    default_image_id = Column(Integer, ForeignKey("ipxe_images.id", ondelete="SET NULL"), nullable=True)
+    assigned_biome_group_id = Column(
+        Integer, ForeignKey("biome_groups.id", ondelete="SET NULL"), nullable=True
+    )
+    is_default = Column(Boolean, nullable=False, server_default='false')
+    created_at = Column(DateTime(timezone=True), nullable=False, server_default=func.now())
+    updated_at = Column(DateTime(timezone=True), nullable=False, server_default=func.now())
+
+    __table_args__ = (
+        Index("ix_ipxe_boot_configs_default_image_id", "default_image_id"),
+        Index("ix_ipxe_boot_configs_assigned_biome_group_id", "assigned_biome_group_id"),
+        {"extend_existing": True},
+    )
+
+
+class IpxeConfig(Base):
+    """iPXE/DHCP/TFTP boot service configuration profile."""
+
+    __tablename__ = "ipxe_config"
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    name = Column(String(255), nullable=False, unique=True)
+    dhcp_mode = Column(String(32), nullable=False, server_default="proxy")
+    dhcp_interface = Column(String(255), nullable=True)
+    dhcp_subnet = Column(String(64), nullable=True)
+    dhcp_range_start = Column(String(64), nullable=True)
+    dhcp_range_end = Column(String(64), nullable=True)
+    dhcp_gateway = Column(String(64), nullable=True)
+    dns_servers = Column(JSON, nullable=True)
+    tftp_enabled = Column(Boolean, nullable=False, server_default='true')
+    http_boot_url = Column(String(1024), nullable=True)
+    minio_bucket = Column(String(255), nullable=True)
+    chain_url = Column(String(1024), nullable=True)
+    default_boot_script = Column(Text, nullable=True)
+    is_active = Column(Boolean, nullable=False, server_default='true')
+    created_at = Column(DateTime(timezone=True), nullable=False, server_default=func.now())
+    updated_at = Column(DateTime(timezone=True), nullable=False, server_default=func.now())
+
+    __table_args__ = (
+        Index("ix_ipxe_config_is_active", "is_active"),
+        {"extend_existing": True},
+    )
+
+
+class BootEvent(Base):
+    """Append-only iPXE/PXE boot event log (discovery, TFTP, boot-start, deploy-complete).
+
+    INSERT-only from ``app.api.ipxe._log_boot_event``. ``machine_id`` is
+    nullable -- discovery events fire before a machine is registered.
+    """
+
+    __tablename__ = "boot_events"
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    machine_id = Column(Integer, ForeignKey("ipxe_machines.id", ondelete="SET NULL"), nullable=True)
+    mac_address = Column(String(32), nullable=False)
+    ip_address = Column(String(64), nullable=True)
+    event_type = Column(String(32), nullable=False)
+    details = Column(JSON, nullable=False)
+    status = Column(String(64), nullable=True)
+    created_at = Column(DateTime(timezone=True), nullable=False, server_default=func.now())
+
+    __table_args__ = (
+        Index("ix_boot_events_machine_id", "machine_id"),
+        Index("ix_boot_events_mac_address", "mac_address"),
+        Index("ix_boot_events_event_type", "event_type"),
+        Index("ix_boot_events_created_at", "created_at"),
         {"extend_existing": True},
     )
 
