@@ -781,16 +781,26 @@ class BiomesServicer(biomes_pb2_grpc.BiomesServicer):
                 if not node:
                     raise KeyError(f"Node not found: {request.node_id}")
 
-                # Create node_biome_assignments row
-                if not hasattr(db, "node_biome_assignments"):
-                    raise RuntimeError("node_biome_assignments table not available")
-
-                assignment_id = db.node_biome_assignments.insert(
-                    biome_id=request.biome_id,
+                # Create the assignment row on the real, baseline-created
+                # ``node_egg_assignments`` table (gh-21: ``node_biome_assignments``
+                # was a phantom name that never existed as a table -- this
+                # insert unconditionally raised RuntimeError before this fix).
+                # Physical columns are ``node_id``/``egg_id``, not
+                # ``node_id``/``biome_id``; ``request.config``/``request.params``
+                # have no matching column on this table and are intentionally
+                # not persisted (same gap the phantom table would have had --
+                # normalizing to the real table doesn't invent new columns).
+                now = datetime.now(timezone.utc)
+                assignment_id = db.node_egg_assignments.insert(
                     node_id=request.node_id,
-                    config=request.config,
-                    state="pending",
-                    created_at=datetime.now(timezone.utc),
+                    egg_id=request.biome_id,
+                    tenant_id=getattr(node, "tenant_id", None) or "__default__",
+                    phase=getattr(biome, "phase", None) or "post_deploy",
+                    status="pending",
+                    readiness_probe_state="not_started",
+                    assigned_at=now,
+                    created_at=now,
+                    updated_at=now,
                 )
                 db.commit()
                 return assignment_id, "pending"
