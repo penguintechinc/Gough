@@ -26,13 +26,28 @@ hvac==2.3.0  # Vault client; Sprint 1 Wave 2 wires real calls
 infisical-python==2.1.1
 
 # Distributed key-value store (Phase 2 quorum check)
-etcd3==0.12.0  # etcd v3 client; Phase 2 primary HA cluster state check
+# etcd3==0.12.0 replaced by aetcd: etcd3's own bundled *_pb2.py stubs use the
+# legacy pre-protoc-3.19 _descriptor.FileDescriptor() API, which raises
+# "TypeError: Descriptors cannot be created directly" under any protobuf
+# runtime built with the (default) upb/C++ backend -- protobuf>=4. etcd3 has
+# had no release since 0.12.0 (2020), so there is no fixed version to pin to.
+# aetcd is the actively maintained, async-native successor (protobuf<8,>4,
+# grpcio<2,>1.66.0) and is a closer fit for this async/Quart codebase anyway
+# (no more asyncio.to_thread() wrapping of a sync client). regression: gh-22
+aetcd==1.0.0  # etcd v3 client; Phase 2 primary HA cluster state check
+
+# gRPC runtime (server revived gh-22; buf-generated stubs are gencode 5.28.3,
+# which requires protobuf>=5.27 at runtime -- see protobuf pin below)
+grpcio==1.70.0
 
 # Event stream / messaging
 nats-py==2.9.0  # NATS JetStream client; Sprint 4 event stream
 cryptography==46.0.6
 boto3==1.35.78
-google-cloud-secret-manager==2.20.0
+# 2.20.0 pins protobuf<5.0.0.dev0, which conflicts with the protobuf>=5.28
+# the gRPC gencode requires; 2.20.2 widens that to protobuf<6.0.0dev with no
+# other API changes.
+google-cloud-secret-manager==2.20.2
 # aioboto3==12.2.0 conflicts with boto3 (deferred)
 # moto==5.2.0 conflicts with boto3 (deferred)
 
@@ -61,9 +76,12 @@ hypercorn==0.17.3
 # Configuration
 python-decouple==3.8
 
-# gRPC deferred (conflicts with etcd3 protobuf pins)
-# grpcio==1.70.0
-# grpcio-tools==1.70.0
+# protobuf: exact-pinned to match the "Protobuf Python Version: 5.28.3"
+# gencode declaration embedded in every buf-generated *_pb2.py in app/grpc/
+# (proto/buf.gen.yaml -> buf.build/protocolbuffers/python:v28.3). Bumping
+# this requires regenerating stubs (`make proto`) with a newer plugin pin
+# first, never bumping protobuf alone.
+protobuf==5.28.3
 
 # Monitoring
 prometheus-client==0.21.1

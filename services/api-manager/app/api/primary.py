@@ -192,7 +192,7 @@ async def get_primary_status():
 async def _check_etcd_quorum(etcd_client: Any) -> bool:
     """Check if etcd cluster has quorum; return True if healthy."""
     try:
-        members = await asyncio.to_thread(etcd_client.member_list)
+        members = [m async for m in etcd_client.members()]
         healthy = sum(1 for m in members if m.client_urls)
         return healthy >= (len(members) // 2 + 1)
     except Exception as e:
@@ -268,77 +268,77 @@ async def replace_primary():
     timeout_seconds = 300
 
     try:
-        import etcd3  # deferred — module import shouldn't hard-require this
-        etcd_client = etcd3.client(host=etcd_host, port=etcd_port)
+        import aetcd  # deferred — module import shouldn't hard-require this
+        async with aetcd.Client(host=etcd_host, port=etcd_port) as etcd_client:
 
-        # Check quorum before starting
-        if not await _check_etcd_quorum(etcd_client):
+            # Check quorum before starting
+            if not await _check_etcd_quorum(etcd_client):
+                return jsonify({
+                    "status": "error",
+                    "error": {"code": "quorum_loss",
+                        "message": "etcd quorum is unhealthy"},
+                }), 409
+
+            # Cordon and evict pods from old node (mocked kubectl)
+            log.info(f"Cordoning node {old_node_id}")
+            await asyncio.to_thread(
+                lambda: __import__("subprocess").run(
+                    ["kubectl", "cordon", str(old_node_id)],
+                    check=False, capture_output=True
+                )
+            )
+
+            # Remove etcd member for old node
+            try:
+                members = [m async for m in etcd_client.members()]
+                for m in members:
+                    if m.name == str(old_node_id):
+                        await etcd_client.remove_member(m.id)
+                        log.info(f"Removed etcd member {old_node_id}")
+                        break
+            except Exception as e:
+                log.error(f"Failed to remove etcd member: {e}")
+
+            # Get joiner secrets to pass to new node
+            secrets = await _get_joiner_secrets(db, cluster_id)
+            endpoint = current_app.config.get("CONTROL_PLANE_ENDPOINT", "")
+
+            # Emit audit event
+            audit = current_app.extensions.get("audit")
+            if audit and isinstance(audit, AuditLogger):
+                audit.log(
+                    AuditEventType.RESOURCE_UPDATE,
+                    f"Primary node replacement: {old_node_id} -> {new_node_id}",
+                    resource_type="primary.node",
+                    resource_id=str(new_node_id),
+                    details={"old_node_id": old_node_id, "reason": reason},
+                )
+
+            # Wait for new node etcd member to join (poll for 5 min)
+            start = asyncio.get_event_loop().time()
+            while asyncio.get_event_loop().time() - start < timeout_seconds:
+                try:
+                    members = [m async for m in etcd_client.members()]
+                    if any(m.name == str(new_node_id) for m in members):
+                        log.info(f"Node {new_node_id} joined etcd cluster")
+                        return jsonify({
+                            "status": "success",
+                            "data": {
+                                "cluster_id": cluster_id,
+                                "old_node_id": old_node_id,
+                                "new_node_id": new_node_id,
+                                "duration_seconds": asyncio.get_event_loop().time() - start,
+                            },
+                        }), 200
+                except Exception:
+                    pass
+                await asyncio.sleep(5)
+
             return jsonify({
                 "status": "error",
-                "error": {"code": "quorum_loss",
-                    "message": "etcd quorum is unhealthy"},
-            }), 409
-
-        # Cordon and evict pods from old node (mocked kubectl)
-        log.info(f"Cordoning node {old_node_id}")
-        await asyncio.to_thread(
-            lambda: __import__("subprocess").run(
-                ["kubectl", "cordon", str(old_node_id)],
-                check=False, capture_output=True
-            )
-        )
-
-        # Remove etcd member for old node
-        try:
-            members = await asyncio.to_thread(etcd_client.member_list)
-            for m in members:
-                if m.name == str(old_node_id):
-                    await asyncio.to_thread(etcd_client.member_remove, m.id)
-                    log.info(f"Removed etcd member {old_node_id}")
-                    break
-        except Exception as e:
-            log.error(f"Failed to remove etcd member: {e}")
-
-        # Get joiner secrets to pass to new node
-        secrets = await _get_joiner_secrets(db, cluster_id)
-        endpoint = current_app.config.get("CONTROL_PLANE_ENDPOINT", "")
-
-        # Emit audit event
-        audit = current_app.extensions.get("audit")
-        if audit and isinstance(audit, AuditLogger):
-            audit.log(
-                AuditEventType.RESOURCE_UPDATE,
-                f"Primary node replacement: {old_node_id} -> {new_node_id}",
-                resource_type="primary.node",
-                resource_id=str(new_node_id),
-                details={"old_node_id": old_node_id, "reason": reason},
-            )
-
-        # Wait for new node etcd member to join (poll for 5 min)
-        start = asyncio.get_event_loop().time()
-        while asyncio.get_event_loop().time() - start < timeout_seconds:
-            try:
-                members = await asyncio.to_thread(etcd_client.member_list)
-                if any(m.name == str(new_node_id) for m in members):
-                    log.info(f"Node {new_node_id} joined etcd cluster")
-                    return jsonify({
-                        "status": "success",
-                        "data": {
-                            "cluster_id": cluster_id,
-                            "old_node_id": old_node_id,
-                            "new_node_id": new_node_id,
-                            "duration_seconds": asyncio.get_event_loop().time() - start,
-                        },
-                    }), 200
-            except Exception:
-                pass
-            await asyncio.sleep(5)
-
-        return jsonify({
-            "status": "error",
-            "error": {"code": "timeout",
-                "message": f"New node {new_node_id} failed to join etcd within {timeout_seconds}s"},
-        }), 504
+                "error": {"code": "timeout",
+                    "message": f"New node {new_node_id} failed to join etcd within {timeout_seconds}s"},
+            }), 504
 
     except Exception as e:
         log.error(f"Primary replace failed: {e}")
@@ -443,24 +443,27 @@ async def force_recover_quorum():
 
         # Wait for cluster stabilization
         start = asyncio.get_event_loop().time()
-        import etcd3  # deferred — module import shouldn't hard-require this
-        etcd_client = etcd3.client(host=etcd_host, port=etcd_port)
-        while asyncio.get_event_loop().time() - start < timeout_seconds:
-            try:
-                status = await asyncio.to_thread(etcd_client.status)
-                if status.leader > 0:
-                    log.info("etcd cluster recovered")
-                    return jsonify({
-                        "status": "success",
-                        "data": {
-                            "cluster_id": cluster_id,
-                            "surviving_node_id": surviving_node_id,
-                            "duration_seconds": asyncio.get_event_loop().time() - start,
-                        },
-                    }), 200
-            except Exception:
-                pass
-            await asyncio.sleep(5)
+        import aetcd  # deferred — module import shouldn't hard-require this
+        async with aetcd.Client(host=etcd_host, port=etcd_port) as etcd_client:
+            while asyncio.get_event_loop().time() - start < timeout_seconds:
+                try:
+                    status = await etcd_client.status()
+                    # aetcd's Status.leader is the leader Member (or None) --
+                    # not an int ID like etcd3's -- so `is not None` replaces
+                    # the old `> 0` check. See gh-22.
+                    if status.leader is not None:
+                        log.info("etcd cluster recovered")
+                        return jsonify({
+                            "status": "success",
+                            "data": {
+                                "cluster_id": cluster_id,
+                                "surviving_node_id": surviving_node_id,
+                                "duration_seconds": asyncio.get_event_loop().time() - start,
+                            },
+                        }), 200
+                except Exception:
+                    pass
+                await asyncio.sleep(5)
 
         return jsonify({
             "status": "error",
