@@ -454,7 +454,7 @@ async def patch_policy():
     # Regression: gh-22. Current-policy read + cluster-size count is one
     # unit of work -- off the event loop via run_db() instead of blocking
     # the request coroutine inline.
-    def _load_current_and_size() -> tuple[dict, int]:
+    def _load_current_and_size() -> tuple[dict[str, Any], int]:
         current = _load_or_default_policy(cluster_id)
         db = get_db()
         cluster_size = 0
@@ -496,7 +496,7 @@ async def patch_policy():
     # Regression: gh-22. Existing-row check + insert-or-update + commit +
     # the post-commit refetch is one unit of work -- stays in one run_db()
     # closure per the house rule (see app/db/run_db.py).
-    def _apply_patch() -> dict:
+    def _apply_patch() -> dict[str, Any]:
         existing = db(db.migration_policy.cluster_id == cluster_id).select().first()
         update_fields = {k: v for k, v in body.items() if k in POLICY_FIELDS}
         update_fields["updated_at"] = now
@@ -793,7 +793,7 @@ async def get_safety_envelope():
     # Regression: gh-22. Policy read + recent-events select is one unit of
     # work -- off the event loop via run_db() instead of blocking the
     # request coroutine inline.
-    def _load_envelope() -> tuple[dict, list[dict]]:
+    def _load_envelope() -> tuple[dict[str, Any], list[dict[str, Any]]]:
         policy = _load_or_default_policy(cluster_id)
         db = get_db()
         last_results: list[dict] = []

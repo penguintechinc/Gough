@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import logging
 from datetime import datetime
+from typing import Any
 
 from quart import Blueprint, g, jsonify, request
 

@@ -844,7 +844,7 @@ async def patch_identity_plane(cluster_id: str):
     # Regression: gh-22. Current-doc read + merge + save is one unit of
     # work -- stays in one run_db() closure per the house rule (see
     # app/db/run_db.py).
-    def _apply() -> tuple[dict, bool]:
+    def _apply() -> tuple[dict[str, Any], bool]:
         current = _load_cluster_doc(
             cluster_id, "identity_plane", _DEFAULT_IDENTITY_PLANE
         )
@@ -985,7 +985,7 @@ async def patch_config(cluster_id: str):
     # Regression: gh-22. Current-doc read + merge + save is one unit of
     # work -- stays in one run_db() closure per the house rule (see
     # app/db/run_db.py).
-    def _apply() -> tuple[dict, bool]:
+    def _apply() -> tuple[dict[str, Any], bool]:
         current = _load_cluster_doc(cluster_id, "feature_flags", _DEFAULT_CONFIG)
         merged = {**current, **body}
         saved = _save_cluster_doc(cluster_id, "feature_flags", merged)

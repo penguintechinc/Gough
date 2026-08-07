@@ -455,7 +455,7 @@ async def list_biomes():
     # thread hop for the whole batch) instead of blocking the request
     # coroutine inline (this service is single-process/single-loop, gRPC
     # included).
-    def _fetch_and_filter() -> list[dict]:
+    def _fetch_and_filter() -> list[dict[str, Any]]:
         if conds:
             q = conds[0]
             for c in conds[1:]:
@@ -466,7 +466,7 @@ async def list_biomes():
 
         # Post-filter for: requires_tag (AND across each, against the
         # biome's declared ``requires_hardware_tags``) and node-eligibility.
-        filtered: list[dict] = []
+        filtered: list[dict[str, Any]] = []
         for biome in rows:
             if requires_tags:
                 declared = set(_g(biome, "requires_hardware_tags") or [])

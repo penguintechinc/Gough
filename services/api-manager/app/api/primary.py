@@ -598,8 +598,15 @@ async def _update_endpoint_on_nodes(
         # coroutine inline for every node in the loop.
         audit = current_app.extensions.get("audit")
         if audit and isinstance(audit, AuditLogger):
-            await run_db(
-                lambda audit=audit, node_id=node_id, node_result=node_result: audit.log(
+            # Bind loop variables as default args to a named closure
+            # (not a bare lambda) -- avoids both the late-binding-in-a-
+            # loop pitfall and an unannotated-lambda mypy --strict error.
+            def _emit_endpoint_audit(
+                audit: Any = audit,
+                node_id: int = node_id,
+                node_result: dict[str, Any] = node_result,
+            ) -> Any:
+                return audit.log(
                     AuditEventType.RESOURCE_UPDATE,
                     f"Update control-plane endpoint on node {node_id}",
                     resource_type="primary.endpoint",
@@ -611,7 +618,8 @@ async def _update_endpoint_on_nodes(
                         "duration_ms": node_result["duration_ms"],
                     },
                 )
-            )
+
+            await run_db(_emit_endpoint_audit)
 
     return results
 
@@ -721,8 +729,15 @@ async def _emit_gracious_arp(vip: str, node_ids: list[int]) -> dict[int, dict[st
         # coroutine inline for every node in the loop.
         audit = current_app.extensions.get("audit")
         if audit and isinstance(audit, AuditLogger):
-            await run_db(
-                lambda audit=audit, node_id=node_id, node_result=node_result: audit.log(
+            # Bind loop variables as default args to a named closure
+            # (not a bare lambda) -- avoids both the late-binding-in-a-
+            # loop pitfall and an unannotated-lambda mypy --strict error.
+            def _emit_arp_audit(
+                audit: Any = audit,
+                node_id: int = node_id,
+                node_result: dict[str, Any] = node_result,
+            ) -> Any:
+                return audit.log(
                     AuditEventType.RESOURCE_UPDATE,
                     f"Emit gracious ARP for {vip} on node {node_id}",
                     resource_type="primary.arp",
@@ -734,7 +749,8 @@ async def _emit_gracious_arp(vip: str, node_ids: list[int]) -> dict[int, dict[st
                         "duration_ms": node_result["duration_ms"],
                     },
                 )
-            )
+
+            await run_db(_emit_arp_audit)
 
     return results
 
