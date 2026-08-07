@@ -1,7 +1,10 @@
 """Tests for the db/database.py + db/galera.py -> executesql migration.
 
-``execute_query`` (app/db/database.py) is plain ANSI SQL, so it is exercised
-against a real Postgres instance via the ``pg_db`` fixture (tests/pg_fixtures.py).
+``execute_query`` (app/db/database.py) was removed as dead code in the gh-22
+DB pool consolidation (zero production callers -- see
+``app.db.database``'s module docstring for the accessors that replaced its
+role; real-Postgres coverage for that module's app-context-free RLS wiring
+now lives in ``tests/test_db_database_rls.py``).
 
 The Galera helpers in app/db/galera.py issue MariaDB/Galera-only SQL
 (``SET SESSION wsrep_sync_wait``, ``SET SESSION auto_increment_*``,
@@ -21,32 +24,7 @@ from __future__ import annotations
 
 from unittest.mock import MagicMock, call
 
-from app.db import database, galera
-
-
-# ---------------------------------------------------------------------------
-# database.execute_query -> db.executesql (real Postgres)
-# ---------------------------------------------------------------------------
-
-
-def test_execute_query_uses_executesql(pg_db, monkeypatch):
-    """execute_query() routes through penguin-dal's executesql on real PG."""
-    monkeypatch.setattr(database, "get_db", lambda: pg_db)
-    assert database.execute_query("SELECT 1") == [(1,)]
-
-
-def test_execute_query_named_placeholders(pg_db, monkeypatch):
-    """execute_query() accepts driver-native %(name)s placeholders (not :name)."""
-    monkeypatch.setattr(database, "get_db", lambda: pg_db)
-    result = database.execute_query("SELECT %(value)s", {"value": 42})
-    assert result == [(42,)]
-
-
-def test_execute_query_fetch_false_returns_none(pg_db, monkeypatch):
-    """execute_query(fetch=False) still executes the statement but returns None."""
-    monkeypatch.setattr(database, "get_db", lambda: pg_db)
-    result = database.execute_query("SELECT 1", fetch=False)
-    assert result is None
+from app.db import galera
 
 
 # ---------------------------------------------------------------------------
