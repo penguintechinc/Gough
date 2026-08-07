@@ -7,6 +7,9 @@ from datetime import datetime, timezone
 from quart import Blueprint, current_app, jsonify, request
 from prometheus_client import Counter
 
+from typing import Any
+
+from ..db.run_db import run_db
 from ..middleware import auth_required
 from ..models import get_db
 from ..security.scope_enforcement import require_scopes
@@ -93,15 +96,21 @@ async def rotate_keys():
         # `revoked_at IS NULL` instead of a nonexistent `used_at` column for
         # "not already revoked".
         now = datetime.now(timezone.utc)
-        revoked_count = db.executesql(
-            "UPDATE joiner_secrets "
-            "SET revoked_at = %(now)s "
-            "WHERE rotation_class = %(rotation_class)s "
-            "AND revoked_at IS NULL "
-            "AND expires_at > %(now)s",
-            {"rotation_class": rotation_class, "now": now},
-            return_rowcount=True,
-        )
+
+        # Regression: gh-22. Off the event loop via run_db() instead of
+        # blocking the request coroutine inline.
+        def _rotate() -> Any:
+            return db.executesql(
+                "UPDATE joiner_secrets "
+                "SET revoked_at = %(now)s "
+                "WHERE rotation_class = %(rotation_class)s "
+                "AND revoked_at IS NULL "
+                "AND expires_at > %(now)s",
+                {"rotation_class": rotation_class, "now": now},
+                return_rowcount=True,
+            )
+
+        revoked_count = await run_db(_rotate)
 
         # Log audit event via AuditEventWriter if available
         try:

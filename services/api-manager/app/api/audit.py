@@ -363,7 +363,13 @@ async def verify_audit_chain():
     _get_tenant_id()
     db = get_db()
 
-    result = verify_chain(db, since=since, to=to)
+    # Regression: gh-22. verify_chain() issues a synchronous db.executesql()
+    # (app.security.audit_chain) -- off the event loop via run_db() instead
+    # of blocking the request coroutine inline.
+    def _verify() -> dict[str, Any]:
+        return verify_chain(db, since=since, to=to)
+
+    result = await run_db(_verify)
 
     cluster_id_label = current_app.config.get("CLUSTER_ID", "unknown")
     if result.get("breaks", 0) > 0:
@@ -541,19 +547,27 @@ async def export_audit_log():
 
     actor_sub = _get_actor_sub()
     audit_writer = _build_audit_writer(cluster_id_label)
-    audit_writer.append(
-        actor_sub=actor_sub,
-        actor_scope=_get_actor_scope(),
-        action="audit.log.export",
-        resource_kind="audit_log",
-        tenant_id=tenant_id,
-        after={
-            "acting_sub": actor_sub,
-            "target_sub": target_sub,
-            "exported_at": datetime.now(timezone.utc).isoformat(),
-        },
-        request_id=request.headers.get("X-Request-Id"),
-    )
+
+    # Regression: gh-22. audit_writer.append() opens a penguin-dal
+    # transaction and issues synchronous executesql() calls -- off the
+    # event loop via run_db() instead of blocking the request coroutine
+    # inline. Insert + its own commit stays one closure (see app/db/run_db.py).
+    def _append_export_audit_event() -> Any:
+        return audit_writer.append(
+            actor_sub=actor_sub,
+            actor_scope=_get_actor_scope(),
+            action="audit.log.export",
+            resource_kind="audit_log",
+            tenant_id=tenant_id,
+            after={
+                "acting_sub": actor_sub,
+                "target_sub": target_sub,
+                "exported_at": datetime.now(timezone.utc).isoformat(),
+            },
+            request_id=request.headers.get("X-Request-Id"),
+        )
+
+    await run_db(_append_export_audit_event)
 
     nats_client = current_app.config.get("NATS_CLIENT")
     if nats_client is not None:
