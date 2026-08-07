@@ -362,13 +362,21 @@ async def discover_node():
         # Minimal stub that delegates single-use enforcement to the DB table
         redis_client = _DbNonceStore(get_db())
 
-    try:
-        principal = validate_one_time_bootstrap_token(
+    # Regression: gh-22. When no real Redis client is wired, redis_client
+    # is the _DbNonceStore fallback above, whose set() executes a direct
+    # penguin-dal select/insert/commit -- run the whole (possibly
+    # DB-touching) validation off the event loop via run_db() rather than
+    # leaving that fallback path blocking the request coroutine inline.
+    def _validate_token() -> Any:
+        return validate_one_time_bootstrap_token(
             token=token,
             vault_client=vault_client,
             redis_client=redis_client,
             signing_secret=signing_secret,
         )
+
+    try:
+        principal = await run_db(_validate_token)
     except OneTimeTokenReplayError as exc:
         return envelope_error("conflict", f"Bootstrap token nonce already used: {exc.nonce}", 409)
     except ExpiredCredentialError as exc:
@@ -398,111 +406,124 @@ async def discover_node():
     tenant_id = "__default__"
     now = datetime.now(timezone.utc)
 
-    identity_conflict = False
+    # Regression: gh-22. The whole read-detect-upsert-commit sequence below
+    # is one unit of work -- a penguin-dal connection checkout isn't safe
+    # to resume on a different thread hop, so it stays in one run_db()
+    # closure rather than being split across several. No behavior change:
+    # same reads, same identity-conflict detection, same fallback-on-
+    # missing-column retries, same single rollback point.
+    def _upsert_node() -> tuple[bool, Any, bool]:
+        identity_conflict = False
 
-    existing_by_dmi = None
-    existing_by_mac = None
-    try:
-        existing_by_dmi = db(db.nodes.dmi_uuid == body.dmi_uuid).select().first()
-        existing_by_mac = db(
-            db.nodes.primary_nic_mac == body.primary_nic_mac
-        ).select().first()
-    except Exception:  # noqa: BLE001 — table may be minimal on test DBs
-        pass
+        existing_by_dmi = None
+        existing_by_mac = None
+        try:
+            existing_by_dmi = db(db.nodes.dmi_uuid == body.dmi_uuid).select().first()
+            existing_by_mac = db(
+                db.nodes.primary_nic_mac == body.primary_nic_mac
+            ).select().first()
+        except Exception:  # noqa: BLE001 — table may be minimal on test DBs
+            pass
 
-    # Detect identity conflicts
-    if existing_by_dmi and existing_by_mac:
-        if _g(existing_by_dmi, "id") != _g(existing_by_mac, "id"):
-            # MAC belongs to a *different* node than the DMI UUID
-            identity_conflict = True
-    elif existing_by_dmi and not existing_by_mac:
-        # MAC changed for same DMI UUID — motherboard swap / NIC replacement
-        existing_mac = _g(existing_by_dmi, "primary_nic_mac")
-        if existing_mac and existing_mac != body.primary_nic_mac:
-            identity_conflict = True
-    elif existing_by_mac and not existing_by_dmi:
-        # DMI UUID changed for same MAC — chassis swap
-        existing_dmi = _g(existing_by_mac, "dmi_uuid")
-        if existing_dmi and existing_dmi != body.dmi_uuid:
-            identity_conflict = True
+        # Detect identity conflicts
+        if existing_by_dmi and existing_by_mac:
+            if _g(existing_by_dmi, "id") != _g(existing_by_mac, "id"):
+                # MAC belongs to a *different* node than the DMI UUID
+                identity_conflict = True
+        elif existing_by_dmi and not existing_by_mac:
+            # MAC changed for same DMI UUID — motherboard swap / NIC replacement
+            existing_mac = _g(existing_by_dmi, "primary_nic_mac")
+            if existing_mac and existing_mac != body.primary_nic_mac:
+                identity_conflict = True
+        elif existing_by_mac and not existing_by_dmi:
+            # DMI UUID changed for same MAC — chassis swap
+            existing_dmi = _g(existing_by_mac, "dmi_uuid")
+            if existing_dmi and existing_dmi != body.dmi_uuid:
+                identity_conflict = True
 
-    posture = "identity_conflict" if identity_conflict else "compliant"
+        posture = "identity_conflict" if identity_conflict else "compliant"
 
-    # Build hardware JSON snapshot
-    hardware_json: dict[str, Any] = {
-        "firmware_type": body.firmware_type,
-        "lshw": body.lshw_json,
-        "lsblk": body.lsblk_json,
-        "nics": [n.model_dump() for n in body.nics],
-        "numa_topology": body.numa_topology.model_dump() if body.numa_topology else None,
-        "accelerators": [a.model_dump() for a in body.accelerators],
-        "smart_attributes": [s.model_dump() for s in body.smart_attributes],
-    }
+        # Build hardware JSON snapshot
+        hardware_json: dict[str, Any] = {
+            "firmware_type": body.firmware_type,
+            "lshw": body.lshw_json,
+            "lsblk": body.lsblk_json,
+            "nics": [n.model_dump() for n in body.nics],
+            "numa_topology": body.numa_topology.model_dump() if body.numa_topology else None,
+            "accelerators": [a.model_dump() for a in body.accelerators],
+            "smart_attributes": [s.model_dump() for s in body.smart_attributes],
+        }
 
-    try:
-        existing = existing_by_dmi or existing_by_mac
-        if existing:
-            node_id = _g(existing, "id")
-            update_kwargs: dict[str, Any] = {
-                "primary_nic_mac": body.primary_nic_mac,
-                "dmi_uuid": body.dmi_uuid,
-                "hardware_json": hardware_json,
-                "hardware_tags": body.hardware_tags,
-                "posture": posture,
-                "state": "probed",
-                "discovered_at": now,
-                "updated_at": now,
-            }
-            # Preserve firmware_type in node row if column exists
-            try:
-                db(db.nodes.id == node_id).update(**update_kwargs)
-            except Exception:  # noqa: BLE001 — firmware_type column might not exist yet
-                minimal = {k: v for k, v in update_kwargs.items() if k != "firmware_type"}
-                db(db.nodes.id == node_id).update(**minimal)
-        else:
-            # New node — generate a sanitised name from the MAC
-            name = f"node-{body.primary_nic_mac.replace(':', '')[-6:].lower()}"
-            # Ensure uniqueness by appending UUID suffix if collision
-            if db(db.nodes.name == name).select().first():
-                name = f"{name}-{str(uuid.uuid4())[:8]}"
-
-            insert_kwargs: dict[str, Any] = {
-                "tenant_id": tenant_id,
-                "name": name,
-                "state": "probed",
-                "dmi_uuid": body.dmi_uuid,
-                "primary_nic_mac": body.primary_nic_mac,
-                "posture": posture,
-                "hardware_json": hardware_json,
-                "hardware_tags": body.hardware_tags,
-                "discovered_at": now,
-                "created_at": now,
-                "updated_at": now,
-            }
-            try:
-                node_id = int(db.nodes.insert(**insert_kwargs))
-            except Exception:  # noqa: BLE001 — missing optional columns
-                minimal_insert = {
-                    k: v
-                    for k, v in insert_kwargs.items()
-                    if k
-                    in {
-                        "tenant_id",
-                        "name",
-                        "state",
-                        "dmi_uuid",
-                        "primary_nic_mac",
-                        "created_at",
-                        "updated_at",
-                    }
+        try:
+            existing = existing_by_dmi or existing_by_mac
+            if existing:
+                node_id = _g(existing, "id")
+                update_kwargs: dict[str, Any] = {
+                    "primary_nic_mac": body.primary_nic_mac,
+                    "dmi_uuid": body.dmi_uuid,
+                    "hardware_json": hardware_json,
+                    "hardware_tags": body.hardware_tags,
+                    "posture": posture,
+                    "state": "probed",
+                    "discovered_at": now,
+                    "updated_at": now,
                 }
-                node_id = int(db.nodes.insert(**minimal_insert))
+                # Preserve firmware_type in node row if column exists
+                try:
+                    db(db.nodes.id == node_id).update(**update_kwargs)
+                except Exception:  # noqa: BLE001 — firmware_type column might not exist yet
+                    minimal = {k: v for k, v in update_kwargs.items() if k != "firmware_type"}
+                    db(db.nodes.id == node_id).update(**minimal)
+            else:
+                # New node — generate a sanitised name from the MAC
+                name = f"node-{body.primary_nic_mac.replace(':', '')[-6:].lower()}"
+                # Ensure uniqueness by appending UUID suffix if collision
+                if db(db.nodes.name == name).select().first():
+                    name = f"{name}-{str(uuid.uuid4())[:8]}"
 
-        db.commit()
-    except Exception as exc:  # noqa: BLE001
-        db.rollback()
-        log.exception("Error upserting node during discover: %s", exc)
-        return envelope_error("internal_error", f"DB error during discover: {exc}", 500)
+                insert_kwargs: dict[str, Any] = {
+                    "tenant_id": tenant_id,
+                    "name": name,
+                    "state": "probed",
+                    "dmi_uuid": body.dmi_uuid,
+                    "primary_nic_mac": body.primary_nic_mac,
+                    "posture": posture,
+                    "hardware_json": hardware_json,
+                    "hardware_tags": body.hardware_tags,
+                    "discovered_at": now,
+                    "created_at": now,
+                    "updated_at": now,
+                }
+                try:
+                    node_id = int(db.nodes.insert(**insert_kwargs))
+                except Exception:  # noqa: BLE001 — missing optional columns
+                    minimal_insert = {
+                        k: v
+                        for k, v in insert_kwargs.items()
+                        if k
+                        in {
+                            "tenant_id",
+                            "name",
+                            "state",
+                            "dmi_uuid",
+                            "primary_nic_mac",
+                            "created_at",
+                            "updated_at",
+                        }
+                    }
+                    node_id = int(db.nodes.insert(**minimal_insert))
+
+            db.commit()
+            return True, node_id, identity_conflict
+        except Exception as exc:  # noqa: BLE001
+            db.rollback()
+            log.exception("Error upserting node during discover: %s", exc)
+            return False, exc, identity_conflict
+
+    ok, result, identity_conflict = await run_db(_upsert_node)
+    if not ok:
+        return envelope_error("internal_error", f"DB error during discover: {result}", 500)
+    node_id = result
 
     # ------------------------------------------------------------------
     # 4. Emit identity_conflict NATS event when applicable
@@ -775,7 +796,12 @@ async def list_nodes():
 async def get_node(node_id: int):
     """Return full node detail including hardware_json."""
     db = get_db()
-    node = db(db.nodes.id == node_id).select().first() if hasattr(db, "nodes") else None
+    # Regression: gh-22. Off the event loop via run_db() instead of
+    # blocking the request coroutine inline.
+    def _fetch_node() -> Any:
+        return db(db.nodes.id == node_id).select().first() if hasattr(db, "nodes") else None
+
+    node = await run_db(_fetch_node)
     if not node:
         return err_not_found(f"Node {node_id} not found")
 
@@ -809,7 +835,12 @@ async def patch_node(node_id: int):
     assert body is not None
 
     db = get_db()
-    node = db(db.nodes.id == node_id).select().first() if hasattr(db, "nodes") else None
+    # Regression: gh-22. Off the event loop via run_db() instead of
+    # blocking the request coroutine inline.
+    def _fetch_node() -> Any:
+        return db(db.nodes.id == node_id).select().first() if hasattr(db, "nodes") else None
+
+    node = await run_db(_fetch_node)
     if not node:
         return err_not_found(f"Node {node_id} not found")
 
@@ -827,9 +858,12 @@ async def patch_node(node_id: int):
 
     # Check for name collision
     if body.name is not None:
-        collision = db(
-            (db.nodes.name == body.name) & (db.nodes.id != node_id)
-        ).select().first()
+        def _check_collision() -> Any:
+            return db(
+                (db.nodes.name == body.name) & (db.nodes.id != node_id)
+            ).select().first()
+
+        collision = await run_db(_check_collision)
         if collision:
             return err_conflict("Node name already in use", details={"name": body.name})
 
@@ -844,16 +878,24 @@ async def patch_node(node_id: int):
     if len(updates) == 1:  # only updated_at
         return envelope_success({"node": _serialize_node(node)})
 
-    try:
-        db(db.nodes.id == node_id).update(**updates)
-        db.commit()
-    except Exception as exc:  # noqa: BLE001
-        db.rollback()
-        log.exception("Error patching node %s: %s", node_id, exc)
-        return err_internal(str(exc))
+    # Regression: gh-22. update + commit + the post-commit refetch is one
+    # unit of work -- stays in one run_db() closure per the house rule
+    # (see app/db/run_db.py).
+    def _apply_update() -> tuple[bool, Any]:
+        try:
+            db(db.nodes.id == node_id).update(**updates)
+            db.commit()
+            return True, db(db.nodes.id == node_id).select().first()
+        except Exception as exc:  # noqa: BLE001
+            db.rollback()
+            log.exception("Error patching node %s: %s", node_id, exc)
+            return False, exc
 
-    refreshed = db(db.nodes.id == node_id).select().first()
-    return envelope_success({"node": _serialize_node(refreshed)})
+    ok, result = await run_db(_apply_update)
+    if not ok:
+        return err_internal(str(result))
+
+    return envelope_success({"node": _serialize_node(result)})
 
 
 # ---------------------------------------------------------------------------
@@ -879,7 +921,12 @@ async def reject_node(node_id: int):
     assert body is not None
 
     db = get_db()
-    node = db(db.nodes.id == node_id).select().first() if hasattr(db, "nodes") else None
+    # Regression: gh-22. Off the event loop via run_db() instead of
+    # blocking the request coroutine inline.
+    def _fetch_node() -> Any:
+        return db(db.nodes.id == node_id).select().first() if hasattr(db, "nodes") else None
+
+    node = await run_db(_fetch_node)
     if not node:
         return err_not_found(f"Node {node_id} not found")
 
@@ -900,19 +947,34 @@ async def reject_node(node_id: int):
         )
 
     before = {"state": current_state}
-    try:
-        db(db.nodes.id == node_id).update(
-            state="rejected",
-            posture="rejected",
-            updated_at=datetime.now(timezone.utc),
-        )
-        db.commit()
-    except Exception as exc:  # noqa: BLE001
-        db.rollback()
-        log.exception("Error rejecting node %s: %s", node_id, exc)
-        return err_internal(str(exc))
 
-    _audit_log("node.reject", str(node_id), before=before, after={"state": "rejected", "reason": body.reason})
+    # Regression: gh-22. update + commit is one unit of work -- stays in
+    # one run_db() closure per the house rule (see app/db/run_db.py).
+    def _apply_reject() -> tuple[bool, Any]:
+        try:
+            db(db.nodes.id == node_id).update(
+                state="rejected",
+                posture="rejected",
+                updated_at=datetime.now(timezone.utc),
+            )
+            db.commit()
+            return True, None
+        except Exception as exc:  # noqa: BLE001
+            db.rollback()
+            log.exception("Error rejecting node %s: %s", node_id, exc)
+            return False, exc
+
+    ok, err = await run_db(_apply_reject)
+    if not ok:
+        return err_internal(str(err))
+
+    # Regression: gh-22. _audit_log() executes a direct penguin-dal
+    # insert+commit -- run it off the event loop too.
+    await run_db(
+        lambda: _audit_log(
+            "node.reject", str(node_id), before=before, after={"state": "rejected", "reason": body.reason}
+        )
+    )
     return envelope_success(
         {"node_id": node_id, "state": "rejected", "reason": body.reason}
     )
@@ -974,7 +1036,12 @@ async def deploy_node(node_id: int):
     assert body is not None
 
     db = get_db()
-    node = db(db.nodes.id == node_id).select().first() if hasattr(db, "nodes") else None
+    # Regression: gh-22. Off the event loop via run_db() instead of
+    # blocking the request coroutine inline.
+    def _fetch_node() -> Any:
+        return db(db.nodes.id == node_id).select().first() if hasattr(db, "nodes") else None
+
+    node = await run_db(_fetch_node)
     if not node:
         return err_not_found(f"Node {node_id} not found")
 
@@ -989,23 +1056,28 @@ async def deploy_node(node_id: int):
             details={"state": current_state},
         )
 
-    try:
-        if hasattr(db, "disks"):
-            failed_disks = db(
-                (db.disks.node_id == node_id)
-                & (db.disks.smart_status == "failed")
-            ).select()
-            if failed_disks:
-                return envelope_error(
-                    "conflict",
-                    f"Node {node_id} has failed SMART status; provisioning blocked until disks are replaced or status cleared by operator.",
-                    409,
-                )
-    except Exception as exc:  # noqa: BLE001
-        log.warning("SMART status check failed (non-fatal): %s", exc)
+    # Regression: gh-22. Off the event loop via run_db() instead of
+    # blocking the request coroutine inline.
+    def _check_smart_disks() -> Any:
+        try:
+            if hasattr(db, "disks"):
+                return db(
+                    (db.disks.node_id == node_id)
+                    & (db.disks.smart_status == "failed")
+                ).select()
+        except Exception as exc:  # noqa: BLE001
+            log.warning("SMART status check failed (non-fatal): %s", exc)
+        return None
+
+    failed_disks = await run_db(_check_smart_disks)
+    if failed_disks:
+        return envelope_error(
+            "conflict",
+            f"Node {node_id} has failed SMART status; provisioning blocked until disks are replaced or status cleared by operator.",
+            409,
+        )
 
     # Validate biome IDs exist
-    assignment_ids: list[int] = []
     now = datetime.now(timezone.utc)
     tenant_id = _g(node, "tenant_id", "__default__")
 
@@ -1013,48 +1085,64 @@ async def deploy_node(node_id: int):
     if not assign_tbl:
         return err_internal("node_egg_assignments table not available")
 
-    try:
-        for spec in body.biome_assignments:
-            biome = db(db.biomes.id == spec.biome_id).select().first() if hasattr(db, "biomes") else None
-            if not biome:
-                return err_not_found(f"Biome {spec.biome_id} not found")
+    # Regression: gh-22. The per-spec validate/insert loop + commit is one
+    # unit of work -- a penguin-dal connection checkout isn't safe to
+    # resume on a different thread hop, so it stays in one run_db()
+    # closure. Preserves the exact original error precedence/order: the
+    # closure returns plain data (never an HTTP response) and the caller
+    # builds the actual err_*() response after awaiting, per house rule.
+    def _create_assignments() -> dict[str, Any]:
+        ids: list[int] = []
+        try:
+            for spec in body.biome_assignments:
+                biome = db(db.biomes.id == spec.biome_id).select().first() if hasattr(db, "biomes") else None
+                if not biome:
+                    return {"ok": False, "kind": "biome_not_found", "biome_id": spec.biome_id}
 
-            # Skip if already pending/deploying/ready
-            existing = db(
-                (assign_tbl.node_id == node_id)
-                & (getattr(assign_tbl, biome_field) == spec.biome_id)
-                & (
-                    assign_tbl.status.belongs(
-                        ["pending", "deploying", "ready", "draining"]
+                # Skip if already pending/deploying/ready
+                existing = db(
+                    (assign_tbl.node_id == node_id)
+                    & (getattr(assign_tbl, biome_field) == spec.biome_id)
+                    & (
+                        assign_tbl.status.belongs(
+                            ["pending", "deploying", "ready", "draining"]
+                        )
                     )
-                )
-            ).select().first()
-            if existing:
-                assignment_ids.append(int(_g(existing, "id")))
-                continue
+                ).select().first()
+                if existing:
+                    ids.append(int(_g(existing, "id")))
+                    continue
 
-            # Build insert dict with the correct field names
-            # Map biome field names: biome_id → egg_id, depends_on_biome_instance_id → depends_on_egg_instance_id
-            depends_field = "depends_on_egg_instance_id" if biome_field == "egg_id" else "depends_on_biome_instance_id"
-            insert_data = {
-                "node_id": node_id,
-                biome_field: spec.biome_id,
-                "tenant_id": tenant_id,
-                "phase": spec.phase or _g(biome, "phase", "post_deploy"),
-                "status": "pending",
-                depends_field: spec.depends_on_biome_instance_id,
-                "readiness_probe_state": "not_started",
-                "assigned_at": now,
-                "created_at": now,
-                "updated_at": now,
-            }
-            new_id = assign_tbl.insert(**insert_data)
-            assignment_ids.append(int(new_id))
+                # Build insert dict with the correct field names
+                # Map biome field names: biome_id → egg_id, depends_on_biome_instance_id → depends_on_egg_instance_id
+                depends_field = "depends_on_egg_instance_id" if biome_field == "egg_id" else "depends_on_biome_instance_id"
+                insert_data = {
+                    "node_id": node_id,
+                    biome_field: spec.biome_id,
+                    "tenant_id": tenant_id,
+                    "phase": spec.phase or _g(biome, "phase", "post_deploy"),
+                    "status": "pending",
+                    depends_field: spec.depends_on_biome_instance_id,
+                    "readiness_probe_state": "not_started",
+                    "assigned_at": now,
+                    "created_at": now,
+                    "updated_at": now,
+                }
+                new_id = assign_tbl.insert(**insert_data)
+                ids.append(int(new_id))
 
-        db.commit()
-    except Exception as exc:  # noqa: BLE001
-        log.exception("Error creating biome assignments for node %s: %s", node_id, exc)
-        return err_internal(str(exc))
+            db.commit()
+            return {"ok": True, "assignment_ids": ids}
+        except Exception as exc:  # noqa: BLE001
+            log.exception("Error creating biome assignments for node %s: %s", node_id, exc)
+            return {"ok": False, "kind": "internal_error", "error": exc}
+
+    result = await run_db(_create_assignments)
+    if not result["ok"]:
+        if result["kind"] == "biome_not_found":
+            return err_not_found(f"Biome {result['biome_id']} not found")
+        return err_internal(str(result["error"]))
+    assignment_ids = result["assignment_ids"]
 
     # Wire plan compiler (Phase B; FIX: use PlanCompiler.compile directly).
     # PlanCompiler is synchronous; wrap in asyncio.to_thread to avoid blocking.
@@ -1082,10 +1170,14 @@ async def deploy_node(node_id: int):
     except Exception as exc:  # noqa: BLE001
         log.warning("plan_compiler initialization failed (non-fatal): %s", exc)
 
-    _audit_log(
-        "node.deploy",
-        str(node_id),
-        after={"biome_assignments": [s.model_dump() for s in body.biome_assignments]},
+    # Regression: gh-22. _audit_log() executes a direct penguin-dal
+    # insert+commit -- run it off the event loop too.
+    await run_db(
+        lambda: _audit_log(
+            "node.deploy",
+            str(node_id),
+            after={"biome_assignments": [s.model_dump() for s in body.biome_assignments]},
+        )
     )
     for aid in assignment_ids:
         await _nats_publish_safe(
@@ -1128,7 +1220,12 @@ async def evacuate_node(node_id: int):
     assert body is not None
 
     db = get_db()
-    node = db(db.nodes.id == node_id).select().first() if hasattr(db, "nodes") else None
+    # Regression: gh-22. Off the event loop via run_db() instead of
+    # blocking the request coroutine inline.
+    def _fetch_node() -> Any:
+        return db(db.nodes.id == node_id).select().first() if hasattr(db, "nodes") else None
+
+    node = await run_db(_fetch_node)
     if not node:
         return err_not_found(f"Node {node_id} not found")
 
@@ -1164,10 +1261,14 @@ async def evacuate_node(node_id: int):
             details={"safe": False, "note": safety_note},
         )
 
-    _audit_log(
-        "node.evacuate",
-        str(node_id),
-        after={"reason": body.reason, "force": body.force},
+    # Regression: gh-22. _audit_log() executes a direct penguin-dal
+    # insert+commit -- run it off the event loop too.
+    await run_db(
+        lambda: _audit_log(
+            "node.evacuate",
+            str(node_id),
+            after={"reason": body.reason, "force": body.force},
+        )
     )
     return envelope_success(
         {
@@ -1244,7 +1345,12 @@ async def post_node_event(node_id: int):
     assert body is not None
 
     db = get_db()
-    node = db(db.nodes.id == node_id).select().first() if hasattr(db, "nodes") else None
+    # Regression: gh-22. Off the event loop via run_db() instead of
+    # blocking the request coroutine inline.
+    def _fetch_node() -> Any:
+        return db(db.nodes.id == node_id).select().first() if hasattr(db, "nodes") else None
+
+    node = await run_db(_fetch_node)
     if not node:
         return err_not_found(f"Node {node_id} not found")
 
@@ -1260,32 +1366,41 @@ async def post_node_event(node_id: int):
     else:
         event_ts = now
 
-    # Persist to node_events table
-    event_id: Optional[int] = None
-    try:
-        if hasattr(db, "node_events"):
-            row_data: dict[str, Any] = {
-                "node_id": node_id,
-                "ts": event_ts,
-                "stage": body.stage,
-                "message": body.message,
-                "progress_pct": body.progress_pct,
-                "raw_json": json.dumps(raw),
-            }
-            event_id = int(db.node_events.insert(**row_data))
-            db.commit()
-        else:
-            log.info(
-                "node_events table not yet migrated; logging event inline: "
-                "node_id=%s stage=%s message=%s",
-                node_id,
-                body.stage,
-                body.message,
-            )
-    except Exception as exc:  # noqa: BLE001
-        db.rollback()
-        log.exception("Error persisting node event for node %s: %s", node_id, exc)
-        return err_internal(str(exc))
+    # Regression: gh-22. Persist to node_events table -- insert + commit
+    # is one unit of work, stays in one run_db() closure per the house
+    # rule (see app/db/run_db.py).
+    def _persist_event() -> tuple[bool, Any]:
+        try:
+            if hasattr(db, "node_events"):
+                row_data: dict[str, Any] = {
+                    "node_id": node_id,
+                    "ts": event_ts,
+                    "stage": body.stage,
+                    "message": body.message,
+                    "progress_pct": body.progress_pct,
+                    "raw_json": json.dumps(raw),
+                }
+                new_event_id = int(db.node_events.insert(**row_data))
+                db.commit()
+                return True, new_event_id
+            else:
+                log.info(
+                    "node_events table not yet migrated; logging event inline: "
+                    "node_id=%s stage=%s message=%s",
+                    node_id,
+                    body.stage,
+                    body.message,
+                )
+                return True, None
+        except Exception as exc:  # noqa: BLE001
+            db.rollback()
+            log.exception("Error persisting node event for node %s: %s", node_id, exc)
+            return False, exc
+
+    ok, result = await run_db(_persist_event)
+    if not ok:
+        return err_internal(str(result))
+    event_id: Optional[int] = result
 
     tenant_id = _g(node, "tenant_id", "__default__")
     try:
@@ -1348,7 +1463,12 @@ async def decommission_node(node_id: int):
     assert body is not None
 
     db = get_db()
-    node = db(db.nodes.id == node_id).select().first() if hasattr(db, "nodes") else None
+    # Regression: gh-22. Off the event loop via run_db() instead of
+    # blocking the request coroutine inline.
+    def _fetch_node() -> Any:
+        return db(db.nodes.id == node_id).select().first() if hasattr(db, "nodes") else None
+
+    node = await run_db(_fetch_node)
     if not node:
         return err_not_found(f"Node {node_id} not found")
 
@@ -1361,22 +1481,35 @@ async def decommission_node(node_id: int):
         return err_conflict("Node is already decommissioned", details={"state": current_state})
 
     before = {"state": current_state}
-    try:
-        db(db.nodes.id == node_id).update(
-            state="decommissioned",
-            updated_at=datetime.now(timezone.utc),
-        )
-        db.commit()
-    except Exception as exc:  # noqa: BLE001
-        db.rollback()
-        log.exception("Error decommissioning node %s: %s", node_id, exc)
-        return err_internal(str(exc))
 
-    _audit_log(
-        "node.decommission",
-        str(node_id),
-        before=before,
-        after={"state": "decommissioned", "reason": body.reason},
+    # Regression: gh-22. update + commit is one unit of work -- stays in
+    # one run_db() closure per the house rule (see app/db/run_db.py).
+    def _apply_decommission() -> tuple[bool, Any]:
+        try:
+            db(db.nodes.id == node_id).update(
+                state="decommissioned",
+                updated_at=datetime.now(timezone.utc),
+            )
+            db.commit()
+            return True, None
+        except Exception as exc:  # noqa: BLE001
+            db.rollback()
+            log.exception("Error decommissioning node %s: %s", node_id, exc)
+            return False, exc
+
+    ok, err = await run_db(_apply_decommission)
+    if not ok:
+        return err_internal(str(err))
+
+    # Regression: gh-22. _audit_log() executes a direct penguin-dal
+    # insert+commit -- run it off the event loop too.
+    await run_db(
+        lambda: _audit_log(
+            "node.decommission",
+            str(node_id),
+            before=before,
+            after={"state": "decommissioned", "reason": body.reason},
+        )
     )
     return envelope_success(
         {"node_id": node_id, "state": "decommissioned", "reason": body.reason}
@@ -1397,7 +1530,12 @@ async def get_node_tags(node_id: int):
     ``"operator"`` for operator-defined ones.  Operator wins on key collision.
     """
     db = get_db()
-    node = db(db.nodes.id == node_id).select().first() if hasattr(db, "nodes") else None
+    # Regression: gh-22. Off the event loop via run_db() instead of
+    # blocking the request coroutine inline.
+    def _fetch_node() -> Any:
+        return db(db.nodes.id == node_id).select().first() if hasattr(db, "nodes") else None
+
+    node = await run_db(_fetch_node)
     if not node:
         return err_not_found(f"Node {node_id} not found")
 
@@ -1413,30 +1551,36 @@ async def get_node_tags(node_id: int):
             if isinstance(t, str) and t.strip():
                 auto_tags.append({"tag": t.strip(), "provenance": "auto"})
 
-    # Operator tags — query node_tags_operator table
-    operator_tags: list[dict[str, Any]] = []
-    operator_keys: set[str] = set()
-    try:
-        if hasattr(db, "node_tags_operator"):
-            rows = db(db.node_tags_operator.node_id == node_id).select()
-            for row in rows:
-                k = _g(row, "tag_key", "")
-                v = _g(row, "tag_value", "")
-                if k:
-                    tag_str = f"{k}:{v}" if v else k
-                    operator_tags.append(
-                        {
-                            "tag": tag_str,
-                            "tag_key": k,
-                            "tag_value": v,
-                            "provenance": "operator",
-                            "set_by": _g(row, "set_by_actor_sub"),
-                            "set_at": _iso(_g(row, "set_at")),
-                        }
-                    )
-                    operator_keys.add(k)
-    except Exception as exc:  # noqa: BLE001
-        log.warning("Could not fetch operator tags for node %s: %s", node_id, exc)
+    # Operator tags — query node_tags_operator table.
+    # Regression: gh-22. Read + build-response loop is a sequence of reads
+    # feeding the response -- one run_db() closure per the house rule.
+    def _fetch_operator_tags() -> tuple[list[dict[str, Any]], set[str]]:
+        tags: list[dict[str, Any]] = []
+        keys: set[str] = set()
+        try:
+            if hasattr(db, "node_tags_operator"):
+                rows = db(db.node_tags_operator.node_id == node_id).select()
+                for row in rows:
+                    k = _g(row, "tag_key", "")
+                    v = _g(row, "tag_value", "")
+                    if k:
+                        tag_str = f"{k}:{v}" if v else k
+                        tags.append(
+                            {
+                                "tag": tag_str,
+                                "tag_key": k,
+                                "tag_value": v,
+                                "provenance": "operator",
+                                "set_by": _g(row, "set_by_actor_sub"),
+                                "set_at": _iso(_g(row, "set_at")),
+                            }
+                        )
+                        keys.add(k)
+        except Exception as exc:  # noqa: BLE001
+            log.warning("Could not fetch operator tags for node %s: %s", node_id, exc)
+        return tags, keys
+
+    operator_tags, operator_keys = await run_db(_fetch_operator_tags)
 
     # Suppress auto tags whose key is shadowed by an operator tag
     merged_auto = [
@@ -1472,7 +1616,12 @@ async def patch_node_tags(node_id: int):
     assert body is not None
 
     db = get_db()
-    node = db(db.nodes.id == node_id).select().first() if hasattr(db, "nodes") else None
+    # Regression: gh-22. Off the event loop via run_db() instead of
+    # blocking the request coroutine inline.
+    def _fetch_node() -> Any:
+        return db(db.nodes.id == node_id).select().first() if hasattr(db, "nodes") else None
+
+    node = await run_db(_fetch_node)
     if not node:
         return err_not_found(f"Node {node_id} not found")
 
@@ -1484,48 +1633,61 @@ async def patch_node_tags(node_id: int):
     tenant_id = _g(node, "tenant_id", "__default__")
     now = datetime.now(timezone.utc)
 
-    try:
-        # Removes first
-        for entry in body.remove:
-            if hasattr(db, "node_tags_operator"):
-                db(
-                    (db.node_tags_operator.node_id == node_id)
-                    & (db.node_tags_operator.tag_key == entry.tag_key)
-                    & (db.node_tags_operator.tag_value == entry.tag_value)
-                ).delete()
+    # Regression: gh-22. The removes-loop + adds-loop + commit is one unit
+    # of work -- a penguin-dal connection checkout isn't safe to resume on
+    # a different thread hop, so it stays in one run_db() closure.
+    def _apply_tag_patch() -> tuple[bool, Any]:
+        try:
+            # Removes first
+            for entry in body.remove:
+                if hasattr(db, "node_tags_operator"):
+                    db(
+                        (db.node_tags_operator.node_id == node_id)
+                        & (db.node_tags_operator.tag_key == entry.tag_key)
+                        & (db.node_tags_operator.tag_value == entry.tag_value)
+                    ).delete()
 
-        # Adds (upsert: insert if not exists)
-        for entry in body.add:
-            if hasattr(db, "node_tags_operator"):
-                existing = db(
-                    (db.node_tags_operator.node_id == node_id)
-                    & (db.node_tags_operator.tag_key == entry.tag_key)
-                    & (db.node_tags_operator.tag_value == entry.tag_value)
-                ).select().first()
-                if not existing:
-                    db.node_tags_operator.insert(
-                        node_id=node_id,
-                        tenant_id=tenant_id,
-                        tag_key=entry.tag_key,
-                        tag_value=entry.tag_value,
-                        provenance="operator",
-                        set_by_actor_sub=actor,
-                        set_at=now,
-                    )
+            # Adds (upsert: insert if not exists)
+            for entry in body.add:
+                if hasattr(db, "node_tags_operator"):
+                    existing = db(
+                        (db.node_tags_operator.node_id == node_id)
+                        & (db.node_tags_operator.tag_key == entry.tag_key)
+                        & (db.node_tags_operator.tag_value == entry.tag_value)
+                    ).select().first()
+                    if not existing:
+                        db.node_tags_operator.insert(
+                            node_id=node_id,
+                            tenant_id=tenant_id,
+                            tag_key=entry.tag_key,
+                            tag_value=entry.tag_value,
+                            provenance="operator",
+                            set_by_actor_sub=actor,
+                            set_at=now,
+                        )
 
-        db.commit()
-    except Exception as exc:  # noqa: BLE001
-        db.rollback()
-        log.exception("Error patching tags for node %s: %s", node_id, exc)
-        return err_internal(str(exc))
+            db.commit()
+            return True, None
+        except Exception as exc:  # noqa: BLE001
+            db.rollback()
+            log.exception("Error patching tags for node %s: %s", node_id, exc)
+            return False, exc
 
-    _audit_log(
-        "node.tags.patch",
-        str(node_id),
-        after={
-            "add": [e.model_dump() for e in body.add],
-            "remove": [e.model_dump() for e in body.remove],
-        },
+    ok, err = await run_db(_apply_tag_patch)
+    if not ok:
+        return err_internal(str(err))
+
+    # Regression: gh-22. _audit_log() executes a direct penguin-dal
+    # insert+commit -- run it off the event loop too.
+    await run_db(
+        lambda: _audit_log(
+            "node.tags.patch",
+            str(node_id),
+            after={
+                "add": [e.model_dump() for e in body.add],
+                "remove": [e.model_dump() for e in body.remove],
+            },
+        )
     )
 
     # Return updated effective tag set
@@ -1550,7 +1712,12 @@ async def assign_biome_to_node(node_id: int):
     assert body is not None
 
     db = get_db()
-    node = db(db.nodes.id == node_id).select().first() if hasattr(db, "nodes") else None
+    # Regression: gh-22. Off the event loop via run_db() instead of
+    # blocking the request coroutine inline.
+    def _fetch_node() -> Any:
+        return db(db.nodes.id == node_id).select().first() if hasattr(db, "nodes") else None
+
+    node = await run_db(_fetch_node)
     if not node:
         return err_not_found(f"Node {node_id} not found")
 
@@ -1559,7 +1726,12 @@ async def assign_biome_to_node(node_id: int):
         if _g(node, "tenant_id", "__default__") != _current_tenant_id():
             return err_not_found(f"Node {node_id} not found")
 
-    biome = db(db.biomes.id == body.biome_id).select().first() if hasattr(db, "biomes") else None
+    # Regression: gh-22. Off the event loop via run_db() instead of
+    # blocking the request coroutine inline.
+    def _fetch_biome() -> Any:
+        return db(db.biomes.id == body.biome_id).select().first() if hasattr(db, "biomes") else None
+
+    biome = await run_db(_fetch_biome)
     if not biome:
         return err_not_found(f"Biome {body.biome_id} not found")
 
@@ -1567,21 +1739,28 @@ async def assign_biome_to_node(node_id: int):
     if not assign_tbl:
         return err_internal("node_egg_assignments table not available")
 
-    existing = db(
-        (assign_tbl.node_id == node_id)
-        & (getattr(assign_tbl, biome_field) == body.biome_id)
-        & (
-            assign_tbl.status.belongs(
-                ["pending", "deploying", "ready", "draining"]
+    def _check_existing() -> Any:
+        return db(
+            (assign_tbl.node_id == node_id)
+            & (getattr(assign_tbl, biome_field) == body.biome_id)
+            & (
+                assign_tbl.status.belongs(
+                    ["pending", "deploying", "ready", "draining"]
+                )
             )
-        )
-    ).select().first()
+        ).select().first()
+
+    existing = await run_db(_check_existing)
     if existing:
         return err_conflict(
             "Biome already assigned to this node",
             details={"assignment_id": _g(existing, "id"), "status": _g(existing, "status")},
         )
 
+    # NOTE: node_effective_tags() (app/api/_helpers.py) issues its own
+    # direct, unwrapped penguin-dal select -- out of scope for this sweep
+    # (app/api/_helpers.py is shared across blueprints, not one of this
+    # sweep's two target files); flagged as a follow-up.
     res: EligibilityResult = check_tag_eligibility(
         _g(biome, "requires_hardware_tags") or [],
         _g(biome, "forbids_hardware_tags") or [],
@@ -1596,7 +1775,10 @@ async def assign_biome_to_node(node_id: int):
         )
 
     if body.depends_on_biome_instance_id is not None:
-        dep = db(assign_tbl.id == body.depends_on_biome_instance_id).select().first()
+        def _fetch_dep() -> Any:
+            return db(assign_tbl.id == body.depends_on_biome_instance_id).select().first()
+
+        dep = await run_db(_fetch_dep)
         if not dep:
             return err_validation(
                 "depends_on_biome_instance_id references a missing assignment",
@@ -1609,35 +1791,43 @@ async def assign_biome_to_node(node_id: int):
                 ],
             )
 
-    try:
-        # Map field names for backward-compat: egg_id → biome_id, depends_on_egg_instance_id → depends_on_biome_instance_id
-        depends_field = "depends_on_egg_instance_id" if biome_field == "egg_id" else "depends_on_biome_instance_id"
-        # ``created_at``/``updated_at`` are NOT NULL on the real
-        # ``node_egg_assignments`` table with no server-side default (gh-21
-        # regression: this insert used to omit them entirely, which never
-        # surfaced against the phantom-table test fixtures' laxer
-        # constraints -- against real Postgres it's a NotNullViolation).
-        now = datetime.now(timezone.utc)
-        insert_data = {
-            "node_id": node_id,
-            biome_field: body.biome_id,
-            "tenant_id": _g(node, "tenant_id", "__default__"),
-            "phase": body.phase,
-            "status": "pending",
-            depends_field: body.depends_on_biome_instance_id,
-            "readiness_probe_state": "not_started",
-            "assigned_at": now,
-            "created_at": now,
-            "updated_at": now,
-        }
-        new_id = assign_tbl.insert(**insert_data)
-        db.commit()
-    except Exception as exc:  # noqa: BLE001
-        log.exception("Error assigning biome %s to node %s: %s", body.biome_id, node_id, exc)
-        return err_internal(str(exc))
+    # Regression: gh-22. insert + commit + the post-commit refetch is one
+    # unit of work -- stays in one run_db() closure per the house rule
+    # (see app/db/run_db.py).
+    def _insert_assignment() -> tuple[bool, Any]:
+        try:
+            # Map field names for backward-compat: egg_id → biome_id, depends_on_egg_instance_id → depends_on_biome_instance_id
+            depends_field = "depends_on_egg_instance_id" if biome_field == "egg_id" else "depends_on_biome_instance_id"
+            # ``created_at``/``updated_at`` are NOT NULL on the real
+            # ``node_egg_assignments`` table with no server-side default (gh-21
+            # regression: this insert used to omit them entirely, which never
+            # surfaced against the phantom-table test fixtures' laxer
+            # constraints -- against real Postgres it's a NotNullViolation).
+            now = datetime.now(timezone.utc)
+            insert_data = {
+                "node_id": node_id,
+                biome_field: body.biome_id,
+                "tenant_id": _g(node, "tenant_id", "__default__"),
+                "phase": body.phase,
+                "status": "pending",
+                depends_field: body.depends_on_biome_instance_id,
+                "readiness_probe_state": "not_started",
+                "assigned_at": now,
+                "created_at": now,
+                "updated_at": now,
+            }
+            new_id = assign_tbl.insert(**insert_data)
+            db.commit()
+            return True, db(assign_tbl.id == new_id).select().first()
+        except Exception as exc:  # noqa: BLE001
+            log.exception("Error assigning biome %s to node %s: %s", body.biome_id, node_id, exc)
+            return False, exc
 
-    row = db(assign_tbl.id == new_id).select().first()
-    return envelope_success({"assignment": _serialize_assignment(row, biome=biome)}, status_code=201)
+    ok, result = await run_db(_insert_assignment)
+    if not ok:
+        return err_internal(str(result))
+
+    return envelope_success({"assignment": _serialize_assignment(result, biome=biome)}, status_code=201)
 
 
 @nodes_bp.route("/<int:node_id>/biomes", methods=["GET"])
@@ -1645,7 +1835,12 @@ async def assign_biome_to_node(node_id: int):
 async def list_node_biomes(node_id: int):
     """List biome assignments for a node (Sprint 2 — retained)."""
     db = get_db()
-    node = db(db.nodes.id == node_id).select().first() if hasattr(db, "nodes") else None
+    # Regression: gh-22. Off the event loop via run_db() instead of
+    # blocking the request coroutine inline.
+    def _fetch_node() -> Any:
+        return db(db.nodes.id == node_id).select().first() if hasattr(db, "nodes") else None
+
+    node = await run_db(_fetch_node)
     if not node:
         return err_not_found(f"Node {node_id} not found")
 
@@ -1662,13 +1857,22 @@ async def list_node_biomes(node_id: int):
     q = assign_tbl.node_id == node_id
     if statuses:
         q = q & assign_tbl.status.belongs(statuses)
-    rows = db(q).select(orderby=assign_tbl.assigned_at)
 
-    out: list[dict] = []
-    for row in rows:
-        biome_id = _g(row, biome_field)
-        biome = db(db.biomes.id == biome_id).select().first() if hasattr(db, "biomes") and biome_id else None
-        out.append(_serialize_assignment(row, biome=biome))
+    # Regression: gh-22. Assignment-rows fetch + per-row biome fetch is a
+    # sequence of reads feeding the response -- one run_db() closure per
+    # the house rule (see app/db/run_db.py).
+    def _fetch_assignments_with_biomes() -> list[tuple[Any, Any]]:
+        rows = db(q).select(orderby=assign_tbl.assigned_at)
+        pairs: list[tuple[Any, Any]] = []
+        for row in rows:
+            biome_id = _g(row, biome_field)
+            biome = db(db.biomes.id == biome_id).select().first() if hasattr(db, "biomes") and biome_id else None
+            pairs.append((row, biome))
+        return pairs
+
+    pairs = await run_db(_fetch_assignments_with_biomes)
+
+    out = [_serialize_assignment(row, biome=biome) for row, biome in pairs]
     return envelope_success({"assignments": out, "total": len(out)})
 
 
@@ -1677,7 +1881,12 @@ async def list_node_biomes(node_id: int):
 async def unassign_biome_from_node(node_id: int, biome_id: int):
     """Unassign a biome from a node (Sprint 2 — retained)."""
     db = get_db()
-    node = db(db.nodes.id == node_id).select().first() if hasattr(db, "nodes") else None
+    # Regression: gh-22. Off the event loop via run_db() instead of
+    # blocking the request coroutine inline.
+    def _fetch_node() -> Any:
+        return db(db.nodes.id == node_id).select().first() if hasattr(db, "nodes") else None
+
+    node = await run_db(_fetch_node)
     if not node:
         return err_not_found(f"Node {node_id} not found")
 
@@ -1690,27 +1899,40 @@ async def unassign_biome_from_node(node_id: int, biome_id: int):
     if not assign_tbl:
         return err_not_found(f"No active assignment for biome {biome_id} on node {node_id}")
 
-    row = db(
-        (assign_tbl.node_id == node_id)
-        & (getattr(assign_tbl, biome_field) == biome_id)
-        & (
-            assign_tbl.status.belongs(
-                ["pending", "deploying", "ready"]
+    # Regression: gh-22. Off the event loop via run_db() instead of
+    # blocking the request coroutine inline.
+    def _fetch_assignment() -> Any:
+        return db(
+            (assign_tbl.node_id == node_id)
+            & (getattr(assign_tbl, biome_field) == biome_id)
+            & (
+                assign_tbl.status.belongs(
+                    ["pending", "deploying", "ready"]
+                )
             )
-        )
-    ).select().first()
+        ).select().first()
+
+    row = await run_db(_fetch_assignment)
     if not row:
         return err_not_found(f"No active assignment for biome {biome_id} on node {node_id}")
 
-    try:
-        db(assign_tbl.id == row.id).update(
-            status="draining",
-            removed_at=datetime.now(timezone.utc),
-        )
-        db.commit()
-    except Exception as exc:  # noqa: BLE001
-        log.exception("Error unassigning biome %s from node %s: %s", biome_id, node_id, exc)
-        return err_internal(str(exc))
+    # Regression: gh-22. update + commit is one unit of work -- stays in
+    # one run_db() closure per the house rule.
+    def _drain_assignment() -> tuple[bool, Any]:
+        try:
+            db(assign_tbl.id == row.id).update(
+                status="draining",
+                removed_at=datetime.now(timezone.utc),
+            )
+            db.commit()
+            return True, None
+        except Exception as exc:  # noqa: BLE001
+            log.exception("Error unassigning biome %s from node %s: %s", biome_id, node_id, exc)
+            return False, exc
+
+    ok, err = await run_db(_drain_assignment)
+    if not ok:
+        return err_internal(str(err))
 
     return envelope_success(
         {
@@ -1744,7 +1966,12 @@ async def get_node_cloud_init(node_id: int) -> Any:
         return err_bad_request(f"Invalid baseline; must be one of: {', '.join(sorted(_VALID_BASELINES))}")
 
     db = get_db()
-    node = db(db.nodes.id == node_id).select().first() if hasattr(db, "nodes") else None
+    # Regression: gh-22. Off the event loop via run_db() instead of
+    # blocking the request coroutine inline.
+    def _fetch_node() -> Any:
+        return db(db.nodes.id == node_id).select().first() if hasattr(db, "nodes") else None
+
+    node = await run_db(_fetch_node)
     if not node:
         return err_not_found(f"Node {node_id} not found")
 
@@ -1752,14 +1979,19 @@ async def get_node_cloud_init(node_id: int) -> Any:
         if _g(node, "tenant_id", "__default__") != _current_tenant_id():
             return err_not_found(f"Node {node_id} not found")
 
-    template_row = None
-    try:
-        if hasattr(db, "cloud_init_templates"):
-            template_row = db(
-                db.cloud_init_templates.is_default == True  # noqa: E712
-            ).select().first()
-    except Exception as exc:  # noqa: BLE001
-        log.warning("Error querying cloud_init_templates: %s", exc)
+    # Regression: gh-22. Off the event loop via run_db() instead of
+    # blocking the request coroutine inline.
+    def _fetch_template() -> Any:
+        try:
+            if hasattr(db, "cloud_init_templates"):
+                return db(
+                    db.cloud_init_templates.is_default == True  # noqa: E712
+                ).select().first()
+        except Exception as exc:  # noqa: BLE001
+            log.warning("Error querying cloud_init_templates: %s", exc)
+        return None
+
+    template_row = await run_db(_fetch_template)
 
     if template_row is None:
         return err_not_found("No default cloud-init template configured")
@@ -1813,7 +2045,12 @@ async def node_lxd_join(node_id: int) -> Any:
         return err_bad_request("member_name is required")
 
     db = get_db()
-    node = db(db.nodes.id == node_id).select().first() if hasattr(db, "nodes") else None
+    # Regression: gh-22. Off the event loop via run_db() instead of
+    # blocking the request coroutine inline.
+    def _fetch_node() -> Any:
+        return db(db.nodes.id == node_id).select().first() if hasattr(db, "nodes") else None
+
+    node = await run_db(_fetch_node)
     if not node:
         return err_not_found(f"Node {node_id} not found")
 
@@ -1838,26 +2075,35 @@ async def node_lxd_join(node_id: int) -> Any:
 
     now = datetime.now(timezone.utc)
 
-    try:
-        if hasattr(db, "lxd_cluster_members"):
-            db.lxd_cluster_members.insert(
-                cluster_id=cluster_id_raw,
-                member_name=member_name,
-                api_url=api_url,
-                status="joined",
-                joined_at=now,
-                created_at=now,
-            )
-        if _g(node, "state") != "ready":
-            db(db.nodes.id == node_id).update(
-                state="ready",
-                updated_at=now,
-            )
-        db.commit()
-    except Exception as exc:  # noqa: BLE001
-        db.rollback()
-        log.exception("DB error recording LXD membership for node %s: %s", node_id, exc)
-        return err_internal(str(exc))
+    # Regression: gh-22. insert + conditional update + commit is one unit
+    # of work -- stays in one run_db() closure per the house rule (see
+    # app/db/run_db.py).
+    def _record_membership() -> tuple[bool, Any]:
+        try:
+            if hasattr(db, "lxd_cluster_members"):
+                db.lxd_cluster_members.insert(
+                    cluster_id=cluster_id_raw,
+                    member_name=member_name,
+                    api_url=api_url,
+                    status="joined",
+                    joined_at=now,
+                    created_at=now,
+                )
+            if _g(node, "state") != "ready":
+                db(db.nodes.id == node_id).update(
+                    state="ready",
+                    updated_at=now,
+                )
+            db.commit()
+            return True, None
+        except Exception as exc:  # noqa: BLE001
+            db.rollback()
+            log.exception("DB error recording LXD membership for node %s: %s", node_id, exc)
+            return False, exc
+
+    ok, err = await run_db(_record_membership)
+    if not ok:
+        return err_internal(str(err))
 
     log.info(
         "Node %s joined LXD cluster %s as member %s",
