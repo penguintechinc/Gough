@@ -15,40 +15,6 @@ import pytest
 from app.workers import smart_sweeper as sw
 
 
-# ---------------------------------------------------------------------------
-# Fixtures
-# ---------------------------------------------------------------------------
-
-
-@pytest.fixture()
-def app_ctx(monkeypatch):
-    """Satisfy ``SMARTSweeper``'s app-context guard for tests that don't
-    exercise real Quart app-context plumbing.
-
-    ``run_once()``/``run_forever()`` now guard for an active Quart app
-    context (``app.workers.smart_sweeper._require_app_context()``) before
-    calling ``app.models.get_db()`` -- see that module's docstring. Every
-    test below monkeypatches ``get_db`` directly, so none of them need a
-    *real* app/context behind the guard -- this monkeypatches the module's
-    ``has_app_context`` name directly instead of constructing one.
-
-    Deliberately not implemented via a real ``quart.ctx.AppContext`` push:
-    ``tests/workers/conftest.py`` stubs ``sys.modules["quart"]`` with a
-    ``MagicMock()`` in environments where the real package isn't
-    importable, which breaks a genuine ``from quart.ctx import ...`` (no
-    ``__path__``) and, more importantly, would make a *correctly* pushed
-    real context indistinguishable from the stub's MagicMock-truthy
-    ``has_app_context()`` anyway -- neither proves anything in that case.
-    Monkeypatching the name ``_require_app_context()`` actually calls works
-    identically regardless of which `quart` this test session resolved to.
-    The guard's real behaviour (raising when there's genuinely no context)
-    is proven directly against ``_require_app_context()`` in
-    ``test_require_app_context_raises_clear_error`` below, the same way.
-    """
-    monkeypatch.setattr(sw, "has_app_context", lambda: True)
-    yield
-
-
 HEALTHY_SATA = {
     "smart_status": {"passed": True},
     "ata_smart_attributes": {
@@ -158,59 +124,6 @@ def test_derive_status_unknown_when_empty():
 
 
 # ---------------------------------------------------------------------------
-# App-context guard (F1 fix round) — proven directly, not environment-dependent
-# ---------------------------------------------------------------------------
-#
-# ``_require_app_context()``'s real behaviour (raise a clear error when
-# there's no active Quart app context) is proven here by monkeypatching
-# ``has_app_context`` itself to return ``False`` -- deliberately not by
-# omitting a real pushed context, since whether ``quart`` resolves to the
-# real package or ``tests/workers/conftest.py``'s ``MagicMock`` stub (see
-# that conftest's ``_install_stubs()``) is environment-dependent, and a
-# MagicMock-backed ``has_app_context()`` is truthy regardless. Monkeypatching
-# the name directly sidesteps that entirely and is deterministic either way.
-
-
-def test_require_app_context_raises_clear_error(monkeypatch):
-    """The guard raises a descriptive RuntimeError naming the actual cause
-    (RLS-wired app.models.get_db() needs an app context) -- not an opaque
-    error surfacing later from deep inside a query.
-    """
-    monkeypatch.setattr(sw, "has_app_context", lambda: False)
-    with pytest.raises(RuntimeError, match="Quart app context"):
-        sw._require_app_context()
-
-
-def test_require_app_context_passes_when_in_context(monkeypatch):
-    monkeypatch.setattr(sw, "has_app_context", lambda: True)
-    sw._require_app_context()  # must not raise
-
-
-def test_run_once_raises_immediately_when_no_app_context(monkeypatch):
-    """run_once() itself surfaces the guard before doing anything else --
-    before calling get_db(), before touching the lease.
-    """
-    monkeypatch.setattr(sw, "has_app_context", lambda: False)
-    calls: list = []
-    monkeypatch.setattr(sw, "get_db", lambda: calls.append("get_db") or None)
-    sweeper = sw.SMARTSweeper(holder_id="t")
-    with pytest.raises(RuntimeError, match="app context"):
-        sweeper.run_once(ttl=60)
-    assert calls == [], "run_once() must guard before ever calling get_db()"
-
-
-def test_run_forever_raises_immediately_when_no_app_context(monkeypatch):
-    """run_forever() guards once, up front, before entering its loop --
-    not silently logged-and-retried forever by the loop's own broad
-    exception handler.
-    """
-    monkeypatch.setattr(sw, "has_app_context", lambda: False)
-    sweeper = sw.SMARTSweeper(holder_id="t")
-    with pytest.raises(RuntimeError, match="app context"):
-        sweeper.run_forever(interval_seconds=1)
-
-
-# ---------------------------------------------------------------------------
 # Leader lease behaviour
 # ---------------------------------------------------------------------------
 
@@ -272,7 +185,7 @@ def ready_node(dal):
     return SimpleNamespace(node_id=int(node_id), sda=int(sda), sdb=int(sdb))
 
 
-def test_sweep_skips_when_not_leader(dal, ready_node, app_ctx):
+def test_sweep_skips_when_not_leader(dal, ready_node):
     lease = _FakeLease(will_grant=False)
     publishes: list = []
     sweeper = sw.SMARTSweeper(
@@ -289,7 +202,7 @@ def test_sweep_skips_when_not_leader(dal, ready_node, app_ctx):
     assert publishes == []
 
 
-def test_sweep_only_visits_ready_nodes(dal, ready_node, app_ctx):
+def test_sweep_only_visits_ready_nodes(dal, ready_node):
     lease = _FakeLease(will_grant=True)
     visits: list = []
 
@@ -311,7 +224,7 @@ def test_sweep_only_visits_ready_nodes(dal, ready_node, app_ctx):
     assert lease.released == 1
 
 
-def test_sweep_emits_warning_on_transition(dal, ready_node, app_ctx):
+def test_sweep_emits_warning_on_transition(dal, ready_node):
     lease = _FakeLease(will_grant=True)
     publishes: list = []
 
@@ -336,7 +249,7 @@ def test_sweep_emits_warning_on_transition(dal, ready_node, app_ctx):
     assert sda.smart_status == "warning"
 
 
-def test_sweep_does_not_re_emit_when_already_warning(dal, ready_node, app_ctx):
+def test_sweep_does_not_re_emit_when_already_warning(dal, ready_node):
     """Second sweep with same warning should not re-publish (transition only)."""
     lease = _FakeLease(will_grant=True)
     publishes: list = []
@@ -353,7 +266,7 @@ def test_sweep_does_not_re_emit_when_already_warning(dal, ready_node, app_ctx):
     assert publishes == []
 
 
-def test_sweep_handles_runner_exception(dal, ready_node, app_ctx):
+def test_sweep_handles_runner_exception(dal, ready_node):
     lease = _FakeLease(will_grant=True)
 
     def boom(node):
@@ -370,7 +283,7 @@ def test_sweep_handles_runner_exception(dal, ready_node, app_ctx):
     assert res.disks_probed == 0
 
 
-def test_sweep_skips_unknown_device_paths(dal, ready_node, app_ctx):
+def test_sweep_skips_unknown_device_paths(dal, ready_node):
     lease = _FakeLease(will_grant=True)
     publishes: list = []
 
@@ -385,7 +298,7 @@ def test_sweep_skips_unknown_device_paths(dal, ready_node, app_ctx):
     assert publishes == []
 
 
-def test_sweep_updates_capacity_metric(dal, ready_node, app_ctx):
+def test_sweep_updates_capacity_metric(dal, ready_node):
     lease = _FakeLease(will_grant=True)
     sweeper = sw.SMARTSweeper(
         smartctl_runner=lambda n: {"/dev/sda": HEALTHY_SATA, "/dev/sdb": HEALTHY_SATA},
@@ -418,7 +331,7 @@ def test_default_smartctl_runner_raises():
         sw._default_smartctl_runner(SimpleNamespace(id=1))
 
 
-def test_failed_smart_emits_warning_with_failed_status(dal, ready_node, app_ctx):
+def test_failed_smart_emits_warning_with_failed_status(dal, ready_node):
     lease = _FakeLease(will_grant=True)
     publishes: list = []
     sweeper = sw.SMARTSweeper(
@@ -471,7 +384,50 @@ def _seed_pg_ready_node_and_disk(db, tenant_id: str = "acme", node_name: str = "
     return int(node_id), int(disk_id)
 
 
-def test_run_once_real_leader_lease_module_accepts_penguin_dal_db(pg_db, monkeypatch, app_ctx):
+def test_run_once_succeeds_without_app_context_against_real_pg(pg_db, monkeypatch):
+    """Regression: gh-22 (DB pool consolidation). ``SMARTSweeper`` used to
+    require an active Quart app context (the now-removed
+    ``_require_app_context()`` guard) because its ``get_db()`` resolved to
+    ``app.models.get_db()`` (``quart.g``/``current_app``-backed). It now
+    resolves to ``app.db.database.get_db()`` (RLS-wired, app-context-free --
+    see that module's docstring), so ``run_once()`` must succeed with NO
+    Quart app context pushed at all. Exercised against real Postgres (not
+    the sqlite ``dal`` fixture) because the whole point is proving the path
+    this worker now goes through -- ``app.db.database``'s own
+    ``init_db()``/RLS wiring, not just "some get_db() got monkeypatched".
+
+    No app context is pushed anywhere in this test (unlike
+    ``test_disks.py``'s fixtures, nothing here builds a Quart app at all) --
+    deliberately not asserted via ``quart.has_app_context()`` itself, since
+    ``tests/workers/conftest.py`` stubs ``sys.modules["quart"]`` with a
+    ``MagicMock()`` whenever this module is the first to import ``quart`` in
+    the session, and a MagicMock-backed ``has_app_context()`` call is
+    truthy regardless of whether it's real quart underneath -- the absence
+    of a context is structural here (nothing in this file ever pushes one),
+    not something worth re-proving through a mock that can't tell the
+    difference.
+    """
+    import app.workers.smart_sweeper as sweeper_mod
+
+    monkeypatch.setattr(sweeper_mod, "get_db", lambda: pg_db)
+    node_id, disk_id = _seed_pg_ready_node_and_disk(pg_db)
+
+    sweeper = sw.SMARTSweeper(
+        smartctl_runner=lambda node: {"/dev/sda": HEALTHY_SATA},
+        publisher=lambda *_: None,
+        holder_id="no-ctx-holder",
+    )
+    res = sweeper.run_once(ttl=60)
+
+    assert res.leader is True
+    assert res.nodes_visited == 1
+    assert res.disks_probed == 1
+
+    disk = pg_db(pg_db.disks.id == disk_id).select().first()
+    assert disk.smart_status == "passed"
+
+
+def test_run_once_real_leader_lease_module_accepts_penguin_dal_db(pg_db, monkeypatch):
     """Regression test for the Task 8a cascade: ``leader_lease.acquire()``/
     ``release()`` take a penguin-dal ``DB`` (each statement its own
     autocommitted ``executesql()`` call -- see that module's docstring), not
@@ -506,7 +462,7 @@ def test_run_once_real_leader_lease_module_accepts_penguin_dal_db(pg_db, monkeyp
     assert lease_rows == [(None,)], "release() must clear the holder after a successful sweep"
 
 
-def test_run_once_second_sweep_reacquires_released_lease(pg_db, monkeypatch, app_ctx):
+def test_run_once_second_sweep_reacquires_released_lease(pg_db, monkeypatch):
     """A released lease can be re-acquired on the next tick -- proves
     ``release()`` actually persisted the clear (not just returned truthy)
     when called with the new penguin-dal ``DB`` argument.
@@ -528,7 +484,7 @@ def test_run_once_second_sweep_reacquires_released_lease(pg_db, monkeypatch, app
 
 
 def test_run_once_cross_tenant_sentinel_lets_scoped_role_sweep_other_tenant(
-    pg_db, pg_db_scoped, monkeypatch, app_ctx
+    pg_db, pg_db_scoped, monkeypatch
 ):
     """``nodes``/``disks`` are RLS-protected (baseline ``rls_tables``).
     Proves the cross-tenant sentinel wrap added to ``run_once()`` lets the

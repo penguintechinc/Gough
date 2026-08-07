@@ -24,20 +24,16 @@ Scheduled by ``supercronic`` at the cluster's configured interval (default 15
 minutes); ``run_forever`` is also available for environments running the
 sweeper as a long-lived sidecar.
 
-**Requires an active Quart app context.** ``run_once()``/``run_forever()``
-call ``app.models.get_db()`` (RLS-wired, per this module's ``get_db`` import)
-which reads ``quart.g``/``current_app`` and raises outside one -- but this
-worker itself runs OUTSIDE Quart's request pipeline (leader-only,
-supercronic-scheduled or long-lived-sidecar, never an HTTP handler). There is
-no wired production entrypoint for this worker yet (confirmed: no caller in
-this repo besides tests, which monkeypatch ``get_db`` and never hit this).
-Until one exists, the real production caller MUST wrap invocation in
-``async with app.app_context():``. ``run_once()``/``run_forever()`` both
-guard for this explicitly (see ``_require_app_context()``) and raise a clear
-``RuntimeError`` rather than failing with an opaque error deep inside a
-query. The systemic fix -- an RLS-wired DB accessor for background workers
-that doesn't depend on a Quart app context -- is tracked separately as a
-follow-up cleanup, not solved here.
+**No Quart app context required.** Regression: gh-22 (DB pool
+consolidation). ``run_once()``/``run_forever()`` call
+``app.db.database.get_db()`` -- the RLS-wired, app-context-free accessor
+(see that module's docstring) -- rather than the app-context-bound
+``app.models.get_db()`` this worker used to depend on. This worker runs
+OUTSIDE Quart's request pipeline entirely (leader-only,
+supercronic-scheduled or long-lived-sidecar, never an HTTP handler), so
+there is no request/app context to push in the first place; the previous
+``_require_app_context()`` guard existed only because the old accessor
+needed one, and has been removed along with the dependency that required it.
 """
 
 from __future__ import annotations
@@ -53,31 +49,12 @@ from datetime import datetime, timezone
 from typing import Any, Callable, Optional
 
 from prometheus_client import Counter, Gauge
-from quart import has_app_context
 
+from ..db.database import get_db
 from ..db.rls import CROSS_TENANT_SENTINEL, get_current_tenant, set_current_tenant
-from ..models import get_db
 from . import leader_lease as _leader_lease
 
 logger = logging.getLogger(__name__)
-
-
-def _require_app_context() -> None:
-    """Raise a clear, descriptive error if called outside a Quart app context.
-
-    ``app.models.get_db()`` reads ``quart.g``/``current_app`` and would
-    otherwise fail with an opaque ``RuntimeError: Not within an app
-    context`` raised deep inside whichever query happens to run first --
-    see the module docstring for why this worker needs one at all.
-    """
-    if not has_app_context():
-        raise RuntimeError(
-            "SMARTSweeper must run within a Quart app context because it "
-            "uses the RLS-wired app.models.get_db() (quart.g/current_app-"
-            "backed). Wrap the call in `async with app.app_context():` -- "
-            "e.g. `async with app.app_context(): sweeper.run_once()`. "
-            "See app.workers.smart_sweeper's module docstring."
-        )
 
 
 @contextmanager
@@ -94,10 +71,11 @@ def _cross_tenant_scope() -> Iterator[None]:
     ``app.workers.audit_chain_writer._cross_tenant_scope()`` /
     ``app.grpc_server._cross_tenant_scope()`` (duplicated locally rather than
     imported, matching this codebase's existing per-module convention).
-    Omitting this would silently fail-closed to zero visible nodes/disks now
-    that ``get_db()`` here resolves to the RLS-wired engine
-    (``app.models.get_db``, wired via ``install_rls_events``) instead of the
-    unwired ``app.db.database`` pool -- not raise, just sweep nothing, ever.
+    Omitting this would silently fail-closed to zero visible nodes/disks --
+    ``get_db()`` here resolves to ``app.db.database``'s RLS-wired,
+    app-context-free engine (wired via ``install_rls_events`` inside that
+    module's own ``init_db()`` -- see gh-22) -- not raise, just sweep
+    nothing, ever.
     """
     previous = get_current_tenant()
     set_current_tenant(CROSS_TENANT_SENTINEL)
@@ -287,12 +265,7 @@ class SMARTSweeper:
         If the lease is held by another replica, returns a result with
         ``leader=False`` and zero counters — caller is expected to back off and
         retry on the next supercron tick.
-
-        Raises:
-            RuntimeError: if called outside an active Quart app context --
-                see the module docstring and :func:`_require_app_context`.
         """
-        _require_app_context()
         result = SweepResult()
         db = get_db()
 
@@ -321,16 +294,7 @@ class SMARTSweeper:
     def run_forever(self, interval_seconds: int = 900) -> None:
         """Long-lived sweep loop. Sleeps ``interval_seconds`` between ticks
         regardless of leader status — non-leaders idle-poll cheaply.
-
-        Raises:
-            RuntimeError: immediately, before entering the loop, if called
-                outside an active Quart app context -- see the module
-                docstring and :func:`_require_app_context`. Checked once up
-                front rather than left to surface (and be logged-and-
-                swallowed, forever, every tick) from inside the loop's own
-                broad exception handler below.
         """
-        _require_app_context()
         logger.info(
             "smart_sweeper: starting run_forever interval=%ss", interval_seconds
         )
