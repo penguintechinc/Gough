@@ -22,6 +22,7 @@ from sqlalchemy import (
     TypeDecorator,
     UniqueConstraint,
     Uuid,
+    func,
     text,
 )
 from sqlalchemy.dialects import postgresql
@@ -858,6 +859,89 @@ class WebhookEndpoint(Base):
     __table_args__ = (
         Index("ix_webhook_endpoints_tenant_id", "tenant_id"),
         Index("ix_webhook_endpoints_active", "active"),
+        {"extend_existing": True},
+    )
+
+
+# =============================================================================
+# Orphan Table Schemas (gh-21)
+# =============================================================================
+# The following twelve tables are queried at runtime throughout app/api/ (and
+# app/permissions.py) but had no SQLAlchemy model or migration anywhere in
+# the codebase -- see .superpowers/sdd/followups/orphan-schemas-brief.md for
+# the file:line usage recon each profile below is derived from. Declaring
+# them here registers them on the shared Base the same way every other M1
+# table is, so Base.metadata.create_all() (driven by the baseline migration)
+# creates them on a fresh database. Grants + RLS enablement live in the
+# baseline migration itself (SQLAlchemy metadata can't express GRANT/RLS).
+#
+# created_at/updated_at use ``server_default=func.now()`` (a genuine
+# database-side DEFAULT) rather than this file's more common Python-side
+# ``default=lambda: datetime.now(timezone.utc)`` pattern, for several of
+# these tables specifically because their INSERT call sites never pass
+# those columns (verified: ``app.api.ipxe.create_image``,
+# ``create_boot_config``, ``update_ipxe_config``'s create branch,
+# ``app.api.biomes.create_biome_group``) -- a Python-side-only default is
+# invisible to penguin-dal's reflected-table insert (the exact class of bug
+# already fixed for ``boot_events`` in the approved brief, and documented in
+# ``tests/test_rls_isolation.py``'s node/node_events seed-helper
+# docstrings). Applied uniformly across all twelve tables' created_at/
+# updated_at columns here rather than table-by-table, since "does today's
+# caller happen to pass it" is a fragile thing to keep in sync by hand.
+
+
+class Cluster(Base):
+    """Cluster registry -- the tenant-ownership anchor for every
+    ``/api/v1/clusters/<cluster_id>/*`` route.
+
+    SECURITY-CRITICAL (gh-21): missing this table was a fail-open
+    tenant-IDOR gate. ``app.api.clusters._require_cluster_tenant`` guards
+    every cluster-scoped route with ``if hasattr(db, "clusters"): ...`` --
+    with no ``clusters`` table at all, that check was always False, so the
+    tenant-ownership lookup was skipped entirely and cross-tenant requests
+    for someone else's cluster were never rejected. Creating this table
+    makes ``hasattr(db, "clusters")`` True, which is what turns the guard
+    on.
+    """
+
+    __tablename__ = "clusters"
+
+    id = Column(String(255), primary_key=True)
+    tenant_id = Column(String(255), nullable=False, server_default="__default__")
+    name = Column(String(255), nullable=False, unique=True)
+    description = Column(Text, nullable=True)
+    status = Column(String(32), nullable=False, server_default="ready")
+    created_at = Column(DateTime(timezone=True), nullable=False, server_default=func.now())
+    updated_at = Column(DateTime(timezone=True), nullable=False, server_default=func.now())
+
+    __table_args__ = (
+        Index("ix_clusters_tenant_id", "tenant_id"),
+        {"extend_existing": True},
+    )
+
+
+class ClusterConfig(Base):
+    """Schemaless key/value config document store scoped to a single cluster.
+
+    Backs the network-pools / baseline-topology / identity-plane / generic
+    config documents surfaced under ``/api/v1/clusters/<cluster_id>/*``
+    (``app.api.clusters._load_cluster_doc`` / ``_save_cluster_doc``)
+    without proliferating a dedicated table per document type. Cluster-
+    scoped, not tenant-scoped -- no RLS, same as ``migration_policy``.
+    """
+
+    __tablename__ = "cluster_config"
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    cluster_id = Column(String(255), ForeignKey("clusters.id", ondelete="CASCADE"), nullable=False)
+    key = Column(String(128), nullable=False)
+    value_json = Column(JSON, nullable=False)
+    created_at = Column(DateTime(timezone=True), nullable=False, server_default=func.now())
+    updated_at = Column(DateTime(timezone=True), nullable=False, server_default=func.now())
+
+    __table_args__ = (
+        UniqueConstraint("cluster_id", "key", name="uq_cluster_config_cluster_key"),
+        Index("ix_cluster_config_cluster_id", "cluster_id"),
         {"extend_existing": True},
     )
 
