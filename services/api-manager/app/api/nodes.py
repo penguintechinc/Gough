@@ -35,6 +35,7 @@ from typing import Any, Optional
 
 from quart import Blueprint, Response, g, request, current_app
 
+from ..db.run_db import run_db
 from ..middleware import auth_required
 from ..models import get_db
 from ._biome_schema import NodeBiomeAssignRequest
@@ -648,6 +649,14 @@ async def list_nodes():
       name_contains case-insensitive substring match on name
       page_size     default 50, max 500
       cursor        opaque pagination cursor
+
+    Regression: gh-22. The SELECT now runs off the event loop via
+    ``run_db()`` -- this service is single-process/single-loop (gRPC
+    shares it), so a synchronous, potentially page_size=500-row query here
+    would stall every other request/RPC until it returned. Cursor
+    filtering is still applied client-side over the fixed ``page_size + 1``
+    window fetched below (unchanged, pre-existing behavior) -- a true
+    DB-side seek past that window is out of scope for this sweep.
     """
     args = request.args
     db = get_db()
@@ -713,10 +722,13 @@ async def list_nodes():
         else:
             q = table.id > 0  # select-all sentinel
 
-        rows = db(q).select(
-            orderby=(table.created_at, table.id),
-            limitby=(0, page_size + 1),
-        )
+        def _fetch() -> Any:
+            return db(q).select(
+                orderby=(table.created_at, table.id),
+                limitby=(0, page_size + 1),
+            )
+
+        rows = await run_db(_fetch)
     except Exception as exc:  # noqa: BLE001
         log.exception("Error listing nodes: %s", exc)
         return envelope_error("internal_error", str(exc), 500)
