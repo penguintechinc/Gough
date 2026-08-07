@@ -25,6 +25,7 @@ from typing import Any, Callable, Optional
 
 from quart import Blueprint, current_app, g, jsonify, request
 
+from ..db.run_db import run_db
 from ..middleware import auth_required
 from ..models import get_db
 from ..workers.migration_engine import (
@@ -222,49 +223,60 @@ def _policy_dict_to_dataclass(d: dict) -> PolicyDC:
     )
 
 
-def _load_cluster_state(cluster_id: str) -> ClusterState:
+async def _load_cluster_state(cluster_id: str) -> ClusterState:
     """Load a ``ClusterState`` snapshot from the live DB.
 
     The capacity provider (WaddleAI) is consulted in M2 to populate the
     ``forecast_*`` fields; M1 falls back to the current free-percent values
     captured on the ``nodes.hardware_json`` blob.
+
+    Regression: gh-22. Unbounded full-table scan over ``nodes`` -- genuinely
+    needed here (a migration safety decision has to see every node's live
+    capacity, not a page of them), so this is a wrap-only conversion, not a
+    pagination one. Both reads (the node scan + the in-flight migration
+    count) are one logical "cluster state" snapshot, so they run in a single
+    ``run_db()`` closure rather than two separate thread hops.
     """
     db = get_db()
-    nodes: list[NodeSnapshot] = []
-    if "nodes" in getattr(db, "tables", []):
-        rows = db(db.nodes.id > 0).select()
-        for row in rows:
-            hw = getattr(row, "hardware_json", None) or {}
-            cpu_free = float(hw.get("cpu_free_pct", 100.0))
-            mem_free = float(hw.get("mem_free_pct", 100.0))
-            disk_free = float(hw.get("disk_free_pct", 100.0))
-            tags = frozenset(hw.get("tags", []) or [])
-            score = float(hw.get("composite_load_score", 0.0))
-            nodes.append(NodeSnapshot(
-                node_id=row.id,
-                state=str(row.state or "unknown"),
-                cpu_free_pct=cpu_free,
-                mem_free_pct=mem_free,
-                disk_free_pct=disk_free,
-                forecast_cpu_free_pct=float(hw.get("forecast_cpu_free_pct",
-                                                    cpu_free)),
-                forecast_mem_free_pct=float(hw.get("forecast_mem_free_pct",
-                                                    mem_free)),
-                forecast_disk_free_pct=float(hw.get("forecast_disk_free_pct",
-                                                     disk_free)),
-                hardware_tags=tags,
-                composite_load_score=score,
-            ))
-    in_flight = 0
-    if "migration_events" in getattr(db, "tables", []):
-        in_flight = db(
-            db.migration_events.result == "in_flight"
-        ).count()
-    return ClusterState(
-        cluster_id=cluster_id,
-        nodes=tuple(nodes),
-        in_flight_migrations=in_flight,
-    )
+
+    def _do_load() -> ClusterState:
+        nodes: list[NodeSnapshot] = []
+        if "nodes" in getattr(db, "tables", []):
+            rows = db(db.nodes.id > 0).select()
+            for row in rows:
+                hw = getattr(row, "hardware_json", None) or {}
+                cpu_free = float(hw.get("cpu_free_pct", 100.0))
+                mem_free = float(hw.get("mem_free_pct", 100.0))
+                disk_free = float(hw.get("disk_free_pct", 100.0))
+                tags = frozenset(hw.get("tags", []) or [])
+                score = float(hw.get("composite_load_score", 0.0))
+                nodes.append(NodeSnapshot(
+                    node_id=row.id,
+                    state=str(row.state or "unknown"),
+                    cpu_free_pct=cpu_free,
+                    mem_free_pct=mem_free,
+                    disk_free_pct=disk_free,
+                    forecast_cpu_free_pct=float(hw.get("forecast_cpu_free_pct",
+                                                        cpu_free)),
+                    forecast_mem_free_pct=float(hw.get("forecast_mem_free_pct",
+                                                        mem_free)),
+                    forecast_disk_free_pct=float(hw.get("forecast_disk_free_pct",
+                                                         disk_free)),
+                    hardware_tags=tags,
+                    composite_load_score=score,
+                ))
+        in_flight = 0
+        if "migration_events" in getattr(db, "tables", []):
+            in_flight = db(
+                db.migration_events.result == "in_flight"
+            ).count()
+        return ClusterState(
+            cluster_id=cluster_id,
+            nodes=tuple(nodes),
+            in_flight_migrations=in_flight,
+        )
+
+    return await run_db(_do_load)
 
 
 def _load_biome_snapshot(biome_instance_id: int) -> Optional[BiomeSnapshot]:
@@ -547,7 +559,7 @@ async def trigger_migration(instance_id: int):
         }), 404
 
     cluster_id = _cluster_id()
-    cluster_state = _load_cluster_state(cluster_id)
+    cluster_state = await _load_cluster_state(cluster_id)
     policy_dict = _load_or_default_policy(cluster_id)
     policy = _policy_dict_to_dataclass(policy_dict)
 
