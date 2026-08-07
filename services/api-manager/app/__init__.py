@@ -21,6 +21,7 @@ from penguin_aaa.middleware.asgi import AuditMiddleware
 from penguin_aaa.audit.emitter import Emitter
 
 from .config import Config
+from .db.run_db import run_db
 from .models import init_db, get_db
 from .security_datastore import PyDALUserDatastore
 from .audit import init_audit_logger
@@ -227,7 +228,9 @@ async def create_app(config_class: type = Config) -> Quart:
             if db is None:
                 # Degraded mode: DB not available but app is still running
                 return {"status": "unhealthy", "database": "unavailable"}, 503
-            db.executesql("SELECT 1")
+            # Regression: gh-22. Off the event loop via run_db() instead
+            # of blocking the request coroutine inline.
+            await run_db(lambda: db.executesql("SELECT 1"))
             return {"status": "healthy", "database": "connected"}, 200
         except Exception as e:
             return {"status": "unhealthy", "error": str(e)}, 503
@@ -237,13 +240,15 @@ async def create_app(config_class: type = Config) -> Quart:
         """Alias for /readyz endpoint."""
         readiness_state = {"status": "ready", "checks": {}}
 
-        # Check Database (graceful if unavailable)
+        # Check Database (graceful if unavailable). Regression: gh-22.
+        # Off the event loop via run_db() instead of blocking the request
+        # coroutine inline.
         try:
             db = get_db()
             if db is None:
                 readiness_state["checks"]["database"] = "unavailable (degraded mode)"
             else:
-                db.executesql("SELECT 1")
+                await run_db(lambda: db.executesql("SELECT 1"))
                 readiness_state["checks"]["database"] = "up"
         except Exception as e:
             readiness_state["status"] = "not_ready"
@@ -310,7 +315,9 @@ async def create_app(config_class: type = Config) -> Quart:
             if db is None:
                 # Degraded mode: DB not available but app is still running
                 return {"status": "unhealthy", "database": "unavailable"}, 503
-            db.executesql("SELECT 1")
+            # Regression: gh-22. Off the event loop via run_db() instead
+            # of blocking the request coroutine inline.
+            await run_db(lambda: db.executesql("SELECT 1"))
             return {"status": "healthy", "database": "connected"}, 200
         except Exception as e:
             return {"status": "unhealthy", "error": str(e)}, 503
@@ -321,13 +328,15 @@ async def create_app(config_class: type = Config) -> Quart:
         """Readiness: Vault unsealed, Postgres reachable, SPIRE up, gRPC warm."""
         readiness_state = {"status": "ready", "checks": {}}
 
-        # Check Database (graceful if unavailable)
+        # Check Database (graceful if unavailable). Regression: gh-22.
+        # Off the event loop via run_db() instead of blocking the request
+        # coroutine inline.
         try:
             db = get_db()
             if db is None:
                 readiness_state["checks"]["database"] = "unavailable (degraded mode)"
             else:
-                db.executesql("SELECT 1")
+                await run_db(lambda: db.executesql("SELECT 1"))
                 readiness_state["checks"]["database"] = "up"
         except Exception as e:
             readiness_state["status"] = "not_ready"
