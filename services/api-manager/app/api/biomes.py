@@ -725,11 +725,14 @@ async def delete_biome(biome_id: int):
         )
 
     # Block delete (soft or hard) when biome is in active assignments.
+    # ``node_egg_assignments`` is the real, baseline-created table (gh-21:
+    # ``node_biome_assignments`` was a phantom name that never existed, so
+    # ``hasattr`` was always False and this safety check never actually ran).
     in_use_count = 0
-    if hasattr(db, "node_biome_assignments"):
+    if hasattr(db, "node_egg_assignments"):
         in_use_count = db(
-            (db.node_biome_assignments.biome_id == biome_id)
-            & (db.node_biome_assignments.status.belongs(["pending", "deploying", "ready", "draining"]))
+            (db.node_egg_assignments.egg_id == biome_id)
+            & (db.node_egg_assignments.status.belongs(["pending", "deploying", "ready", "draining"]))
         ).count()
     if in_use_count > 0:
         return err_conflict(

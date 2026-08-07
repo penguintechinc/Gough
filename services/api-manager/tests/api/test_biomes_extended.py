@@ -402,11 +402,11 @@ class TestLockToHostValidation:
                 migrate=True,
             )
 
-        if "node_biome_assignments" not in getattr(dal_with_eggs, "tables", []):
+        if "node_egg_assignments" not in getattr(dal_with_eggs, "tables", []):
             dal_with_eggs.define_table(
-                "node_biome_assignments",
+                "node_egg_assignments",
                 Field("node_id", "integer", notnull=True),
-                Field("biome_id", "integer", notnull=True),
+                Field("egg_id", "integer", notnull=True),
                 Field("tenant_id", "string", default="__default__"),
                 Field("status", "string", default="pending"),
                 migrate=True,
@@ -432,9 +432,9 @@ class TestLockToHostValidation:
         dal_with_eggs.commit()
 
         # Assign to first node
-        dal_with_eggs.node_biome_assignments.insert(
+        dal_with_eggs.node_egg_assignments.insert(
             node_id=int(node1_id),
-            biome_id=int(biome_id),
+            egg_id=int(biome_id),
             tenant_id="__default__",
         )
         dal_with_eggs.commit()
