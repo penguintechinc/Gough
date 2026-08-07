@@ -377,13 +377,27 @@ async def rotate_joiner_secret(cluster_id: uuid.UUID, js_id: uuid.UUID):
     # commit-on-clean-exit / rollback-on-exception still applies unchanged,
     # just now running on the worker thread instead of blocking the event
     # loop.
-    def _rotate_in_tx() -> tuple[Any, Any]:
+    #
+    # Fix-round (gh-22): the `row.revoked_at is not None` check above is a
+    # fast-path only -- two concurrent rotate requests on the same js_id
+    # can both read revoked_at=NULL before either writes (a run_db()
+    # closure boundary is a thread boundary, not a transaction boundary).
+    # The *authoritative* guard is this closure's revoke UPDATE: it's
+    # conditional on `revoked_at IS NULL` and its rowcount is checked
+    # *inside this same transaction*, before persist_extracted_material()
+    # runs -- so a losing request never mints a second successor secret
+    # for an already-rotated row.
+    def _rotate_in_tx() -> tuple[str, Any, Any]:
         with db.transaction() as tx:
-            tx.executesql(
+            claimed = tx.executesql(
                 "UPDATE joiner_secrets SET revoked_at = %s, rotated_at = %s "
-                "WHERE id = %s",
+                "WHERE id = %s AND revoked_at IS NULL",
                 (now, now, str(js_id)),
+                return_rowcount=True,
             )
+            if not claimed:
+                return "already_revoked", None, None
+
             new_id, audit_event_id, _expires_at = persist_extracted_material(
                 tx,
                 cluster_id=str(cluster_id),
@@ -409,10 +423,20 @@ async def rotate_joiner_secret(cluster_id: uuid.UUID, js_id: uuid.UUID):
                     as_dict=True,
                 ),
             )
-        return audit_event_id, new_row_data
+        return "ok", audit_event_id, new_row_data
 
     try:
-        audit_event_id, new_row_data = await run_db(_rotate_in_tx)
+        status, audit_event_id, new_row_data = await run_db(_rotate_in_tx)
+        if status == "already_revoked":
+            return (
+                jsonify(
+                    {
+                        "error": "already_revoked",
+                        "message": "cannot rotate a revoked secret",
+                    }
+                ),
+                409,
+            )
     except Exception:
         _metrics.joiner_secret_decryption_failure.inc()
         raise

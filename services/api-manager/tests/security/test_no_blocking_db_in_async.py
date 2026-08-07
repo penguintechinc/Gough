@@ -161,7 +161,9 @@ def _scan_file(path: pathlib.Path) -> list[tuple[int, str]]:
 
 
 def test_no_blocking_db_in_async() -> None:
-    app_root = pathlib.Path(__file__).resolve().parents[1] / "app"
+    # tests/security/test_no_blocking_db_in_async.py -> parents[2] is the
+    # api-manager service root (parents[0]=security/, [1]=tests/).
+    app_root = pathlib.Path(__file__).resolve().parents[2] / "app"
     offenders: list[str] = []
 
     for path in sorted(app_root.rglob("*.py")):

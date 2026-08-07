@@ -113,7 +113,13 @@ async def list_enrollment_keys():
 
     query = db.enrollment_keys.id > 0
     if not include_used:
-        query &= db.enrollment_keys.is_used is False
+        # Pre-existing bug (fix-round, gh-22): `is False` is a Python
+        # identity check against a PyDAL field proxy -- never true for a
+        # real Field object, so this branch always silently no-opped
+        # instead of actually filtering. `== False` is the correct DAL
+        # idiom (see e.g. this file's own enroll_agent() claim query, and
+        # `noqa: E712` usage throughout the codebase).
+        query &= db.enrollment_keys.is_used == False  # noqa: E712 -- DAL idiom
 
     # Regression: gh-22. Off the event loop via run_db() instead of
     # blocking the request coroutine inline.
@@ -241,12 +247,25 @@ async def enroll_agent():
     access_token = _create_agent_access_token(agent_id, caps)
     refresh_token, refresh_expires = _create_agent_refresh_token(agent_id)
 
-    # Regression: gh-22. Insert agent + mark enrollment key used + commit +
-    # CA-public-key lookup + audit log is one unit of work -- stays in one
-    # run_db() closure per the house rule (see app/db/run_db.py), single
-    # rollback point inside the closure.
-    def _enroll() -> tuple[bool, Any]:
+    # Fix-round (gh-22): the is_used check above is a fast-path only -- two
+    # concurrent enroll requests can both read is_used=False before either
+    # writes (a run_db() closure boundary is a thread boundary, not a
+    # transaction boundary; see app/db/run_db.py). The *authoritative*
+    # guard is this closure's conditional UPDATE: it flips is_used only if
+    # the row still reads False at write time, and Postgres serializes
+    # concurrent UPDATEs to the same row, so at most one concurrent
+    # request's UPDATE affects a row -- the rowcount is checked before any
+    # agent is inserted, so a losing request never creates an agent row.
+    def _enroll() -> tuple[str, Any]:
         try:
+            claimed = db(
+                (db.enrollment_keys.id == key_record.id)
+                & (db.enrollment_keys.is_used == False)  # noqa: E712 -- DAL idiom
+            ).update(is_used=True)
+            if not claimed:
+                db.commit()
+                return "already_used", None
+
             agent_db_id = db.access_agents.insert(
                 agent_id=agent_id,
                 hostname=hostname,
@@ -259,16 +278,21 @@ async def enroll_agent():
                 last_heartbeat=datetime.utcnow(),
             )
 
-            # Mark enrollment key as used
+            # Record which agent claimed the key (already marked used above).
             db(db.enrollment_keys.id == key_record.id).update(
-                is_used=True,
                 used_by_agent=agent_db_id,
             )
 
             db.commit()
 
-            # Get CA public key
-            ca_config = db(db.ssh_ca_config.is_active is True).select().first()
+            # Get CA public key.
+            # Pre-existing bug (fix-round, gh-22): `is True` is a Python
+            # identity check against a PyDAL field proxy, never true for a
+            # real Field object -- `db(False)` then raises inside
+            # QuerySet's table-extraction (AttributeError: 'bool' object
+            # has no attribute 'table'), turning every successful
+            # enrollment into a 500. `== True` is the correct DAL idiom.
+            ca_config = db(db.ssh_ca_config.is_active == True).select().first()  # noqa: E712 -- DAL idiom
             ca_public_key = ca_config.public_key if ca_config else None
 
             # Audit log
@@ -284,14 +308,16 @@ async def enroll_agent():
                     },
                 )
 
-            return True, ca_public_key
+            return "ok", ca_public_key
         except Exception as e:
             db.rollback()
             log.exception(f"Error enrolling agent: {e}")
-            return False, e
+            return "error", e
 
-    ok, result = await run_db(_enroll)
-    if not ok:
+    status, result = await run_db(_enroll)
+    if status == "already_used":
+        return jsonify({"error": "Enrollment key already used"}), 409
+    if status == "error":
         return jsonify({"error": str(result)}), 500
 
     ca_public_key = result

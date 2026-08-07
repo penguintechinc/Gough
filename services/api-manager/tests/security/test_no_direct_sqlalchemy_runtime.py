@@ -43,7 +43,9 @@ def _strip_comment(line: str) -> str:
     return stripped
 
 def test_no_direct_sqlalchemy_runtime():
-    app_root = pathlib.Path(__file__).resolve().parents[1] / "app"
+    # tests/security/test_no_direct_sqlalchemy_runtime.py -> parents[2] is
+    # the api-manager service root (parents[0]=security/, [1]=tests/).
+    app_root = pathlib.Path(__file__).resolve().parents[2] / "app"
     offenders = []
     for p in app_root.rglob("*.py"):
         rel = p.relative_to(app_root)

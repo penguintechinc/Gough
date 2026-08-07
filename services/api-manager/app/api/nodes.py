@@ -856,17 +856,6 @@ async def patch_node(node_id: int):
             403,
         )
 
-    # Check for name collision
-    if body.name is not None:
-        def _check_collision() -> Any:
-            return db(
-                (db.nodes.name == body.name) & (db.nodes.id != node_id)
-            ).select().first()
-
-        collision = await run_db(_check_collision)
-        if collision:
-            return err_conflict("Node name already in use", details={"name": body.name})
-
     updates: dict[str, Any] = {"updated_at": datetime.now(timezone.utc)}
     if body.name is not None:
         updates["name"] = body.name
@@ -878,21 +867,49 @@ async def patch_node(node_id: int):
     if len(updates) == 1:  # only updated_at
         return envelope_success({"node": _serialize_node(node)})
 
-    # Regression: gh-22. update + commit + the post-commit refetch is one
-    # unit of work -- stays in one run_db() closure per the house rule
-    # (see app/db/run_db.py).
-    def _apply_update() -> tuple[bool, Any]:
+    # Regression: gh-22. Name-collision check + update + commit + the
+    # post-commit refetch is one unit of work -- stays in one run_db()
+    # closure per the house rule (see app/db/run_db.py).
+    #
+    # Fix-round (gh-22): a separate run_db() hop between the collision
+    # SELECT and the UPDATE reintroduced a check-then-write race -- two
+    # concurrent PATCHes renaming different nodes to the same new name
+    # could both pass the collision check before either writes (a closure
+    # boundary is a thread boundary, not a transaction boundary). Merging
+    # them into one closure narrows that window, but the *authoritative*
+    # guard is nodes' real DB-level UniqueConstraint("tenant_id", "name")
+    # (app/models_m1.py, uq_nodes_tenant_name) -- the UPDATE is caught and
+    # translated to the same conflict response if a concurrent PATCH wins
+    # the race past the fast-path check above.
+    def _apply_update() -> tuple[str, Any]:
+        if body.name is not None:
+            collision = db(
+                (db.nodes.name == body.name) & (db.nodes.id != node_id)
+            ).select().first()
+            if collision:
+                return "conflict", None
+
         try:
             db(db.nodes.id == node_id).update(**updates)
             db.commit()
-            return True, db(db.nodes.id == node_id).select().first()
+            return "ok", db(db.nodes.id == node_id).select().first()
         except Exception as exc:  # noqa: BLE001
             db.rollback()
+            if body.name is not None:
+                # uq_nodes_tenant_name violation from a concurrent PATCH
+                # that won the race past the fast-path check above.
+                still_colliding = db(
+                    (db.nodes.name == body.name) & (db.nodes.id != node_id)
+                ).select().first()
+                if still_colliding:
+                    return "conflict", None
             log.exception("Error patching node %s: %s", node_id, exc)
-            return False, exc
+            return "error", exc
 
-    ok, result = await run_db(_apply_update)
-    if not ok:
+    status, result = await run_db(_apply_update)
+    if status == "conflict":
+        return err_conflict("Node name already in use", details={"name": body.name})
+    if status == "error":
         return err_internal(str(result))
 
     return envelope_success({"node": _serialize_node(result)})
