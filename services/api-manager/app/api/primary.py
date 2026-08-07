@@ -25,6 +25,7 @@ from typing import Any, Callable, Optional, cast
 from quart import Blueprint, current_app, g, jsonify, request
 
 from ..audit import AuditEventType, AuditLogger
+from ..db.run_db import run_db
 from ..middleware import auth_required
 from ..models import get_db
 
@@ -201,9 +202,15 @@ async def _check_etcd_quorum(etcd_client: Any) -> bool:
 
 
 async def _get_joiner_secrets(db: Any, cluster_id: str) -> dict[str, str]:
-    """Retrieve kubeadm join token, CA hash, and certificate key from DB."""
+    """Retrieve kubeadm join token, CA hash, and certificate key from DB.
+
+    Regression: gh-22. Off the event loop via run_db() instead of blocking
+    the caller's request coroutine inline (this function is ``async def``
+    but every statement in it was synchronous penguin-dal I/O).
+    """
     secrets: dict[str, str] = {}
-    try:
+
+    def _fetch_rows() -> Any:
         now = datetime.now(timezone.utc)
         query = (
             (db.joiner_secrets.cluster_id == cluster_id)
@@ -213,12 +220,15 @@ async def _get_joiner_secrets(db: Any, cluster_id: str) -> dict[str, str]:
                 | (db.joiner_secrets.expires_at > now)
             )
         )
-        rows = db(query).select(
+        return db(query).select(
             db.joiner_secrets.extractor_name,
             db.joiner_secrets.ciphertext,
             orderby=~db.joiner_secrets.created_at,
             limitby=(0, 10),
         )
+
+    try:
+        rows = await run_db(_fetch_rows)
         for row in rows:
             name = row.extractor_name
             if name in ("kubeadm_join_token", "kubeadm_ca_hash", "kubeadm_certificate_key"):
@@ -303,15 +313,20 @@ async def replace_primary():
             secrets = await _get_joiner_secrets(db, cluster_id)
             endpoint = current_app.config.get("CONTROL_PLANE_ENDPOINT", "")
 
-            # Emit audit event
+            # Emit audit event. Regression: gh-22. AuditLogger.log() issues
+            # its own synchronous db.system_logs.insert()+commit() -- off
+            # the event loop via run_db() instead of blocking the request
+            # coroutine inline.
             audit = current_app.extensions.get("audit")
             if audit and isinstance(audit, AuditLogger):
-                audit.log(
-                    AuditEventType.RESOURCE_UPDATE,
-                    f"Primary node replacement: {old_node_id} -> {new_node_id}",
-                    resource_type="primary.node",
-                    resource_id=str(new_node_id),
-                    details={"old_node_id": old_node_id, "reason": reason},
+                await run_db(
+                    lambda: audit.log(
+                        AuditEventType.RESOURCE_UPDATE,
+                        f"Primary node replacement: {old_node_id} -> {new_node_id}",
+                        resource_type="primary.node",
+                        resource_id=str(new_node_id),
+                        details={"old_node_id": old_node_id, "reason": reason},
+                    )
                 )
 
             # Wait for new node etcd member to join (poll for 5 min)
@@ -430,15 +445,19 @@ async def force_recover_quorum():
                     "message": "Failed to restore etcd snapshot"},
             }), 500
 
-        # Emit audit event (high severity for break-glass)
+        # Emit audit event (high severity for break-glass). Regression:
+        # gh-22. Off the event loop via run_db() instead of blocking the
+        # request coroutine inline.
         audit = current_app.extensions.get("audit")
         if audit and isinstance(audit, AuditLogger):
-            audit.log(
-                AuditEventType.SYSTEM_CONFIG_CHANGE,
-                f"Break-glass quorum recovery on surviving node {surviving_node_id}",
-                resource_type="primary.etcd",
-                resource_id=cluster_id,
-                details={"surviving_node_id": surviving_node_id, "reason": reason},
+            await run_db(
+                lambda: audit.log(
+                    AuditEventType.SYSTEM_CONFIG_CHANGE,
+                    f"Break-glass quorum recovery on surviving node {surviving_node_id}",
+                    resource_type="primary.etcd",
+                    resource_id=cluster_id,
+                    details={"surviving_node_id": surviving_node_id, "reason": reason},
+                )
             )
 
         # Wait for cluster stabilization
@@ -510,14 +529,17 @@ async def _update_endpoint_on_nodes(
             # below exactly as before. Pre-existing, unrelated to this
             # conversion; preserved verbatim via db.executesql() rather than
             # guessing a column mapping (e.g. ipv4/ipv6).
+            # Regression: gh-22. Off the event loop via run_db() instead of
+            # blocking this coroutine inline for every node in the loop.
             db = get_db()
-            node_row = cast(
-                "list[tuple[Any, ...]]",
-                db.executesql(
+
+            def _fetch_node_ip() -> Any:
+                return db.executesql(
                     "SELECT management_ip, cluster_ip FROM nodes WHERE id=%s",
                     (node_id,),
-                ),
-            )
+                )
+
+            node_row = cast("list[tuple[Any, ...]]", await run_db(_fetch_node_ip))
             if not node_row:
                 node_result["error"] = f"Node {node_id} not found in DB"
                 results[node_id] = node_result
@@ -570,20 +592,25 @@ async def _update_endpoint_on_nodes(
         )
         results[node_id] = node_result
 
-        # Emit per-node audit event
+        # Emit per-node audit event. Regression: gh-22. AuditLogger.log()
+        # issues its own synchronous db.system_logs.insert()+commit() --
+        # off the event loop via run_db() instead of blocking this
+        # coroutine inline for every node in the loop.
         audit = current_app.extensions.get("audit")
         if audit and isinstance(audit, AuditLogger):
-            audit.log(
-                AuditEventType.RESOURCE_UPDATE,
-                f"Update control-plane endpoint on node {node_id}",
-                resource_type="primary.endpoint",
-                resource_id=str(node_id),
-                details={
-                    "endpoint": new_endpoint,
-                    "success": node_result["success"],
-                    "error": node_result.get("error"),
-                    "duration_ms": node_result["duration_ms"],
-                },
+            await run_db(
+                lambda audit=audit, node_id=node_id, node_result=node_result: audit.log(
+                    AuditEventType.RESOURCE_UPDATE,
+                    f"Update control-plane endpoint on node {node_id}",
+                    resource_type="primary.endpoint",
+                    resource_id=str(node_id),
+                    details={
+                        "endpoint": new_endpoint,
+                        "success": node_result["success"],
+                        "error": node_result.get("error"),
+                        "duration_ms": node_result["duration_ms"],
+                    },
+                )
             )
 
     return results
@@ -621,14 +648,17 @@ async def _emit_gracious_arp(vip: str, node_ids: list[int]) -> dict[int, dict[st
             # _update_endpoint_on_nodes above: management_ip/cluster_ip are
             # not real columns on `nodes` -- pre-existing, unrelated to this
             # conversion, preserved verbatim via db.executesql().
+            # Regression: gh-22. Off the event loop via run_db() instead of
+            # blocking this coroutine inline for every node in the loop.
             db = get_db()
-            node_row = cast(
-                "list[tuple[Any, ...]]",
-                db.executesql(
+
+            def _fetch_node_ip() -> Any:
+                return db.executesql(
                     "SELECT management_ip, cluster_ip FROM nodes WHERE id=%s",
                     (node_id,),
-                ),
-            )
+                )
+
+            node_row = cast("list[tuple[Any, ...]]", await run_db(_fetch_node_ip))
             if not node_row:
                 node_result["error"] = f"Node {node_id} not found in DB"
                 results[node_id] = node_result
@@ -685,20 +715,25 @@ async def _emit_gracious_arp(vip: str, node_ids: list[int]) -> dict[int, dict[st
         )
         results[node_id] = node_result
 
-        # Emit per-node audit event
+        # Emit per-node audit event. Regression: gh-22. AuditLogger.log()
+        # issues its own synchronous db.system_logs.insert()+commit() --
+        # off the event loop via run_db() instead of blocking this
+        # coroutine inline for every node in the loop.
         audit = current_app.extensions.get("audit")
         if audit and isinstance(audit, AuditLogger):
-            audit.log(
-                AuditEventType.RESOURCE_UPDATE,
-                f"Emit gracious ARP for {vip} on node {node_id}",
-                resource_type="primary.arp",
-                resource_id=str(node_id),
-                details={
-                    "vip": vip,
-                    "success": node_result["success"],
-                    "error": node_result.get("error"),
-                    "duration_ms": node_result["duration_ms"],
-                },
+            await run_db(
+                lambda audit=audit, node_id=node_id, node_result=node_result: audit.log(
+                    AuditEventType.RESOURCE_UPDATE,
+                    f"Emit gracious ARP for {vip} on node {node_id}",
+                    resource_type="primary.arp",
+                    resource_id=str(node_id),
+                    details={
+                        "vip": vip,
+                        "success": node_result["success"],
+                        "error": node_result.get("error"),
+                        "duration_ms": node_result["duration_ms"],
+                    },
+                )
             )
 
     return results
@@ -774,12 +809,17 @@ async def switch_frontend():
                     "message": f"Cannot reach {new_endpoint}: {e}"},
             }), 400
 
-    # Update endpoint everywhere
+    # Update endpoint everywhere. Regression: gh-22. Off the event loop via
+    # run_db() instead of blocking the request coroutine inline.
     db = get_db()
-    try:
-        node_ids = [
+
+    def _fetch_primary_node_ids() -> list[int]:
+        return [
             row.id for row in db(db.nodes.state == "primary").select(db.nodes.id)
         ]
+
+    try:
+        node_ids = await run_db(_fetch_primary_node_ids)
         if not await _update_endpoint_on_nodes(new_endpoint or "", node_ids):
             return jsonify({
                 "status": "error",
@@ -803,16 +843,17 @@ async def switch_frontend():
         vip = new_endpoint.split(":")[0] if new_endpoint else ""
         await _emit_gracious_arp(vip, node_ids)
 
-    # Emit audit event
+    # Emit audit event. Regression: gh-22. Off the event loop via run_db()
+    # instead of blocking the request coroutine inline.
     audit = current_app.extensions.get("audit")
     if audit and isinstance(audit, AuditLogger):
-        audit.log(
+        await run_db(lambda: audit.log(
             AuditEventType.SYSTEM_CONFIG_CHANGE,
             f"Control plane frontend switched to {target_mode}",
             resource_type="primary.frontend",
             resource_id=cluster_id,
             details={"target_mode": target_mode, "endpoint": new_endpoint},
-        )
+        ))
 
     return jsonify({
         "status": "success",
@@ -956,17 +997,21 @@ async def rotate_ipxe_ca():
                     "message": "Failed to publish helper artifact"},
             }), 500
 
-        # Update cloud-init bootstrap template (real impl updates DB)
+        # Update cloud-init bootstrap template (real impl updates DB).
+        # Regression: gh-22. Off the event loop via run_db() instead of
+        # blocking the request coroutine inline.
         db = get_db()
         try:
-            _rotate_bootstrap_ca(db, new_cert)
+            await run_db(lambda: _rotate_bootstrap_ca(db, new_cert))
         except Exception as e:
             log.warning(f"Failed to update bootstrap template: {e}")
 
-        # Emit audit event with old/new fingerprints
+        # Emit audit event with old/new fingerprints. Regression: gh-22.
+        # Off the event loop via run_db() instead of blocking the request
+        # coroutine inline.
         audit = current_app.extensions.get("audit")
         if audit and isinstance(audit, AuditLogger):
-            audit.log(
+            await run_db(lambda: audit.log(
                 AuditEventType.SYSTEM_CONFIG_CHANGE,
                 f"iPXE CA rotated: new fingerprint {ca_fingerprint}",
                 resource_type="primary.ipxe_ca",
@@ -976,7 +1021,7 @@ async def rotate_ipxe_ca():
                     "validity_days": new_ca_validity_days,
                     "new_ca_fingerprint": ca_fingerprint,
                 },
-            )
+            ))
 
         # Calculate validity end date
         now = datetime.now(timezone.utc)
