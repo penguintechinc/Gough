@@ -10,6 +10,8 @@ Provides REST API for managing iPXE/MAAS-like provisioning operations:
 
 from __future__ import annotations
 
+import base64
+import json
 import logging
 import secrets
 import threading
@@ -22,6 +24,7 @@ from typing import Any, Callable, Literal, Optional
 import jwt
 from quart import Blueprint, Response, current_app, g, jsonify, request
 
+from ..db.run_db import run_db
 from ..middleware import auth_required, admin_required, maintainer_or_admin_required
 from ..models import get_db
 from .. import metrics as _metrics
@@ -34,6 +37,43 @@ ipxe_bp = Blueprint("ipxe", __name__)
 # =============================================================================
 # Helper Functions
 # =============================================================================
+
+# Regression: gh-22. Pagination defaults for list_machines/list_images --
+# page_size default is deliberately generous so existing callers that never
+# pass page_size/cursor see the same result set as before the sweep, unless
+# their table has actually grown past the default.
+_DEFAULT_PAGE_SIZE = 500
+_MAX_PAGE_SIZE = 2000
+
+
+def _encode_ipxe_cursor(item_id: int, ts: Optional[datetime]) -> str:
+    """Encode (id, ts) into a base64 opaque pagination cursor.
+
+    Mirrors ``app.api.nodes``'s cursor pattern (gh-22). ``ts`` may be
+    ``None`` (e.g. a machine that has never reported ``last_seen_at``).
+    """
+    payload = json.dumps({"id": item_id, "ts": ts.isoformat() if ts else None})
+    return base64.urlsafe_b64encode(payload.encode()).decode()
+
+
+def _decode_ipxe_cursor(cursor: str) -> tuple[int, Optional[datetime]]:
+    """Decode an opaque pagination cursor back to (id, ts).
+
+    Raises ValueError on bad/tampered input.
+    """
+    try:
+        payload = json.loads(base64.urlsafe_b64decode(cursor.encode()).decode())
+        item_id = int(payload["id"])
+        ts_raw = payload.get("ts")
+        ts: Optional[datetime] = None
+        if ts_raw:
+            ts = datetime.fromisoformat(ts_raw)
+            if ts.tzinfo is None:
+                ts = ts.replace(tzinfo=timezone.utc)
+        return item_id, ts
+    except Exception as exc:
+        raise ValueError(f"Invalid cursor: {exc}") from exc
+
 
 def _validate_required_fields(data: dict, required: list[str]) -> Optional[tuple]:
     """Validate required fields in request data.
@@ -286,9 +326,22 @@ async def list_machines():
         status: Filter by status (unknown/discovered/commissioning/ready/deploying/deployed/failed)
         zone: Filter by zone
         pool: Filter by pool
+        page_size: Max rows to return (default 500, max 2000)
+        cursor: Opaque pagination cursor from a previous response's next_cursor
 
     Returns:
         200: List of machines
+
+    Regression: gh-22. This was an unbounded ``SELECT *`` over the entire
+    ``ipxe_machines`` table run synchronously on the shared event loop --
+    now the SELECT runs off-loop via ``run_db()`` and is bounded by
+    ``page_size`` (default generous enough that existing callers see the
+    same response shape/content unless their table has actually grown past
+    it). Cursor filtering mirrors ``app.api.nodes.list_nodes``: the DB
+    fetch always pulls the first ``page_size + 1`` rows of the ordered set,
+    then the cursor is applied client-side over that fixed window (same
+    known limitation nodes.py has -- not a true DB-side seek beyond the
+    first window; out of scope for this sweep to redesign).
     """
     db = get_db()
 
@@ -296,7 +349,14 @@ async def list_machines():
     query = db.ipxe_machines.id > 0
 
     # Apply filters
-    args = await request.args
+    # Regression: gh-22. `request.args` is a sync `cached_property`
+    # (`ImmutableMultiDict`), not a coroutine -- `await`ing it raised
+    # `TypeError: object ImmutableMultiDict can't be used in 'await'
+    # expression` on every real call, a pre-existing bug this sweep's own
+    # end-to-end pagination tests surfaced (prior tests all mocked `db` and
+    # asserted a permissive `status_code in (200, 401, 500)`, so the 500
+    # this raised went unnoticed).
+    args = request.args
     if args.get("status"):
         query &= (db.ipxe_machines.status == args["status"])
     if args.get("zone"):
@@ -304,11 +364,54 @@ async def list_machines():
     if args.get("pool"):
         query &= (db.ipxe_machines.pool == args["pool"])
 
-    machines = db(query).select(orderby=~db.ipxe_machines.last_seen_at)
+    try:
+        page_size = min(int(args.get("page_size", _DEFAULT_PAGE_SIZE)), _MAX_PAGE_SIZE)
+        if page_size < 1:
+            page_size = _DEFAULT_PAGE_SIZE
+    except (TypeError, ValueError):
+        return jsonify({"error": "page_size must be an integer"}), 400
+
+    cursor_raw = args.get("cursor")
+    cursor_after_id: Optional[int] = None
+    cursor_after_ts: Optional[datetime] = None
+    if cursor_raw:
+        try:
+            cursor_after_id, cursor_after_ts = _decode_ipxe_cursor(cursor_raw)
+        except ValueError:
+            return jsonify({"error": "cursor is invalid or tampered"}), 400
+
+    def _fetch() -> Any:
+        return db(query).select(
+            orderby=~db.ipxe_machines.last_seen_at, limitby=(0, page_size + 1)
+        )
+
+    machines = await run_db(_fetch)
+
+    if cursor_after_id is not None:
+        floor_ts = datetime.min.replace(tzinfo=timezone.utc)
+        cursor_key = (cursor_after_ts or floor_ts, cursor_after_id)
+        filtered = []
+        for m in machines:
+            row_ts = m.last_seen_at
+            if row_ts is not None and row_ts.tzinfo is None:
+                row_ts = row_ts.replace(tzinfo=timezone.utc)
+            # Descending order (~last_seen_at): the next page is strictly
+            # "less than" the cursor's position.
+            if (row_ts or floor_ts, m.id) < cursor_key:
+                filtered.append(m)
+        machines = filtered
+
+    next_cursor: Optional[str] = None
+    out_machines = list(machines)
+    if len(out_machines) > page_size:
+        out_machines = out_machines[:page_size]
+        last = out_machines[-1]
+        next_cursor = _encode_ipxe_cursor(last.id, last.last_seen_at)
 
     return jsonify({
-        "machines": [m.as_dict() for m in machines],
-        "count": len(machines)
+        "machines": [m.as_dict() for m in out_machines],
+        "count": len(out_machines),
+        "next_cursor": next_cursor,
     }), 200
 
 
@@ -704,9 +807,16 @@ async def list_images():
     Query Parameters:
         architecture: Filter by architecture (amd64/arm64)
         os_version: Filter by OS version
+        page_size: Max rows to return (default 500, max 2000)
+        cursor: Opaque pagination cursor from a previous response's next_cursor
 
     Returns:
         200: List of boot images
+
+    Regression: gh-22. Same conversion as ``list_machines`` above -- the
+    SELECT now runs off-loop via ``run_db()`` and is bounded by
+    ``page_size``; see that handler's docstring for the pagination/cursor
+    semantics (mirrors ``app.api.nodes.list_nodes``).
     """
     db = get_db()
 
@@ -714,17 +824,67 @@ async def list_images():
     query = db.ipxe_images.id > 0
 
     # Apply filters
-    args = await request.args
+    # Regression: gh-22. `request.args` is a sync `cached_property`
+    # (`ImmutableMultiDict`), not a coroutine -- `await`ing it raised
+    # `TypeError: object ImmutableMultiDict can't be used in 'await'
+    # expression` on every real call, a pre-existing bug this sweep's own
+    # end-to-end pagination tests surfaced (prior tests all mocked `db` and
+    # asserted a permissive `status_code in (200, 401, 500)`, so the 500
+    # this raised went unnoticed).
+    args = request.args
     if args.get("architecture"):
         query &= (db.ipxe_images.architecture == args["architecture"])
     if args.get("os_version"):
         query &= (db.ipxe_images.os_version == args["os_version"])
 
-    images = db(query).select(orderby=~db.ipxe_images.created_at)
+    try:
+        page_size = min(int(args.get("page_size", _DEFAULT_PAGE_SIZE)), _MAX_PAGE_SIZE)
+        if page_size < 1:
+            page_size = _DEFAULT_PAGE_SIZE
+    except (TypeError, ValueError):
+        return jsonify({"error": "page_size must be an integer"}), 400
+
+    cursor_raw = args.get("cursor")
+    cursor_after_id: Optional[int] = None
+    cursor_after_ts: Optional[datetime] = None
+    if cursor_raw:
+        try:
+            cursor_after_id, cursor_after_ts = _decode_ipxe_cursor(cursor_raw)
+        except ValueError:
+            return jsonify({"error": "cursor is invalid or tampered"}), 400
+
+    def _fetch() -> Any:
+        return db(query).select(
+            orderby=~db.ipxe_images.created_at, limitby=(0, page_size + 1)
+        )
+
+    images = await run_db(_fetch)
+
+    if cursor_after_id is not None:
+        floor_ts = datetime.min.replace(tzinfo=timezone.utc)
+        cursor_key = (cursor_after_ts or floor_ts, cursor_after_id)
+        filtered = []
+        for img in images:
+            row_ts = img.created_at
+            if row_ts is not None and row_ts.tzinfo is None:
+                row_ts = row_ts.replace(tzinfo=timezone.utc)
+            # Descending order (~created_at): the next page is strictly
+            # "less than" the cursor's position.
+            if (row_ts or floor_ts, img.id) < cursor_key:
+                filtered.append(img)
+        images = filtered
+
+    next_cursor: Optional[str] = None
+    out_images = list(images)
+    if len(out_images) > page_size:
+        out_images = out_images[:page_size]
+        last = out_images[-1]
+        next_cursor = _encode_ipxe_cursor(last.id, last.created_at)
 
     return jsonify({
-        "images": [img.as_dict() for img in images],
-        "count": len(images)
+        "images": [img.as_dict() for img in out_images],
+        "count": len(out_images),
+        "next_cursor": next_cursor,
     }), 200
 
 
