@@ -414,7 +414,12 @@ async def list_biomes():
         except ValueError:
             return err_validation("node_id must be an integer")
         if hasattr(db, "nodes"):
-            node = db(db.nodes.id == node_id).select().first()
+            # Regression: gh-22. Off the event loop via run_db() instead of
+            # blocking the request coroutine inline.
+            def _fetch_node() -> Any:
+                return db(db.nodes.id == node_id).select().first()
+
+            node = await run_db(_fetch_node)
             if node is None:
                 return err_not_found(f"Node {node_id} not found")
 
@@ -500,7 +505,13 @@ async def create_biome():
             return err_validation(f"Invalid cloud_init_content: {msg}")
 
     db = get_db()
-    if db(db.biomes.name == biome_in.name).select().first():
+
+    # Regression: gh-22. Off the event loop via run_db() instead of
+    # blocking the request coroutine inline.
+    def _check_name_exists() -> Any:
+        return db(db.biomes.name == biome_in.name).select().first()
+
+    if await run_db(_check_name_exists):
         return err_conflict(
             "Biome name already exists",
             details={"name": biome_in.name},
@@ -512,70 +523,83 @@ async def create_biome():
     has_signing_metadata = bool(biome_in.signing_key_id)
     signing_required = cluster_signing_required and not has_signing_metadata
 
-    try:
-        biome_id = db.biomes.insert(
-            name=biome_in.name,
-            display_name=biome_in.display_name,
-            description=biome_in.description,
-            biome_type=biome_in.biome_type,
-            version=biome_in.version,
-            category=biome_in.category,
-            snap_name=biome_in.snap_name,
-            snap_channel=biome_in.snap_channel,
-            snap_classic=biome_in.snap_classic,
-            cloud_init_content=biome_in.cloud_init_content,
-            lxd_image_alias=biome_in.lxd_image_alias,
-            lxd_image_url=biome_in.lxd_image_url,
-            lxd_profiles=biome_in.lxd_profiles,
-            is_hypervisor_config=biome_in.is_hypervisor_config,
-            dependencies=biome_in.dependencies,
-            min_ram_mb=biome_in.min_ram_mb,
-            min_disk_gb=biome_in.min_disk_gb,
-            required_architecture=biome_in.required_architecture,
-            is_active=biome_in.is_active,
-            is_default=biome_in.is_default,
-            # M1 columns
-            biome_kind=biome_in.biome_kind,
-            phase=biome_in.phase,
-            workload_type=biome_in.workload_type,
-            lock_to_host=biome_in.lock_to_host,
-            auto_join_cluster=biome_in.auto_join_cluster,
-            upgrade_strategy=biome_in.upgrade_strategy,
-            requires_hardware_tags=list(biome_in.requires_hardware_tags),
-            prefers_hardware_tags=list(biome_in.prefers_hardware_tags),
-            forbids_hardware_tags=list(biome_in.forbids_hardware_tags),
-            storage_requirements_json=(
-                biome_in.storage_requirements.model_dump()
-                if biome_in.storage_requirements is not None
-                else None
-            ),
-            readiness_probe=(
-                biome_in.readiness_probe.model_dump(by_alias=True, exclude_none=True)
-                if biome_in.readiness_probe is not None
-                else None
-            ),
-            emits_joiner_secrets=biome_in.emits_joiner_secrets,
-            joiner_emit_spec=biome_in.joiner_emit_spec,
-            consumes_joiner_secrets_from=biome_in.consumes_joiner_secrets_from,
-            joiner_consume_spec=biome_in.joiner_consume_spec,
-            snapshot_schedule_json=biome_in.snapshot_schedule,
-            required_interfaces=biome_in.required_interfaces,
-            signing_key_id=biome_in.signing_key_id,
-            sbom_url=biome_in.sbom_url,
-            registry_url=biome_in.registry_url,
-        )
-        db.commit()
-    except Exception as exc:  # noqa: BLE001
-        db.rollback()
-        log.exception("Error creating biome: %s", exc)
-        return err_internal(f"Failed to insert biome: {exc}")
+    # Regression: gh-22. insert + commit/rollback is one unit of work -- a
+    # penguin-dal connection checkout isn't safe to resume on a different
+    # thread hop, so the whole try/except stays inside one run_db() closure.
+    def _insert_biome() -> tuple[bool, Any]:
+        try:
+            new_id = db.biomes.insert(
+                name=biome_in.name,
+                display_name=biome_in.display_name,
+                description=biome_in.description,
+                biome_type=biome_in.biome_type,
+                version=biome_in.version,
+                category=biome_in.category,
+                snap_name=biome_in.snap_name,
+                snap_channel=biome_in.snap_channel,
+                snap_classic=biome_in.snap_classic,
+                cloud_init_content=biome_in.cloud_init_content,
+                lxd_image_alias=biome_in.lxd_image_alias,
+                lxd_image_url=biome_in.lxd_image_url,
+                lxd_profiles=biome_in.lxd_profiles,
+                is_hypervisor_config=biome_in.is_hypervisor_config,
+                dependencies=biome_in.dependencies,
+                min_ram_mb=biome_in.min_ram_mb,
+                min_disk_gb=biome_in.min_disk_gb,
+                required_architecture=biome_in.required_architecture,
+                is_active=biome_in.is_active,
+                is_default=biome_in.is_default,
+                # M1 columns
+                biome_kind=biome_in.biome_kind,
+                phase=biome_in.phase,
+                workload_type=biome_in.workload_type,
+                lock_to_host=biome_in.lock_to_host,
+                auto_join_cluster=biome_in.auto_join_cluster,
+                upgrade_strategy=biome_in.upgrade_strategy,
+                requires_hardware_tags=list(biome_in.requires_hardware_tags),
+                prefers_hardware_tags=list(biome_in.prefers_hardware_tags),
+                forbids_hardware_tags=list(biome_in.forbids_hardware_tags),
+                storage_requirements_json=(
+                    biome_in.storage_requirements.model_dump()
+                    if biome_in.storage_requirements is not None
+                    else None
+                ),
+                readiness_probe=(
+                    biome_in.readiness_probe.model_dump(by_alias=True, exclude_none=True)
+                    if biome_in.readiness_probe is not None
+                    else None
+                ),
+                emits_joiner_secrets=biome_in.emits_joiner_secrets,
+                joiner_emit_spec=biome_in.joiner_emit_spec,
+                consumes_joiner_secrets_from=biome_in.consumes_joiner_secrets_from,
+                joiner_consume_spec=biome_in.joiner_consume_spec,
+                snapshot_schedule_json=biome_in.snapshot_schedule,
+                required_interfaces=biome_in.required_interfaces,
+                signing_key_id=biome_in.signing_key_id,
+                sbom_url=biome_in.sbom_url,
+                registry_url=biome_in.registry_url,
+            )
+            db.commit()
+            return True, new_id
+        except Exception as exc:  # noqa: BLE001
+            db.rollback()
+            log.exception("Error creating biome: %s", exc)
+            return False, exc
+
+    ok, result = await run_db(_insert_biome)
+    if not ok:
+        return err_internal(f"Failed to insert biome: {result}")
+    biome_id = result
+
+    def _fetch_created() -> Any:
+        return db(db.biomes.id == biome_id).select().first()
 
     return envelope_success(
         {
             "biome_id": int(biome_id),
             "version": biome_in.version,
             "signing_required": bool(signing_required),
-            "biome": serialize_biome(db(db.biomes.id == biome_id).select().first()),
+            "biome": serialize_biome(await run_db(_fetch_created)),
         },
         status_code=201,
     )
@@ -589,7 +613,11 @@ async def get_biome(biome_id: int):
     Includes signing status and SBOM URL.
     """
     db = get_db()
-    biome = db(db.biomes.id == biome_id).select().first()
+
+    def _fetch() -> Any:
+        return db(db.biomes.id == biome_id).select().first()
+
+    biome = await run_db(_fetch)
     if not biome:
         return err_not_found(f"Biome {biome_id} not found")
 
@@ -624,7 +652,10 @@ async def update_biome(biome_id: int):
 
     db = get_db()
 
-    biome = db(db.biomes.id == biome_id).select().first()
+    def _fetch() -> Any:
+        return db(db.biomes.id == biome_id).select().first()
+
+    biome = await run_db(_fetch)
     if not biome:
         return err_not_found(f"Biome {biome_id} not found")
 
@@ -636,7 +667,10 @@ async def update_biome(biome_id: int):
 
     # Check for name conflict if name is being changed
     if "name" in data and data["name"] != biome.name:
-        existing = db((db.biomes.name == data["name"]) & (db.biomes.id != biome_id)).select().first()
+        def _check_name_conflict() -> Any:
+            return db((db.biomes.name == data["name"]) & (db.biomes.id != biome_id)).select().first()
+
+        existing = await run_db(_check_name_conflict)
         if existing:
             return err_conflict("Biome name already exists", details={"name": data["name"]})
 
@@ -685,16 +719,31 @@ async def update_biome(biome_id: int):
             if fname in data:
                 update_fields[fname] = data[fname]
 
-        if update_fields:
-            db(db.biomes.id == biome_id).update(**update_fields)
-            db.commit()
+        # Regression: gh-22. update + commit + the post-commit refetch (all
+        # originally inside this try/except, so rollback-on-any-failure
+        # behavior is preserved) is one unit of work -- stays in one
+        # run_db() closure per the house rule (see app/db/run_db.py).
+        def _apply_update() -> tuple[bool, Any]:
+            try:
+                if update_fields:
+                    db(db.biomes.id == biome_id).update(**update_fields)
+                    db.commit()
+                return True, db(db.biomes.id == biome_id).select().first()
+            except Exception as e:  # noqa: BLE001
+                db.rollback()
+                log.exception("Error updating biome: %s", e)
+                return False, e
+
+        ok, result = await run_db(_apply_update)
+        if not ok:
+            return err_internal(str(result))
 
         return envelope_success(
-            {"biome": serialize_biome(db(db.biomes.id == biome_id).select().first())},
+            {"biome": serialize_biome(result)},
         )
 
     except Exception as e:
-        db.rollback()
+        await run_db(lambda: db.rollback())
         log.exception("Error updating biome: %s", e)
         return err_internal(str(e))
 
@@ -712,7 +761,11 @@ async def delete_biome(biome_id: int):
     enforced both here and by the scope policy table.
     """
     db = get_db()
-    biome = db(db.biomes.id == biome_id).select().first()
+
+    def _fetch() -> Any:
+        return db(db.biomes.id == biome_id).select().first()
+
+    biome = await run_db(_fetch)
     if not biome:
         return err_not_found(f"Biome {biome_id} not found")
 
@@ -737,10 +790,13 @@ async def delete_biome(biome_id: int):
     # ``hasattr`` was always False and this safety check never actually ran).
     in_use_count = 0
     if hasattr(db, "node_egg_assignments"):
-        in_use_count = db(
-            (db.node_egg_assignments.egg_id == biome_id)
-            & (db.node_egg_assignments.status.belongs(["pending", "deploying", "ready", "draining"]))
-        ).count()
+        def _count_in_use() -> int:
+            return db(
+                (db.node_egg_assignments.egg_id == biome_id)
+                & (db.node_egg_assignments.status.belongs(["pending", "deploying", "ready", "draining"]))
+            ).count()
+
+        in_use_count = await run_db(_count_in_use)
     if in_use_count > 0:
         return err_conflict(
             "Biome is currently assigned to one or more nodes; unassign first",
@@ -762,19 +818,25 @@ async def delete_biome(biome_id: int):
                 details={"machines_count": len(machines_with_biome)},
             )
 
-    try:
-        if hard:
-            db(db.biomes.id == biome_id).delete()
-            action = "hard_deleted"
-        else:
-            db(db.biomes.id == biome_id).update(is_active=False)
-            action = "soft_deleted"
-        db.commit()
-        return envelope_success({"biome_id": biome_id, "action": action})
-    except Exception as exc:  # noqa: BLE001
-        db.rollback()
-        log.exception("Error deleting biome: %s", exc)
-        return err_internal(str(exc))
+    def _delete_or_deactivate() -> tuple[bool, Any]:
+        try:
+            if hard:
+                db(db.biomes.id == biome_id).delete()
+                action = "hard_deleted"
+            else:
+                db(db.biomes.id == biome_id).update(is_active=False)
+                action = "soft_deleted"
+            db.commit()
+            return True, action
+        except Exception as exc:  # noqa: BLE001
+            db.rollback()
+            log.exception("Error deleting biome: %s", exc)
+            return False, exc
+
+    ok, result = await run_db(_delete_or_deactivate)
+    if not ok:
+        return err_internal(str(result))
+    return envelope_success({"biome_id": biome_id, "action": result})
 
 
 @biomes_bp.route("/<int:biome_id>/upload", methods=["POST"])
@@ -800,7 +862,10 @@ async def upload_lxd_image(biome_id: int):
     """
     db = get_db()
 
-    biome = db(db.biomes.id == biome_id).select().first()
+    def _fetch_biome() -> Any:
+        return db(db.biomes.id == biome_id).select().first()
+
+    biome = await run_db(_fetch_biome)
     if not biome:
         return jsonify({"error": "Biome not found"}), 404
 
@@ -831,40 +896,47 @@ async def upload_lxd_image(biome_id: int):
     checksum = hashlib.sha256(file_data).hexdigest()
 
     # Get storage configuration
-    storage = db(db.storage_config.is_active == True).select().first()
+    def _fetch_storage() -> Any:
+        return db(db.storage_config.is_active == True).select().first()
+
+    storage = await run_db(_fetch_storage)
     if not storage:
         return jsonify({"error": "No active storage configuration"}), 500
 
-    try:
-        # In a real implementation, upload to MinIO/S3 here
-        # For now, generate a placeholder URL
-        storage_url = f"{storage.endpoint_url}/{storage.bucket_lxd_images}/{biome.name}/{filename}"
+    # In a real implementation, upload to MinIO/S3 here
+    # For now, generate a placeholder URL
+    storage_url = f"{storage.endpoint_url}/{storage.bucket_lxd_images}/{biome.name}/{filename}"
 
-        # Update biome with storage information
-        db(db.biomes.id == biome_id).update(
-            lxd_image_url=storage_url,
-            checksum=checksum,
-            size_bytes=file_size,
-        )
-        db.commit()
+    # Regression: gh-22. Update + commit + the post-commit refetch is one
+    # unit of work -- stays in one run_db() closure per the house rule.
+    def _apply_upload() -> tuple[bool, Any]:
+        try:
+            db(db.biomes.id == biome_id).update(
+                lxd_image_url=storage_url,
+                checksum=checksum,
+                size_bytes=file_size,
+            )
+            db.commit()
+            return True, db(db.biomes.id == biome_id).select().first()
+        except Exception as e:  # noqa: BLE001
+            db.rollback()
+            log.exception(f"Error uploading LXD image: {e}")
+            return False, e
 
-        biome = db(db.biomes.id == biome_id).select().first()
+    ok, result = await run_db(_apply_upload)
+    if not ok:
+        return jsonify({"error": str(result)}), 500
 
-        return jsonify({
-            "message": "LXD image uploaded successfully",
-            "biome": serialize_biome(biome),
-            "upload_details": {
-                "filename": filename,
-                "size_bytes": file_size,
-                "checksum": checksum,
-                "storage_url": storage_url,
-            },
-        }), 200
-
-    except Exception as e:
-        db.rollback()
-        log.exception(f"Error uploading LXD image: {e}")
-        return jsonify({"error": str(e)}), 500
+    return jsonify({
+        "message": "LXD image uploaded successfully",
+        "biome": serialize_biome(result),
+        "upload_details": {
+            "filename": filename,
+            "size_bytes": file_size,
+            "checksum": checksum,
+            "storage_url": storage_url,
+        },
+    }), 200
 
 
 # ============================================================================
@@ -896,7 +968,11 @@ async def sign_biome(biome_id: int):
         return err_forbidden_mfa("MFA required to sign biomes in compliance lanes")
 
     db = get_db()
-    biome = db(db.biomes.id == biome_id).select().first()
+
+    def _fetch() -> Any:
+        return db(db.biomes.id == biome_id).select().first()
+
+    biome = await run_db(_fetch)
     if not biome:
         return err_not_found(f"Biome {biome_id} not found")
 
@@ -921,18 +997,21 @@ async def sign_biome(biome_id: int):
 
     # Mark the row pending so listings expose the state.
     # Upon successful cosign verification (Sprint 4), set signature_verified and image_digest.
-    try:
-        if hasattr(db.biomes, "signing_status"):
-            db(db.biomes.id == biome_id).update(signing_status="signing_pending")
-        # TODO: Once cosign verification completes (Sprint 4):
-        # db(db.biomes.id == biome_id).update(
-        #     signature_verified=True,
-        #     image_digest=<verified_digest>,
-        #     published_at=datetime.now(timezone.utc)
-        # )
-        db.commit()
-    except Exception:  # noqa: BLE001 — column not migrated yet on minimal DBs
-        db.rollback()
+    def _mark_pending() -> None:
+        try:
+            if hasattr(db.biomes, "signing_status"):
+                db(db.biomes.id == biome_id).update(signing_status="signing_pending")
+            # TODO: Once cosign verification completes (Sprint 4):
+            # db(db.biomes.id == biome_id).update(
+            #     signature_verified=True,
+            #     image_digest=<verified_digest>,
+            #     published_at=datetime.now(timezone.utc)
+            # )
+            db.commit()
+        except Exception:  # noqa: BLE001 — column not migrated yet on minimal DBs
+            db.rollback()
+
+    await run_db(_mark_pending)
 
     return envelope_success(
         {
@@ -971,7 +1050,11 @@ async def upgrade_biome(biome_id: int):
     assert body is not None
 
     db = get_db()
-    biome = db(db.biomes.id == biome_id).select().first()
+
+    def _fetch() -> Any:
+        return db(db.biomes.id == biome_id).select().first()
+
+    biome = await run_db(_fetch)
     if not biome:
         return err_not_found(f"Biome {biome_id} not found")
 
@@ -999,22 +1082,25 @@ async def upgrade_biome(biome_id: int):
     # Create upgrade_run record
     actor_sub = g.current_user.sub if hasattr(g, "current_user") and g.current_user else "unknown"
 
-    run_id = db.upgrade_runs.insert(
-        biome_id=biome_id,
-        target_version=body.target_version,
-        cluster_id=_g(biome, "cluster_id", "default"),
-        status="pending",
-        phase="canary",
-        nodes_total=0,
-        nodes_completed=0,
-        nodes_failed=0,
-        started_at=None,
-        completed_at=None,
-        rollback_reason=None,
-        actor_sub=actor_sub,
-        created_at=datetime.now(timezone.utc),
-        updated_at=datetime.now(timezone.utc),
-    )
+    def _insert_run() -> Any:
+        return db.upgrade_runs.insert(
+            biome_id=biome_id,
+            target_version=body.target_version,
+            cluster_id=_g(biome, "cluster_id", "default"),
+            status="pending",
+            phase="canary",
+            nodes_total=0,
+            nodes_completed=0,
+            nodes_failed=0,
+            started_at=None,
+            completed_at=None,
+            rollback_reason=None,
+            actor_sub=actor_sub,
+            created_at=datetime.now(timezone.utc),
+            updated_at=datetime.now(timezone.utc),
+        )
+
+    run_id = await run_db(_insert_run)
 
     log.info(
         "biome.upgrade.requested",
@@ -1323,9 +1409,13 @@ async def get_upgrade_run(biome_id: int, run_id: str):
     Spec ``GET /api/v1/biomes/{id}/upgrade-runs/{run_id}`` — scope ``gough.biomes.read``.
     """
     db = get_db()
-    run = db(
-        (db.upgrade_runs.id == run_id) & (db.upgrade_runs.biome_id == biome_id)
-    ).select().first()
+
+    def _fetch() -> Any:
+        return db(
+            (db.upgrade_runs.id == run_id) & (db.upgrade_runs.biome_id == biome_id)
+        ).select().first()
+
+    run = await run_db(_fetch)
 
     if not run:
         return err_not_found(f"Upgrade run {run_id} not found")
@@ -1372,10 +1462,18 @@ async def biome_eligibility(biome_id: int):
         return err_validation("node_id must be an integer")
 
     db = get_db()
-    biome = db(db.biomes.id == biome_id).select().first()
+
+    def _fetch_biome() -> Any:
+        return db(db.biomes.id == biome_id).select().first()
+
+    biome = await run_db(_fetch_biome)
     if not biome:
         return err_not_found(f"Biome {biome_id} not found")
-    node = db(db.nodes.id == node_id).select().first() if hasattr(db, "nodes") else None
+
+    def _fetch_node() -> Any:
+        return db(db.nodes.id == node_id).select().first() if hasattr(db, "nodes") else None
+
+    node = await run_db(_fetch_node)
     if not node:
         return err_not_found(f"Node {node_id} not found")
 
@@ -1403,7 +1501,10 @@ async def list_biome_groups():
     """
     db = get_db()
 
-    groups = db(db.biome_groups.id > 0).select(orderby=db.biome_groups.display_name)
+    def _fetch() -> Any:
+        return db(db.biome_groups.id > 0).select(orderby=db.biome_groups.display_name)
+
+    groups = await run_db(_fetch)
 
     return jsonify({
         "groups": [serialize_biome_group(group) for group in groups],
@@ -1448,42 +1549,57 @@ async def create_biome_group():
 
     db = get_db()
 
-    # Check if group name already exists
-    existing = db(db.biome_groups.name == name).select().first()
-    if existing:
+    # Regression: gh-22. Name-exists check + per-biome-ID existence loop is
+    # a sequence of reads feeding validation -- one run_db() closure per
+    # the house rule, preserving the exact original error precedence/order.
+    def _validate_group() -> dict[str, Any]:
+        existing = db(db.biome_groups.name == name).select().first()
+        if existing:
+            return {"error": "name_exists"}
+        for biome_ref in biomes:
+            if not isinstance(biome_ref, dict) or "biome_id" not in biome_ref:
+                return {"error": "invalid_format"}
+            biome = db(db.biomes.id == biome_ref["biome_id"]).select().first()
+            if not biome:
+                return {"error": "biome_not_found", "biome_id": biome_ref["biome_id"]}
+        return {"error": None}
+
+    validation = await run_db(_validate_group)
+    if validation["error"] == "name_exists":
         return jsonify({"error": "Group name already exists"}), 409
+    if validation["error"] == "invalid_format":
+        return jsonify({"error": "Invalid biome reference format"}), 400
+    if validation["error"] == "biome_not_found":
+        return jsonify({"error": f"Biome ID {validation['biome_id']} not found"}), 400
 
-    # Validate that all biome IDs exist
-    for biome_ref in biomes:
-        if not isinstance(biome_ref, dict) or "biome_id" not in biome_ref:
-            return jsonify({"error": "Invalid biome reference format"}), 400
+    # Regression: gh-22. insert + commit + refetch is one unit of work --
+    # stays in one run_db() closure per the house rule.
+    def _create_group() -> tuple[bool, Any]:
+        try:
+            group_id = db.biome_groups.insert(
+                name=name,
+                display_name=display_name,
+                description=data.get("description"),
+                biomes=biomes,
+                is_default=data.get("is_default", False),
+            )
 
-        biome = db(db.biomes.id == biome_ref["biome_id"]).select().first()
-        if not biome:
-            return jsonify({"error": f"Biome ID {biome_ref['biome_id']} not found"}), 400
+            db.commit()
 
-    try:
-        group_id = db.biome_groups.insert(
-            name=name,
-            display_name=display_name,
-            description=data.get("description"),
-            biomes=biomes,
-            is_default=data.get("is_default", False),
-        )
+            return True, db(db.biome_groups.id == group_id).select().first()
+        except Exception as e:  # noqa: BLE001
+            db.rollback()
+            log.exception(f"Error creating biome group: {e}")
+            return False, e
 
-        db.commit()
+    ok, result = await run_db(_create_group)
+    if not ok:
+        return jsonify({"error": str(result)}), 500
 
-        group = db(db.biome_groups.id == group_id).select().first()
-
-        return jsonify({
-            "message": "Biome group created successfully",
-            "group": serialize_biome_group(group),
-        }), 201
-
-    except Exception as e:
-        db.rollback()
-        log.exception(f"Error creating biome group: {e}")
-        return jsonify({"error": str(e)}), 500
+    return jsonify({
+        "message": "Biome group created successfully",
+        "group": serialize_biome_group(result),
+    }), 201
 
 
 @biomes_bp.route("/groups/<int:group_id>", methods=["GET"])
@@ -1500,20 +1616,26 @@ async def get_biome_group(group_id: int):
     """
     db = get_db()
 
-    group = db(db.biome_groups.id == group_id).select().first()
+    # Regression: gh-22. Group fetch + biome-reference resolution loop is
+    # a sequence of reads feeding the response -- one run_db() closure.
+    def _fetch_group_and_resolve() -> tuple[Any, list[dict[str, Any]]]:
+        group = db(db.biome_groups.id == group_id).select().first()
+        if not group:
+            return None, []
+        resolved_biomes: list[dict[str, Any]] = []
+        for biome_ref in (group.biomes or []):
+            if isinstance(biome_ref, dict) and "biome_id" in biome_ref:
+                biome = db(db.biomes.id == biome_ref["biome_id"]).select().first()
+                if biome:
+                    resolved_biomes.append({
+                        "order": biome_ref.get("order", 0),
+                        "biome": serialize_biome(biome),
+                    })
+        return group, resolved_biomes
+
+    group, resolved_biomes = await run_db(_fetch_group_and_resolve)
     if not group:
         return jsonify({"error": "Biome group not found"}), 404
-
-    # Resolve biome references
-    resolved_biomes = []
-    for biome_ref in (group.biomes or []):
-        if isinstance(biome_ref, dict) and "biome_id" in biome_ref:
-            biome = db(db.biomes.id == biome_ref["biome_id"]).select().first()
-            if biome:
-                resolved_biomes.append({
-                    "order": biome_ref.get("order", 0),
-                    "biome": serialize_biome(biome),
-                })
 
     group_data = serialize_biome_group(group)
     group_data["resolved_biomes"] = resolved_biomes
@@ -1544,13 +1666,19 @@ async def update_biome_group(group_id: int):
 
     db = get_db()
 
-    group = db(db.biome_groups.id == group_id).select().first()
+    def _fetch() -> Any:
+        return db(db.biome_groups.id == group_id).select().first()
+
+    group = await run_db(_fetch)
     if not group:
         return jsonify({"error": "Biome group not found"}), 404
 
     # Check for name conflict if name is being changed
     if "name" in data and data["name"] != group.name:
-        existing = db((db.biome_groups.name == data["name"]) & (db.biome_groups.id != group_id)).select().first()
+        def _check_name_conflict() -> Any:
+            return db((db.biome_groups.name == data["name"]) & (db.biome_groups.id != group_id)).select().first()
+
+        existing = await run_db(_check_name_conflict)
         if existing:
             return jsonify({"error": "Group name already exists"}), 409
 
@@ -1560,13 +1688,23 @@ async def update_biome_group(group_id: int):
         if not isinstance(biomes, list):
             return jsonify({"error": "Biomes must be an array"}), 400
 
-        for biome_ref in biomes:
-            if not isinstance(biome_ref, dict) or "biome_id" not in biome_ref:
-                return jsonify({"error": "Invalid biome reference format"}), 400
+        # Regression: gh-22. Per-biome-ID existence loop is a sequence of
+        # reads feeding validation -- one run_db() closure, preserving the
+        # exact original error precedence/order.
+        def _validate_biomes() -> Optional[dict[str, Any]]:
+            for biome_ref in biomes:
+                if not isinstance(biome_ref, dict) or "biome_id" not in biome_ref:
+                    return {"error": "invalid_format"}
+                biome = db(db.biomes.id == biome_ref["biome_id"]).select().first()
+                if not biome:
+                    return {"error": "biome_not_found", "biome_id": biome_ref["biome_id"]}
+            return None
 
-            biome = db(db.biomes.id == biome_ref["biome_id"]).select().first()
-            if not biome:
-                return jsonify({"error": f"Biome ID {biome_ref['biome_id']} not found"}), 400
+        validation = await run_db(_validate_biomes)
+        if validation is not None:
+            if validation["error"] == "invalid_format":
+                return jsonify({"error": "Invalid biome reference format"}), 400
+            return jsonify({"error": f"Biome ID {validation['biome_id']} not found"}), 400
 
     try:
         update_fields = {}
@@ -1575,19 +1713,30 @@ async def update_biome_group(group_id: int):
             if field in data:
                 update_fields[field] = data[field]
 
-        if update_fields:
-            db(db.biome_groups.id == group_id).update(**update_fields)
-            db.commit()
+        # Regression: gh-22. update + commit + refetch is one unit of
+        # work -- stays in one run_db() closure per the house rule.
+        def _apply_update() -> tuple[bool, Any]:
+            try:
+                if update_fields:
+                    db(db.biome_groups.id == group_id).update(**update_fields)
+                    db.commit()
+                return True, db(db.biome_groups.id == group_id).select().first()
+            except Exception as e:  # noqa: BLE001
+                db.rollback()
+                log.exception(f"Error updating biome group: {e}")
+                return False, e
 
-        group = db(db.biome_groups.id == group_id).select().first()
+        ok, result = await run_db(_apply_update)
+        if not ok:
+            return jsonify({"error": str(result)}), 500
 
         return jsonify({
             "message": "Biome group updated successfully",
-            "group": serialize_biome_group(group),
+            "group": serialize_biome_group(result),
         }), 200
 
     except Exception as e:
-        db.rollback()
+        await run_db(lambda: db.rollback())
         log.exception(f"Error updating biome group: {e}")
         return jsonify({"error": str(e)}), 500
 
@@ -1607,28 +1756,40 @@ async def delete_biome_group(group_id: int):
     """
     db = get_db()
 
-    group = db(db.biome_groups.id == group_id).select().first()
+    # Regression: gh-22. Group fetch + in-use check is a sequence of reads
+    # feeding validation -- one run_db() closure.
+    def _fetch_group_and_configs() -> tuple[Any, Any]:
+        group = db(db.biome_groups.id == group_id).select().first()
+        if not group:
+            return None, None
+        configs = db(db.ipxe_boot_configs.assigned_biome_group_id == group_id).select()
+        return group, configs
+
+    group, configs = await run_db(_fetch_group_and_configs)
     if not group:
         return jsonify({"error": "Biome group not found"}), 404
 
-    # Check if group is assigned to any boot configs
-    configs = db(db.ipxe_boot_configs.assigned_biome_group_id == group_id).select()
     if configs:
         return jsonify({
             "error": "Cannot delete biome group that is assigned to boot configs",
             "configs_count": len(configs),
         }), 409
 
-    try:
-        db(db.biome_groups.id == group_id).delete()
-        db.commit()
+    def _delete_group() -> tuple[bool, Any]:
+        try:
+            db(db.biome_groups.id == group_id).delete()
+            db.commit()
+            return True, None
+        except Exception as e:  # noqa: BLE001
+            db.rollback()
+            log.exception(f"Error deleting biome group: {e}")
+            return False, e
 
-        return jsonify({"message": "Biome group deleted successfully"}), 200
+    ok, err = await run_db(_delete_group)
+    if not ok:
+        return jsonify({"error": str(err)}), 500
 
-    except Exception as e:
-        db.rollback()
-        log.exception(f"Error deleting biome group: {e}")
-        return jsonify({"error": str(e)}), 500
+    return jsonify({"message": "Biome group deleted successfully"}), 200
 
 
 
@@ -1667,22 +1828,29 @@ async def render_cloud_init():
 
     db = get_db()
 
-    configs = []
-    biomes_info = []
+    # Regression: gh-22. Per-biome-ID fetch loop is a sequence of reads
+    # feeding validation/aggregation -- one run_db() closure, preserving
+    # the exact original error precedence/order.
+    def _collect_configs() -> tuple[Optional[int], list[str], list[dict[str, Any]]]:
+        configs: list[str] = []
+        biomes_info: list[dict[str, Any]] = []
+        for biome_id in biome_ids:
+            biome = db(db.biomes.id == biome_id).select().first()
+            if not biome:
+                return biome_id, [], []
 
-    # Collect cloud-init configs from biomes
-    for biome_id in biome_ids:
-        biome = db(db.biomes.id == biome_id).select().first()
-        if not biome:
-            return jsonify({"error": f"Biome ID {biome_id} not found"}), 404
+            if biome.cloud_init_content:
+                configs.append(biome.cloud_init_content)
+                biomes_info.append({
+                    "id": biome.id,
+                    "name": biome.name,
+                    "display_name": biome.display_name,
+                })
+        return None, configs, biomes_info
 
-        if biome.cloud_init_content:
-            configs.append(biome.cloud_init_content)
-            biomes_info.append({
-                "id": biome.id,
-                "name": biome.name,
-                "display_name": biome.display_name,
-            })
+    missing_biome_id, configs, biomes_info = await run_db(_collect_configs)
+    if missing_biome_id is not None:
+        return jsonify({"error": f"Biome ID {missing_biome_id} not found"}), 404
 
     # Add additional config if provided
     additional_config = data.get("additional_config")
@@ -1765,14 +1933,18 @@ async def list_deployments():
         q = q & (db.deployments.node_id == node_id)
     query = db(q)
 
-    # Get total count for pagination
-    total_count = query.count()
+    # Regression: gh-22. Count + paginated select is a sequence of reads
+    # feeding the response -- one run_db() closure instead of blocking the
+    # request coroutine inline.
+    def _fetch() -> tuple[int, Any]:
+        total_count = query.count()
+        rows = query.select(
+            orderby=~db.deployments.created_at,
+            limitby=(offset, offset + limit),
+        )
+        return total_count, rows
 
-    # Fetch paginated results
-    deployments_rows = query.select(
-        orderby=~db.deployments.created_at,
-        limitby=(offset, offset + limit),
-    )
+    total_count, deployments_rows = await run_db(_fetch)
 
     deployments = []
     for row in deployments_rows:
@@ -1814,7 +1986,10 @@ async def get_deployment(deployment_id: str):
     """
     db = get_db()
 
-    deployment = db(db.deployments.id == deployment_id).select().first()
+    def _fetch() -> Any:
+        return db(db.deployments.id == deployment_id).select().first()
+
+    deployment = await run_db(_fetch)
     if not deployment:
         return err_not_found(f"Deployment {deployment_id} not found")
 
@@ -1876,7 +2051,10 @@ async def get_deployment_logs(deployment_id: str):
     db = get_db()
 
     # Check deployment exists
-    deployment = db(db.deployments.id == deployment_id).select().first()
+    def _fetch_deployment() -> Any:
+        return db(db.deployments.id == deployment_id).select().first()
+
+    deployment = await run_db(_fetch_deployment)
     if not deployment:
         return err_not_found(f"Deployment {deployment_id} not found")
 
@@ -1937,7 +2115,10 @@ async def cancel_deployment(deployment_id: str):
     """
     db = get_db()
 
-    deployment = db(db.deployments.id == deployment_id).select().first()
+    def _fetch() -> Any:
+        return db(db.deployments.id == deployment_id).select().first()
+
+    deployment = await run_db(_fetch)
     if not deployment:
         return err_not_found(f"Deployment {deployment_id} not found")
 
@@ -1948,17 +2129,23 @@ async def cancel_deployment(deployment_id: str):
             details={"status": current_status, "allowed": ["pending", "in_progress"]}
         )
 
-    try:
-        now = datetime.now(timezone.utc)
-        db(db.deployments.id == deployment_id).update(
-            status="cancelled",
-            updated_at=now,
-        )
-        db.commit()
-    except Exception as exc:  # noqa: BLE001
-        db.rollback()
-        log.exception("Error cancelling deployment %s: %s", deployment_id, exc)
-        return err_internal(str(exc))
+    def _cancel() -> tuple[bool, Any]:
+        try:
+            now = datetime.now(timezone.utc)
+            db(db.deployments.id == deployment_id).update(
+                status="cancelled",
+                updated_at=now,
+            )
+            db.commit()
+            return True, None
+        except Exception as exc:  # noqa: BLE001
+            db.rollback()
+            log.exception("Error cancelling deployment %s: %s", deployment_id, exc)
+            return False, exc
+
+    ok, err = await run_db(_cancel)
+    if not ok:
+        return err_internal(str(err))
 
     # Publish NATS event
     tenant_id = getattr(deployment, "tenant_id", "__default__")
