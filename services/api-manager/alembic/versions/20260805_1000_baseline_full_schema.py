@@ -231,6 +231,29 @@ def upgrade() -> None:
     # future writers will need, and there's no reason this role should be
     # missing the one DML verb the m1_tables loop grants everyone else.
     op.execute('GRANT SELECT, INSERT, UPDATE, DELETE ON webhook_endpoints TO "api-manager-rw"')
+    # node_events (app.models_m1.NodeEvent) -- same gap class as
+    # webhook_endpoints/audit_events above: left out of the m1_tables list
+    # entirely (gh-22), so "api-manager-rw" had no grant on it at all. The
+    # only writer today is app.api.nodes' POST /nodes/{id}/events handler
+    # (``db.node_events.insert(**row_data)``); no reader exists in app/ yet.
+    # SELECT is required in addition to INSERT even though nothing SELECTs
+    # the table directly: penguin-dal's insert() runs SQLAlchemy's
+    # ``INSERT ... RETURNING`` to get the new row's id back, and Postgres
+    # requires SELECT privilege on any column named in a RETURNING clause,
+    # not just INSERT. No UPDATE/DELETE grant -- neither is used anywhere.
+    op.execute('GRANT SELECT, INSERT ON node_events TO "api-manager-rw"')
+    # node_events.id is a SERIAL-style autoincrement column backed by a
+    # Postgres sequence (``node_events_id_seq``, Postgres' default naming
+    # convention for a table-owned identity/serial column) -- GRANT on the
+    # table itself does NOT include USAGE on that sequence, and without it
+    # the INSERT above (which relies on the column's ``nextval(...)``
+    # DEFAULT) fails with "permission denied for sequence
+    # node_events_id_seq" even though the table grant is otherwise correct.
+    # Everything from the ``dialect != 'postgresql'`` guard above onward is
+    # already Postgres-only, same as every other GRANT in this section --
+    # no separate dialect check needed here (MySQL/MariaDB/SQLite have no
+    # equivalent GRANT surface for auto-increment columns anyway).
+    op.execute('GRANT USAGE, SELECT ON SEQUENCE node_events_id_seq TO "api-manager-rw"')
 
     op.execute('GRANT SELECT ON nodes TO "worker-ipxe-rw"')
     op.execute('GRANT SELECT ON node_egg_assignments TO "worker-ipxe-rw"')
