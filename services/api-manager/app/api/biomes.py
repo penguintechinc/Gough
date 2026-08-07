@@ -447,33 +447,39 @@ async def list_biomes():
     if name_contains:
         conds.append(table.name.contains(name_contains))
 
-    # Regression: gh-22. Unbounded SELECT over the full biomes table -- now
-    # run off the event loop via run_db() instead of blocking the request
+    # Regression: gh-22. Unbounded SELECT over the full biomes table, plus
+    # the per-row node-eligibility post-filter (each iteration issues its
+    # own penguin-dal select via _eval_node_eligibility ->
+    # node_effective_tags -- app.api._helpers) -- all combined into one
+    # run_db() closure (one logical "fetch + filter" unit of work, one
+    # thread hop for the whole batch) instead of blocking the request
     # coroutine inline (this service is single-process/single-loop, gRPC
     # included).
-    def _fetch() -> Any:
+    def _fetch_and_filter() -> list[dict]:
         if conds:
             q = conds[0]
             for c in conds[1:]:
                 q = q & c
-            return db(q).select(orderby=table.display_name)
-        return db(table.id > 0).select(orderby=table.display_name)
+            rows = db(q).select(orderby=table.display_name)
+        else:
+            rows = db(table.id > 0).select(orderby=table.display_name)
 
-    rows = await run_db(_fetch)
+        # Post-filter for: requires_tag (AND across each, against the
+        # biome's declared ``requires_hardware_tags``) and node-eligibility.
+        filtered: list[dict] = []
+        for biome in rows:
+            if requires_tags:
+                declared = set(_g(biome, "requires_hardware_tags") or [])
+                if not set(requires_tags).issubset(declared):
+                    continue
+            if node is not None:
+                res = _eval_node_eligibility(db, biome, node)
+                if not res.eligible:
+                    continue
+            filtered.append(serialize_biome(biome))
+        return filtered
 
-    # Post-filter for: requires_tag (AND across each, against the biome's
-    # declared ``requires_hardware_tags``) and node-eligibility.
-    out: list[dict] = []
-    for biome in rows:
-        if requires_tags:
-            declared = set(_g(biome, "requires_hardware_tags") or [])
-            if not set(requires_tags).issubset(declared):
-                continue
-        if node is not None:
-            res = _eval_node_eligibility(db, biome, node)
-            if not res.eligible:
-                continue
-        out.append(serialize_biome(biome))
+    out = await run_db(_fetch_and_filter)
 
     return envelope_success({"biomes": out, "total": len(out)})
 
@@ -1477,7 +1483,10 @@ async def biome_eligibility(biome_id: int):
     if not node:
         return err_not_found(f"Node {node_id} not found")
 
-    result = _eval_node_eligibility(db, biome, node)
+    # Regression: gh-22. _eval_node_eligibility() -> node_effective_tags()
+    # issues its own direct penguin-dal select -- off the event loop via
+    # run_db() instead of blocking the request coroutine inline.
+    result = await run_db(lambda: _eval_node_eligibility(db, biome, node))
     payload = {
         "biome_id": biome_id,
         "node_id": node_id,

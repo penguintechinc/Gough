@@ -1757,14 +1757,14 @@ async def assign_biome_to_node(node_id: int):
             details={"assignment_id": _g(existing, "id"), "status": _g(existing, "status")},
         )
 
-    # NOTE: node_effective_tags() (app/api/_helpers.py) issues its own
-    # direct, unwrapped penguin-dal select -- out of scope for this sweep
-    # (app/api/_helpers.py is shared across blueprints, not one of this
-    # sweep's two target files); flagged as a follow-up.
+    # Regression: gh-22 (Part 4). node_effective_tags() (app/api/_helpers.py)
+    # issues its own direct penguin-dal select -- off the event loop via
+    # run_db() instead of blocking the request coroutine inline.
+    node_tags = await run_db(lambda: node_effective_tags(db, node))
     res: EligibilityResult = check_tag_eligibility(
         _g(biome, "requires_hardware_tags") or [],
         _g(biome, "forbids_hardware_tags") or [],
-        node_effective_tags(db, node),
+        node_tags,
     )
     if not res.eligible:
         return envelope_error(
