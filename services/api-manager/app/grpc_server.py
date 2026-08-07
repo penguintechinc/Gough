@@ -4,6 +4,22 @@ Thin wrappers over the same service/dal functions used by the REST endpoints.
 No business logic lives here — all logic is in the REST layer functions.
 
 mTLS is Plan 4 scope; the runner uses an insecure channel until then.
+
+Regression: gh-22 (DB pool consolidation). Servicer methods use
+``app.db.database.get_db()`` -- the RLS-wired, app-context-free accessor
+(see that module's docstring) -- NOT ``app.models.get_db()``. The gRPC
+server runs as a background ``asyncio.ensure_future()`` task started from
+``app.__init__``'s ``_start_grpc`` ``before_serving`` hook: Quart pushes an
+app context only for the duration of that hook coroutine's own execution,
+not for tasks it schedules and returns from immediately, so every real
+servicer call (once the gRPC listener actually starts accepting traffic --
+previously it silently failed to start at all, see the ``_start_grpc``
+docstring) runs with NO Quart app context. ``app.models.get_db()`` would
+``RuntimeError`` on every such call; ``app.db.database.get_db()`` doesn't
+need one. Each servicer's cross-tenant sentinel wrap (``_cross_tenant_scope``
+below) and the closure+``asyncio.to_thread()`` idiom are unaffected by this
+switch -- ``app.db.rls``'s tenant ``ContextVar`` propagates through
+``to_thread()`` regardless of which accessor resolved the connection pool.
 """
 
 from __future__ import annotations
@@ -81,7 +97,7 @@ class IPXEServicer(ipxe_pb2_grpc.IPXEServicer):
         context: grpc.aio.ServicerContext,
     ) -> ipxe_pb2.MintBootstrapTokenResponse:
         from app.api.ipxe import _find_node_or_machine_by_mac, _mint_bootstrap_jwt
-        from app.models import get_db
+        from app.db.database import get_db
 
         try:
             db = get_db()
@@ -169,7 +185,7 @@ class IPXEServicer(ipxe_pb2_grpc.IPXEServicer):
         context: grpc.aio.ServicerContext,
     ) -> ipxe_pb2.BindMacResponse:
         from app.api.ipxe import _normalize_mac
-        from app.models import get_db
+        from app.db.database import get_db
 
         try:
             normalized = await asyncio.to_thread(_normalize_mac, request.mac_address or "")
@@ -226,7 +242,7 @@ class IPXEServicer(ipxe_pb2_grpc.IPXEServicer):
         request: ipxe_pb2.FetchCloudInitRequest,
         context: grpc.aio.ServicerContext,
     ) -> ipxe_pb2.FetchCloudInitResponse:
-        from app.models import get_db
+        from app.db.database import get_db
 
         _VALID_BASELINES = {"native", "hybrid", "full-virtual"}
 
@@ -359,7 +375,7 @@ class JoinerSecretsServicer(joiner_pb2_grpc.JoinerSecretsServicer):
         ``_resolve_ready_biome() is None`` to that), rather than
         introducing a second, distinguishable failure mode.
         """
-        from app.models import get_db
+        from app.db.database import get_db
         from app.workers.joiner_secret_emitter import ExtractedMaterial, persist_extracted_material
         from app.security.joiner_envelope import zero_bytes
         from quart import current_app
@@ -462,7 +478,7 @@ class JoinerSecretsServicer(joiner_pb2_grpc.JoinerSecretsServicer):
         ``IdentityServicer.VerifyOTPN``'s existing correct decrypt pattern
         in this same file.
         """
-        from app.models import get_db
+        from app.db.database import get_db
         from app.security.joiner_envelope import EnvelopeCiphertext, decrypt_envelope
         from quart import current_app
         import uuid as _uuid
@@ -530,7 +546,7 @@ class JoinerSecretsServicer(joiner_pb2_grpc.JoinerSecretsServicer):
         (constructor and ``.emit()`` kwargs neither one matches the real
         class, same finding task 6a made for ``app/api/joiner_secrets.py``).
         """
-        from app.models import get_db
+        from app.db.database import get_db
         from app.workers.joiner_secret_emitter import persist_extracted_material
         from app.security.joiner_envelope import zero_bytes
         from quart import current_app
@@ -621,7 +637,7 @@ class JoinerSecretsServicer(joiner_pb2_grpc.JoinerSecretsServicer):
         context: grpc.aio.ServicerContext,
     ) -> joiner_pb2.RevokeResponse:
         """Mark a joiner secret revoked (never hard-deletes; see class docstring)."""
-        from app.models import get_db
+        from app.db.database import get_db
         import uuid as _uuid
 
         try:
@@ -674,7 +690,7 @@ class JoinerSecretsServicer(joiner_pb2_grpc.JoinerSecretsServicer):
         verbatim (not internally consistent as keyset pagination, but not
         this task's call to redesign).
         """
-        from app.models import get_db
+        from app.db.database import get_db
         import uuid as _uuid
         import base64
         import json
@@ -759,7 +775,7 @@ class BiomesServicer(biomes_pb2_grpc.BiomesServicer):
         request: biomes_pb2.DeployBiomeRequest,
         context: grpc.aio.ServicerContext,
     ) -> biomes_pb2.DeployBiomeResponse:
-        from app.models import get_db
+        from app.db.database import get_db
 
         try:
             def _do_deploy() -> tuple[int, str]:
@@ -824,7 +840,7 @@ class BiomesServicer(biomes_pb2_grpc.BiomesServicer):
         request: biomes_pb2.BiomeGetRequest,
         context: grpc.aio.ServicerContext,
     ) -> biomes_pb2.BiomeGetResponse:
-        from app.models import get_db
+        from app.db.database import get_db
 
         try:
             def _fetch() -> dict[str, Any]:
@@ -868,7 +884,7 @@ class BiomesServicer(biomes_pb2_grpc.BiomesServicer):
         request: biomes_pb2.VerifySignatureRequest,
         context: grpc.aio.ServicerContext,
     ) -> biomes_pb2.VerifySignatureResponse:
-        from app.models import get_db
+        from app.db.database import get_db
 
         try:
             def _verify() -> tuple[bool, str]:
@@ -1001,7 +1017,7 @@ class AuditServicer(audit_pb2_grpc.AuditServicer):
         entry). No tenant filter in the original query either -- see class
         docstring on ``_cross_tenant_scope``.
         """
-        from app.models import get_db
+        from app.db.database import get_db
         from typing import cast
         import json
 
@@ -1114,7 +1130,7 @@ class AuditServicer(audit_pb2_grpc.AuditServicer):
         No tenant filter in the original query -- see class docstring on
         ``_cross_tenant_scope``.
         """
-        from app.models import get_db
+        from app.db.database import get_db
         from typing import cast
         import json
         import uuid as _uuid
@@ -1302,7 +1318,7 @@ class IdentityServicer(identity_pb2_grpc.IdentityServicer):
         than distinguishable abort codes, which avoids giving a caller an
         oracle on *why* verification failed.
         """
-        from app.models import get_db
+        from app.db.database import get_db
         from app.security.joiner_envelope import EnvelopeCiphertext, decrypt_envelope
         from quart import current_app
 

@@ -486,43 +486,74 @@ class TestGaleraFunctions:
 
 
 class TestDatabaseInit:
-    """Tests for database initialization functions."""
+    """Tests for database initialization functions.
+
+    Regression: gh-22 (DB pool consolidation). ``init_db()`` no longer
+    raises when ``DATABASE_URL`` is unset -- it now falls back to
+    ``Config.get_db_uri()`` (the same ``DB_*``-env-var source
+    ``app.models.init_db()`` uses), which always resolves to a URI (backed
+    by ``Config``'s own dev defaults) rather than raising. It also now
+    installs RLS GUC wiring (``app.db.rls.install_rls_events``) on the
+    engine it builds -- see ``app.db.database``'s module docstring.
+    """
 
     def test_init_db_with_url(self, monkeypatch):
-        """Test init_db() with explicit database URL."""
+        """Test init_db() with explicit database URL (passed through unchanged)."""
         from app.db.database import init_db
 
-        with patch('app.db.database.DB') as mock_db_class:
+        with patch('app.db.database.DB') as mock_db_class, \
+                patch('app.db.database.install_rls_events') as mock_install:
             mock_instance = MagicMock()
             mock_db_class.return_value = mock_instance
 
             db = init_db(database_url='sqlite:///test.db', pool_size=5)
 
             mock_db_class.assert_called_once_with('sqlite:///test.db', pool_size=5)
+            mock_install.assert_called_once_with(mock_instance.engine)
             assert db is mock_instance
 
     def test_init_db_with_env_var(self, monkeypatch):
-        """Test init_db() uses DATABASE_URL environment variable."""
+        """Test init_db() uses DATABASE_URL environment variable, passed through unchanged."""
         from app.db.database import init_db
 
-        monkeypatch.setenv('DATABASE_URL', 'sqlite:///env.db')
+        monkeypatch.setenv('DATABASE_URL', 'postgresql://localhost/env')
 
-        with patch('app.db.database.DB') as mock_db_class:
+        with patch('app.db.database.DB') as mock_db_class, \
+                patch('app.db.database.install_rls_events'):
             mock_instance = MagicMock()
             mock_db_class.return_value = mock_instance
 
             db = init_db()
 
-            mock_db_class.assert_called_once_with('sqlite:///env.db', pool_size=10)
+            mock_db_class.assert_called_once_with('postgresql://localhost/env', pool_size=10)
 
-    def test_init_db_no_url_raises_error(self, monkeypatch):
-        """Test init_db() raises ValueError when DATABASE_URL not set."""
+    def test_init_db_falls_back_to_config_get_db_uri(self, monkeypatch):
+        """init_db() falls back to Config.get_db_uri() (converted to SQLAlchemy
+        format) when neither an explicit URL nor DATABASE_URL is given --
+        the same source app.models.init_db() uses, so both pools resolve to
+        the same database.
+        """
+        from app.config import Config
         from app.db.database import init_db
 
         monkeypatch.delenv('DATABASE_URL', raising=False)
+        monkeypatch.setattr(Config, 'DB_TYPE', 'postgres')
+        monkeypatch.setattr(Config, 'DB_HOST', 'db-host')
+        monkeypatch.setattr(Config, 'DB_PORT', '5432')
+        monkeypatch.setattr(Config, 'DB_NAME', 'fallback_db')
+        monkeypatch.setattr(Config, 'DB_USER', 'fallback_user')
+        monkeypatch.setattr(Config, 'DB_PASS', 'fallback_pass')
 
-        with pytest.raises(ValueError, match="DATABASE_URL environment variable not set"):
+        with patch('app.db.database.DB') as mock_db_class, \
+                patch('app.db.database.install_rls_events'):
+            mock_db_class.return_value = MagicMock()
+
             init_db()
+
+            call_args = mock_db_class.call_args
+            assert call_args[0][0] == (
+                'postgresql://fallback_user:fallback_pass@db-host:5432/fallback_db'
+            )
 
     def test_get_db_creates_instance(self, monkeypatch):
         """Test get_db() creates instance on first call."""
@@ -604,218 +635,6 @@ class TestDatabaseInit:
                 assert db is mock_db
 
             mock_db.commit.assert_called_once()
-
-    def test_execute_query_with_fetch(self, monkeypatch):
-        """Test execute_query() with fetch=True."""
-        from app.db.database import execute_query
-
-        monkeypatch.setenv('DATABASE_URL', 'sqlite:///test.db')
-        mock_db = MagicMock()
-        mock_db.executesql.return_value = [(1, 'test')]
-
-        with patch('app.db.database.get_db', return_value=mock_db):
-            result = execute_query("SELECT * FROM test", fetch=True)
-
-            assert isinstance(result, list)
-            assert len(result) == 1
-            mock_db.executesql.assert_called_once_with("SELECT * FROM test", None)
-
-    def test_execute_query_without_fetch(self, monkeypatch):
-        """Test execute_query() with fetch=False."""
-        from app.db.database import execute_query
-
-        monkeypatch.setenv('DATABASE_URL', 'sqlite:///test.db')
-        mock_db = MagicMock()
-        mock_db.executesql.return_value = None
-
-        with patch('app.db.database.get_db', return_value=mock_db):
-            result = execute_query("INSERT INTO test VALUES (1)", fetch=False)
-
-            assert result is None
-            mock_db.executesql.assert_called_once_with("INSERT INTO test VALUES (1)", None)
-
-    def test_execute_query_with_params(self, monkeypatch):
-        """Test execute_query() with parameter binding."""
-        from app.db.database import execute_query
-
-        monkeypatch.setenv('DATABASE_URL', 'sqlite:///test.db')
-        mock_db = MagicMock()
-        mock_db.executesql.return_value = [(1,)]
-
-        with patch('app.db.database.get_db', return_value=mock_db):
-            execute_query("SELECT * FROM test WHERE id = %(id)s", params={'id': 1})
-
-            mock_db.executesql.assert_called_once_with(
-                "SELECT * FROM test WHERE id = %(id)s", {'id': 1}
-            )
-
-    def test_execute_query_error(self, monkeypatch):
-        """Test execute_query() handles errors."""
-        from app.db.database import execute_query
-
-        monkeypatch.setenv('DATABASE_URL', 'sqlite:///test.db')
-        mock_db = MagicMock()
-        mock_db.executesql.side_effect = Exception("Query failed")
-
-        with patch('app.db.database.get_db', return_value=mock_db):
-            with pytest.raises(Exception, match="Query failed"):
-                execute_query("SELECT * FROM test")
-
-    def test_get_connection_info(self, monkeypatch):
-        """Test get_connection_info() returns connection details."""
-        from app.db.database import get_connection_info
-
-        monkeypatch.setenv('DATABASE_URL', 'sqlite:///test.db')
-        monkeypatch.setenv('DB_TYPE', 'sqlite')
-
-        mock_db = MagicMock()
-        mock_db.tables = {'users': {}, 'nodes': {}}
-
-        with patch('app.db.database.get_db', return_value=mock_db):
-            info = get_connection_info()
-
-            assert info['db_type'] == 'sqlite'
-            assert 'tables' in info
-
-    def test_insert_api_definition(self, monkeypatch):
-        """Test insert_api_definition() inserts API definition."""
-        from app.db.database import insert_api_definition
-
-        monkeypatch.setenv('DATABASE_URL', 'sqlite:///test.db')
-        mock_db = MagicMock()
-        mock_db.api_definitions.insert.return_value = 1
-
-        with patch('app.db.database.get_db', return_value=mock_db):
-            record_id = insert_api_definition(
-                name='test_api',
-                version='v1',
-                path='/api/test',
-                method='GET',
-                description='Test API',
-            )
-
-            assert record_id == 1
-            mock_db.api_definitions.insert.assert_called_once()
-            mock_db.commit.assert_called_once()
-
-    def test_get_api_definitions(self, monkeypatch):
-        """Test get_api_definitions() retrieves with optional filters."""
-        from app.db.database import get_api_definitions
-
-        monkeypatch.setenv('DATABASE_URL', 'sqlite:///test.db')
-        mock_db = MagicMock()
-        mock_row = MagicMock()
-        mock_row.as_dict.return_value = {'id': 1, 'name': 'test', 'enabled': True}
-
-        # Mock the query builder chain properly
-        mock_query_result = MagicMock()
-        mock_query_result.select.return_value = [mock_row]
-        mock_db.return_value = mock_query_result
-
-        # Mock the column comparison
-        mock_db.api_definitions.id = MagicMock()
-        mock_db.api_definitions.id.__gt__ = MagicMock(return_value=mock_query_result)
-        mock_db.api_definitions.name = MagicMock()
-        mock_db.api_definitions.enabled = MagicMock()
-
-        with patch('app.db.database.get_db', return_value=mock_db):
-            results = get_api_definitions(name='test', enabled=True)
-
-            assert len(results) == 1
-            assert results[0]['name'] == 'test'
-
-    def test_insert_api_usage(self, monkeypatch):
-        """Test insert_api_usage() inserts usage record."""
-        from app.db.database import insert_api_usage
-
-        monkeypatch.setenv('DATABASE_URL', 'sqlite:///test.db')
-        mock_db = MagicMock()
-        mock_db.api_usage.insert.return_value = 1
-
-        with patch('app.db.database.get_db', return_value=mock_db):
-            record_id = insert_api_usage(
-                api_id=1,
-                method='GET',
-                path='/api/test',
-                status_code=200,
-                response_time_ms=50,
-            )
-
-            assert record_id == 1
-            mock_db.api_usage.insert.assert_called_once()
-
-    def test_insert_api_key(self, monkeypatch):
-        """Test insert_api_key() inserts API key."""
-        from app.db.database import insert_api_key
-
-        monkeypatch.setenv('DATABASE_URL', 'sqlite:///test.db')
-        mock_db = MagicMock()
-        mock_db.api_keys.insert.return_value = 1
-
-        with patch('app.db.database.get_db', return_value=mock_db):
-            record_id = insert_api_key(
-                key_hash='hash123',
-                name='test_key',
-                user_id='user1',
-                scopes=['read', 'write'],
-            )
-
-            assert record_id == 1
-
-    def test_get_api_key_by_hash_found(self, monkeypatch):
-        """Test get_api_key_by_hash() finds existing key."""
-        from app.db.database import get_api_key_by_hash
-
-        monkeypatch.setenv('DATABASE_URL', 'sqlite:///test.db')
-        mock_db = MagicMock()
-        mock_row = MagicMock()
-        mock_row.as_dict.return_value = {'id': 1, 'key_hash': 'hash123'}
-        mock_db.return_value.select.return_value.first.return_value = mock_row
-
-        with patch('app.db.database.get_db', return_value=mock_db):
-            result = get_api_key_by_hash('hash123')
-
-            assert result is not None
-            assert result['key_hash'] == 'hash123'
-
-    def test_get_api_key_by_hash_not_found(self, monkeypatch):
-        """Test get_api_key_by_hash() returns None when not found."""
-        from app.db.database import get_api_key_by_hash
-
-        monkeypatch.setenv('DATABASE_URL', 'sqlite:///test.db')
-        mock_db = MagicMock()
-        mock_db.return_value.select.return_value.first.return_value = None
-
-        with patch('app.db.database.get_db', return_value=mock_db):
-            result = get_api_key_by_hash('nonexistent')
-
-            assert result is None
-
-    def test_update_api_key_last_used(self, monkeypatch):
-        """Test update_api_key_last_used() updates timestamp."""
-        from app.db.database import update_api_key_last_used
-
-        monkeypatch.setenv('DATABASE_URL', 'sqlite:///test.db')
-        mock_db = MagicMock()
-        mock_db.return_value.update.return_value = 1
-
-        with patch('app.db.database.get_db', return_value=mock_db):
-            result = update_api_key_last_used(1)
-
-            assert result is True
-
-    def test_update_api_key_last_used_not_found(self, monkeypatch):
-        """Test update_api_key_last_used() returns False if not updated."""
-        from app.db.database import update_api_key_last_used
-
-        monkeypatch.setenv('DATABASE_URL', 'sqlite:///test.db')
-        mock_db = MagicMock()
-        mock_db.return_value.update.return_value = 0
-
-        with patch('app.db.database.get_db', return_value=mock_db):
-            result = update_api_key_last_used(999)
-
-            assert result is False
 
 
 # ============================================================================

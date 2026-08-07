@@ -76,26 +76,49 @@ class FakeGrpcContext:
 
 
 def _make_app(
+    monkeypatch: pytest.MonkeyPatch,
     *,
     db: Any,
     vault_client: Any = None,
     material_provider: Any = None,
     cluster_id: str | None = None,
 ) -> Quart:
-    """Build a bare Quart app exposing ``app.config["db"]`` for ``get_db()``.
+    """Build a bare Quart app, and point the servicers' DB accessor at ``db``.
 
-    gRPC servicers run outside Quart's HTTP request pipeline (no
-    ``before_request``/tenant middleware -- see
-    ``app.grpc_server._cross_tenant_scope``); all they need from Quart is an
-    active app context so ``app.models.get_db()``/``current_app.config``
-    resolve, which is exactly what production gets too (see
-    ``app/__init__.py``'s ``_start_grpc`` -- the gRPC server runs as an
-    ``asyncio.ensure_future()`` task spawned from inside a
-    ``before_serving`` hook's app context; new asyncio Tasks copy the
-    current ``contextvars`` context at creation, so that single app context
-    stays valid for every subsequent gRPC call for the life of the
-    process).
+    Regression: gh-22 (DB pool consolidation). Servicers used to resolve
+    their DB via ``app.models.get_db()`` (``current_app.config["db"]``),
+    which is why this helper used to set ``app.config["db"] = db`` and every
+    call site wrapped the servicer call in ``async with app.app_context():``
+    -- that combination is what made ``current_app.config.get("db")``
+    resolve to ``db`` at all. Servicers now use
+    ``app.db.database.get_db()`` instead (RLS-wired, app-context-free --
+    see that module's docstring) precisely because the OLD assumption
+    baked into this helper's previous docstring -- that a single
+    app-context push around ``asyncio.ensure_future(grpc_runner.serve())``
+    in ``app/__init__.py``'s ``_start_grpc`` stays "active" for every
+    subsequent gRPC call for the life of the process -- was wrong: Quart
+    pops that app context the moment the ``before_serving`` hook coroutine
+    returns (immediately after scheduling the task), so every real
+    servicer call ran with NO app context and would ``RuntimeError`` on
+    ``app.models.get_db()`` (never caught here because this helper always
+    supplied one). ``app.db.database.get_db()`` is thread-local, not
+    request/app-context-scoped, so redirecting it to ``db`` requires
+    patching the function itself (each servicer method does its own local
+    ``from app.db.database import get_db``, a fresh attribute lookup on
+    ``app.db.database`` every call -- patching that module's ``get_db``
+    attribute is what every subsequent local import picks up, for the
+    life of this test via ``monkeypatch``'s teardown).
+
+    ``app.config["db"] = db`` and the ``app_context()`` wrap at call sites
+    are kept (harmless, no longer load-bearing for these tests) rather than
+    ripped out repo-wide -- any future servicer still using
+    ``app.models.get_db()`` (e.g. a request-path helper reused as-is) would
+    still need them.
     """
+    import app.db.database as db_database_mod
+
+    monkeypatch.setattr(db_database_mod, "get_db", lambda: db)
+
     app = Quart(__name__)
     app.config["db"] = db
     # CLUSTER_ID must be a valid UUID string -- app.grpc_server.JoinerSecretsServicer
@@ -252,7 +275,7 @@ def _seed_audit_event(dal_db: Any, **overrides: Any) -> str:
 
 class TestEmit:
     async def test_emit_persists_secret_for_ready_node(
-        self, pg_db: Any, mock_vault_client: Any
+        self, monkeypatch: pytest.MonkeyPatch, pg_db: Any, mock_vault_client: Any
     ) -> None:
         node_id = _seed_node(pg_db)
         biome_id = _seed_biome(pg_db, biome_kind="k8s-primary", emits_joiner_secrets=True)
@@ -265,7 +288,7 @@ class TestEmit:
         material.rotation_class = "single_use"
         provider = Mock(return_value=material)
 
-        app = _make_app(db=pg_db, vault_client=mock_vault_client, material_provider=provider)
+        app = _make_app(monkeypatch, db=pg_db, vault_client=mock_vault_client, material_provider=provider)
         request = Mock(node_id=str(node_id), rotation_class="k8s-primary", key_version=1)
         context = FakeGrpcContext()
 
@@ -280,7 +303,7 @@ class TestEmit:
         assert row.tenant_id == "acme"
 
     async def test_emit_skips_non_emitting_biome_when_multiple_ready(
-        self, pg_db: Any, mock_vault_client: Any
+        self, monkeypatch: pytest.MonkeyPatch, pg_db: Any, mock_vault_client: Any
     ) -> None:
         """Regression (fix round 1): a node with two ``ready`` assignments --
         one pointing at a non-emitting biome, one at an emitting biome --
@@ -308,7 +331,7 @@ class TestEmit:
         material.rotation_class = "single_use"
         provider = Mock(return_value=material)
 
-        app = _make_app(db=pg_db, vault_client=mock_vault_client, material_provider=provider)
+        app = _make_app(monkeypatch, db=pg_db, vault_client=mock_vault_client, material_provider=provider)
         request = Mock(node_id=str(node_id), rotation_class="k8s-primary", key_version=1)
         context = FakeGrpcContext()
 
@@ -321,7 +344,7 @@ class TestEmit:
         assert row.emitter_biome_id == emitting_id
 
     async def test_emit_not_found_when_ready_assignment_biome_does_not_emit(
-        self, pg_db: Any, mock_vault_client: Any
+        self, monkeypatch: pytest.MonkeyPatch, pg_db: Any, mock_vault_client: Any
     ) -> None:
         """Regression (fix round 1): a node whose only ``ready`` assignment
         points at a non-emitting biome must abort NOT_FOUND, the same as
@@ -332,7 +355,7 @@ class TestEmit:
         _seed_assignment(pg_db, node_id=node_id, egg_id=biome_id, status="ready")
 
         provider = Mock()
-        app = _make_app(db=pg_db, vault_client=mock_vault_client, material_provider=provider)
+        app = _make_app(monkeypatch, db=pg_db, vault_client=mock_vault_client, material_provider=provider)
         request = Mock(node_id=str(node_id), rotation_class="sidecar", key_version=1)
         context = FakeGrpcContext()
 
@@ -346,11 +369,11 @@ class TestEmit:
         provider.assert_not_called()
 
     async def test_emit_not_found_when_no_ready_assignment(
-        self, pg_db: Any, mock_vault_client: Any
+        self, monkeypatch: pytest.MonkeyPatch, pg_db: Any, mock_vault_client: Any
     ) -> None:
         node_id = _seed_node(pg_db)
         provider = Mock()
-        app = _make_app(db=pg_db, vault_client=mock_vault_client, material_provider=provider)
+        app = _make_app(monkeypatch, db=pg_db, vault_client=mock_vault_client, material_provider=provider)
         request = Mock(node_id=str(node_id), rotation_class="k8s-primary", key_version=1)
         context = FakeGrpcContext()
 
@@ -364,9 +387,9 @@ class TestEmit:
         provider.assert_not_called()
 
     async def test_emit_invalid_argument_on_bad_node_id(
-        self, pg_db: Any, mock_vault_client: Any
+        self, monkeypatch: pytest.MonkeyPatch, pg_db: Any, mock_vault_client: Any
     ) -> None:
-        app = _make_app(db=pg_db, vault_client=mock_vault_client, material_provider=Mock())
+        app = _make_app(monkeypatch, db=pg_db, vault_client=mock_vault_client, material_provider=Mock())
         request = Mock(node_id="not-an-int", rotation_class="x", key_version=1)
         context = FakeGrpcContext()
 
@@ -385,12 +408,12 @@ class TestEmit:
 
 class TestConsume:
     async def test_consume_returns_real_plaintext(
-        self, pg_db: Any, mock_vault_client: Any
+        self, monkeypatch: pytest.MonkeyPatch, pg_db: Any, mock_vault_client: Any
     ) -> None:
         secret_id, plaintext = _seed_joiner_secret(
             pg_db, vault_client=mock_vault_client, plaintext=b"the-actual-secret"
         )
-        app = _make_app(db=pg_db, vault_client=mock_vault_client)
+        app = _make_app(monkeypatch, db=pg_db, vault_client=mock_vault_client)
         request = Mock(secret_id=secret_id, node_id="")
         context = FakeGrpcContext()
 
@@ -404,8 +427,8 @@ class TestConsume:
         assert response.decrypted_secret == plaintext
         assert response.decrypted_secret != b""
 
-    async def test_consume_not_found(self, pg_db: Any, mock_vault_client: Any) -> None:
-        app = _make_app(db=pg_db, vault_client=mock_vault_client)
+    async def test_consume_not_found(self, monkeypatch: pytest.MonkeyPatch, pg_db: Any, mock_vault_client: Any) -> None:
+        app = _make_app(monkeypatch, db=pg_db, vault_client=mock_vault_client)
         request = Mock(secret_id=str(uuid.uuid4()), node_id="")
         context = FakeGrpcContext()
 
@@ -416,11 +439,11 @@ class TestConsume:
         code, _ = context.aborted
         assert "NOT_FOUND" in str(code)
 
-    async def test_consume_revoked_denied(self, pg_db: Any, mock_vault_client: Any) -> None:
+    async def test_consume_revoked_denied(self, monkeypatch: pytest.MonkeyPatch, pg_db: Any, mock_vault_client: Any) -> None:
         secret_id, _ = _seed_joiner_secret(
             pg_db, vault_client=mock_vault_client, revoked_at=datetime.now(timezone.utc)
         )
-        app = _make_app(db=pg_db, vault_client=mock_vault_client)
+        app = _make_app(monkeypatch, db=pg_db, vault_client=mock_vault_client)
         request = Mock(secret_id=secret_id, node_id="")
         context = FakeGrpcContext()
 
@@ -438,7 +461,7 @@ class TestConsume:
 
 
 class TestRotate:
-    async def test_rotate_atomic_success(self, pg_db: Any, mock_vault_client: Any) -> None:
+    async def test_rotate_atomic_success(self, monkeypatch: pytest.MonkeyPatch, pg_db: Any, mock_vault_client: Any) -> None:
         secret_id, _ = _seed_joiner_secret(pg_db, vault_client=mock_vault_client)
 
         material = Mock()
@@ -448,7 +471,7 @@ class TestRotate:
         material.rotation_class = "vault-unseal"
         provider = Mock(return_value=material)
 
-        app = _make_app(db=pg_db, vault_client=mock_vault_client, material_provider=provider)
+        app = _make_app(monkeypatch, db=pg_db, vault_client=mock_vault_client, material_provider=provider)
         request = Mock(secret_id=secret_id, new_key_version=2)
         context = FakeGrpcContext()
 
@@ -466,7 +489,7 @@ class TestRotate:
         assert new_row.revoked_at is None
 
     async def test_rotate_rollback_on_persist_failure(
-        self, pg_db: Any, mock_vault_client: Any
+        self, monkeypatch: pytest.MonkeyPatch, pg_db: Any, mock_vault_client: Any
     ) -> None:
         """Forced Vault failure mid-transaction must NOT leave the old
         secret revoked with nothing to replace it (same regression class
@@ -483,7 +506,7 @@ class TestRotate:
         failing_vault = Mock()
         failing_vault.transit_encrypt = Mock(side_effect=Exception("Vault sealed"))
 
-        app = _make_app(db=pg_db, vault_client=failing_vault, material_provider=provider)
+        app = _make_app(monkeypatch, db=pg_db, vault_client=failing_vault, material_provider=provider)
         request = Mock(secret_id=secret_id, new_key_version=2)
         context = FakeGrpcContext()
 
@@ -496,8 +519,8 @@ class TestRotate:
         old_row = pg_db(pg_db.joiner_secrets.id == secret_id).select().first()
         assert old_row.revoked_at is None, "revoke must roll back with the failed persist"
 
-    async def test_rotate_not_found(self, pg_db: Any, mock_vault_client: Any) -> None:
-        app = _make_app(db=pg_db, vault_client=mock_vault_client, material_provider=Mock())
+    async def test_rotate_not_found(self, monkeypatch: pytest.MonkeyPatch, pg_db: Any, mock_vault_client: Any) -> None:
+        app = _make_app(monkeypatch, db=pg_db, vault_client=mock_vault_client, material_provider=Mock())
         request = Mock(secret_id=str(uuid.uuid4()), new_key_version=1)
         context = FakeGrpcContext()
 
@@ -508,11 +531,11 @@ class TestRotate:
         code, _ = context.aborted
         assert "NOT_FOUND" in str(code)
 
-    async def test_rotate_already_revoked(self, pg_db: Any, mock_vault_client: Any) -> None:
+    async def test_rotate_already_revoked(self, monkeypatch: pytest.MonkeyPatch, pg_db: Any, mock_vault_client: Any) -> None:
         secret_id, _ = _seed_joiner_secret(
             pg_db, vault_client=mock_vault_client, revoked_at=datetime.now(timezone.utc)
         )
-        app = _make_app(db=pg_db, vault_client=mock_vault_client, material_provider=Mock())
+        app = _make_app(monkeypatch, db=pg_db, vault_client=mock_vault_client, material_provider=Mock())
         request = Mock(secret_id=secret_id, new_key_version=1)
         context = FakeGrpcContext()
 
@@ -530,9 +553,9 @@ class TestRotate:
 
 
 class TestRevoke:
-    async def test_revoke_marks_row(self, pg_db: Any, mock_vault_client: Any) -> None:
+    async def test_revoke_marks_row(self, monkeypatch: pytest.MonkeyPatch, pg_db: Any, mock_vault_client: Any) -> None:
         secret_id, _ = _seed_joiner_secret(pg_db, vault_client=mock_vault_client)
-        app = _make_app(db=pg_db)
+        app = _make_app(monkeypatch, db=pg_db)
         request = Mock(secret_id=secret_id)
         context = FakeGrpcContext()
 
@@ -545,12 +568,12 @@ class TestRevoke:
         assert row.revoked_at is not None
 
     async def test_revoke_already_revoked_returns_false(
-        self, pg_db: Any, mock_vault_client: Any
+        self, monkeypatch: pytest.MonkeyPatch, pg_db: Any, mock_vault_client: Any
     ) -> None:
         secret_id, _ = _seed_joiner_secret(
             pg_db, vault_client=mock_vault_client, revoked_at=datetime.now(timezone.utc)
         )
-        app = _make_app(db=pg_db)
+        app = _make_app(monkeypatch, db=pg_db)
         request = Mock(secret_id=secret_id)
         context = FakeGrpcContext()
 
@@ -560,8 +583,8 @@ class TestRevoke:
         assert context.aborted is None
         assert response.revoked is False
 
-    async def test_revoke_not_found(self, pg_db: Any) -> None:
-        app = _make_app(db=pg_db)
+    async def test_revoke_not_found(self, monkeypatch: pytest.MonkeyPatch, pg_db: Any) -> None:
+        app = _make_app(monkeypatch, db=pg_db)
         request = Mock(secret_id=str(uuid.uuid4()))
         context = FakeGrpcContext()
 
@@ -580,7 +603,7 @@ class TestRevoke:
 
 class TestList:
     async def test_list_filters_by_node_and_paginates(
-        self, pg_db: Any, mock_vault_client: Any
+        self, monkeypatch: pytest.MonkeyPatch, pg_db: Any, mock_vault_client: Any
     ) -> None:
         node_id = _seed_node(pg_db)
         other_node_id = _seed_node(pg_db)
@@ -590,7 +613,7 @@ class TestList:
             pg_db, vault_client=mock_vault_client, emitter_node_id=other_node_id
         )
 
-        app = _make_app(db=pg_db)
+        app = _make_app(monkeypatch, db=pg_db)
         request = Mock(node_id=str(node_id), limit=1, cursor="")
         context = FakeGrpcContext()
 
@@ -602,9 +625,9 @@ class TestList:
         assert first_page.next_cursor
         assert all(s.node_id == str(node_id) for s in first_page.secrets)
 
-    async def test_list_empty_result(self, pg_db: Any) -> None:
+    async def test_list_empty_result(self, monkeypatch: pytest.MonkeyPatch, pg_db: Any) -> None:
         node_id = _seed_node(pg_db)
-        app = _make_app(db=pg_db)
+        app = _make_app(monkeypatch, db=pg_db)
         request = Mock(node_id=str(node_id), limit=50, cursor="")
         context = FakeGrpcContext()
 
@@ -615,8 +638,8 @@ class TestList:
         assert list(response.secrets) == []
         assert response.next_cursor == ""
 
-    async def test_list_invalid_node_id(self, pg_db: Any) -> None:
-        app = _make_app(db=pg_db)
+    async def test_list_invalid_node_id(self, monkeypatch: pytest.MonkeyPatch, pg_db: Any) -> None:
+        app = _make_app(monkeypatch, db=pg_db)
         request = Mock(node_id="not-an-int", limit=50, cursor="")
         context = FakeGrpcContext()
 
@@ -634,13 +657,13 @@ class TestList:
 
 
 class TestAuditStream:
-    async def test_stream_yields_events_since_offset(self, pg_db: Any) -> None:
+    async def test_stream_yields_events_since_offset(self, monkeypatch: pytest.MonkeyPatch, pg_db: Any) -> None:
         old_ts = datetime.now(timezone.utc) - timedelta(days=1)
         new_ts = datetime.now(timezone.utc)
         _seed_audit_event(pg_db, ts=old_ts, action="stale")
         _seed_audit_event(pg_db, ts=new_ts, action="fresh")
 
-        app = _make_app(db=pg_db)
+        app = _make_app(monkeypatch, db=pg_db)
         cutoff = int((new_ts - timedelta(seconds=1)).timestamp())
         request = Mock(start_offset=cutoff, filter="")
         context = FakeGrpcContext()
@@ -653,7 +676,7 @@ class TestAuditStream:
         payload = json.loads(results[0].event_payload)
         assert payload["action"] == "fresh"
 
-    async def test_stream_applies_after_json_filter(self, pg_db: Any) -> None:
+    async def test_stream_applies_after_json_filter(self, monkeypatch: pytest.MonkeyPatch, pg_db: Any) -> None:
         _seed_audit_event(
             pg_db, action="match", after_json={"biome_kind": "vault"}
         )
@@ -661,7 +684,7 @@ class TestAuditStream:
             pg_db, action="no-match", after_json={"biome_kind": "other"}
         )
 
-        app = _make_app(db=pg_db)
+        app = _make_app(monkeypatch, db=pg_db)
         request = Mock(
             start_offset=0, filter=json.dumps({"biome_kind": "vault"})
         )
@@ -672,8 +695,8 @@ class TestAuditStream:
 
         assert [json.loads(r.event_payload)["action"] for r in results] == ["match"]
 
-    async def test_stream_empty_result(self, pg_db: Any) -> None:
-        app = _make_app(db=pg_db)
+    async def test_stream_empty_result(self, monkeypatch: pytest.MonkeyPatch, pg_db: Any) -> None:
+        app = _make_app(monkeypatch, db=pg_db)
         request = Mock(start_offset=int(datetime.now(timezone.utc).timestamp()) + 3600, filter="")
         context = FakeGrpcContext()
 
@@ -684,12 +707,12 @@ class TestAuditStream:
 
 
 class TestAuditExportRange:
-    async def test_export_range_returns_jsonl(self, pg_db: Any) -> None:
+    async def test_export_range_returns_jsonl(self, monkeypatch: pytest.MonkeyPatch, pg_db: Any) -> None:
         now = datetime.now(timezone.utc)
         _seed_audit_event(pg_db, ts=now, action="in-range")
         _seed_audit_event(pg_db, ts=now - timedelta(days=2), action="out-of-range")
 
-        app = _make_app(db=pg_db)
+        app = _make_app(monkeypatch, db=pg_db)
         request = Mock(
             start_time=int((now - timedelta(hours=1)).timestamp()),
             end_time=int((now + timedelta(hours=1)).timestamp()),
@@ -705,9 +728,9 @@ class TestAuditExportRange:
         assert len(lines) == 1
         assert json.loads(lines[0])["action"] == "in-range"
 
-    async def test_export_range_empty_result(self, pg_db: Any) -> None:
+    async def test_export_range_empty_result(self, monkeypatch: pytest.MonkeyPatch, pg_db: Any) -> None:
         now = datetime.now(timezone.utc)
-        app = _make_app(db=pg_db)
+        app = _make_app(monkeypatch, db=pg_db)
         request = Mock(
             start_time=int(now.timestamp()) + 3600,
             end_time=int(now.timestamp()) + 7200,
@@ -734,11 +757,11 @@ class TestDeployBiome:
     These prove the real ``node_egg_assignments`` row actually lands, with
     the correct physical column mapping (``egg_id``, not ``biome_id``)."""
 
-    async def test_deploy_biome_persists_assignment_row(self, pg_db: Any) -> None:
+    async def test_deploy_biome_persists_assignment_row(self, monkeypatch: pytest.MonkeyPatch, pg_db: Any) -> None:
         node_id = _seed_node(pg_db, tenant_id="acme")
         biome_id = _seed_biome(pg_db, tenant_id="acme", phase="pre_deploy")
 
-        app = _make_app(db=pg_db)
+        app = _make_app(monkeypatch, db=pg_db)
         request = Mock(biome_id=biome_id, node_id=node_id, config="", params={})
         context = FakeGrpcContext()
 
@@ -765,7 +788,7 @@ class TestDeployBiome:
         assert row.updated_at is not None
 
     async def test_deploy_biome_defaults_phase_when_biome_has_none(
-        self, pg_db: Any
+        self, monkeypatch: pytest.MonkeyPatch, pg_db: Any
     ) -> None:
         """``phase`` is NOT NULL with no server default on the real table --
         falls back to ``post_deploy`` when the biome row's own phase is
@@ -776,7 +799,7 @@ class TestDeployBiome:
         pg_db(pg_db.biomes.id == biome_id).update(phase="")
         pg_db.commit()
 
-        app = _make_app(db=pg_db)
+        app = _make_app(monkeypatch, db=pg_db)
         request = Mock(biome_id=biome_id, node_id=node_id, config="", params={})
         context = FakeGrpcContext()
 
@@ -791,9 +814,9 @@ class TestDeployBiome:
         )
         assert row.phase == "post_deploy"
 
-    async def test_deploy_biome_not_found_biome(self, pg_db: Any) -> None:
+    async def test_deploy_biome_not_found_biome(self, monkeypatch: pytest.MonkeyPatch, pg_db: Any) -> None:
         node_id = _seed_node(pg_db)
-        app = _make_app(db=pg_db)
+        app = _make_app(monkeypatch, db=pg_db)
         request = Mock(biome_id=999999, node_id=node_id, config="", params={})
         context = FakeGrpcContext()
 
@@ -804,9 +827,9 @@ class TestDeployBiome:
         code, _ = context.aborted
         assert "NOT_FOUND" in str(code)
 
-    async def test_deploy_biome_not_found_node(self, pg_db: Any) -> None:
+    async def test_deploy_biome_not_found_node(self, monkeypatch: pytest.MonkeyPatch, pg_db: Any) -> None:
         biome_id = _seed_biome(pg_db)
-        app = _make_app(db=pg_db)
+        app = _make_app(monkeypatch, db=pg_db)
         request = Mock(biome_id=biome_id, node_id=999999, config="", params={})
         context = FakeGrpcContext()
 
@@ -825,7 +848,7 @@ class TestDeployBiome:
 
 class TestVerifyOTPN:
     async def test_verify_otpn_success_returns_real_plaintext(
-        self, pg_db: Any, mock_vault_client: Any
+        self, monkeypatch: pytest.MonkeyPatch, pg_db: Any, mock_vault_client: Any
     ) -> None:
         node_id = _seed_node(pg_db)
         _seed_joiner_secret(
@@ -836,7 +859,7 @@ class TestVerifyOTPN:
             rotation_class="single_use",
         )
 
-        app = _make_app(db=pg_db, vault_client=mock_vault_client)
+        app = _make_app(monkeypatch, db=pg_db, vault_client=mock_vault_client)
         request = Mock(node_id=str(node_id), otp_token="unused", rotation_class="single_use")
         context = FakeGrpcContext()
 
@@ -848,10 +871,10 @@ class TestVerifyOTPN:
         assert response.decrypted_secret == b"otpn-material"
 
     async def test_verify_otpn_not_found_returns_false_not_error(
-        self, pg_db: Any, mock_vault_client: Any
+        self, monkeypatch: pytest.MonkeyPatch, pg_db: Any, mock_vault_client: Any
     ) -> None:
         node_id = _seed_node(pg_db)
-        app = _make_app(db=pg_db, vault_client=mock_vault_client)
+        app = _make_app(monkeypatch, db=pg_db, vault_client=mock_vault_client)
         request = Mock(node_id=str(node_id), otp_token="x", rotation_class="single_use")
         context = FakeGrpcContext()
 
@@ -863,7 +886,7 @@ class TestVerifyOTPN:
         assert response.decrypted_secret == b""
 
     async def test_verify_otpn_revoked_returns_false(
-        self, pg_db: Any, mock_vault_client: Any
+        self, monkeypatch: pytest.MonkeyPatch, pg_db: Any, mock_vault_client: Any
     ) -> None:
         node_id = _seed_node(pg_db)
         _seed_joiner_secret(
@@ -873,7 +896,7 @@ class TestVerifyOTPN:
             rotation_class="single_use",
             revoked_at=datetime.now(timezone.utc),
         )
-        app = _make_app(db=pg_db, vault_client=mock_vault_client)
+        app = _make_app(monkeypatch, db=pg_db, vault_client=mock_vault_client)
         request = Mock(node_id=str(node_id), otp_token="x", rotation_class="single_use")
         context = FakeGrpcContext()
 
@@ -883,9 +906,9 @@ class TestVerifyOTPN:
         assert response.valid is False
 
     async def test_verify_otpn_invalid_node_id_returns_false_not_error(
-        self, pg_db: Any, mock_vault_client: Any
+        self, monkeypatch: pytest.MonkeyPatch, pg_db: Any, mock_vault_client: Any
     ) -> None:
-        app = _make_app(db=pg_db, vault_client=mock_vault_client)
+        app = _make_app(monkeypatch, db=pg_db, vault_client=mock_vault_client)
         request = Mock(node_id="not-an-int", otp_token="x", rotation_class="single_use")
         context = FakeGrpcContext()
 
@@ -903,7 +926,7 @@ class TestVerifyOTPN:
 
 class TestCrossTenantScopeRLS:
     async def test_consume_sees_row_under_scoped_role_only_via_cross_tenant_scope(
-        self, pg_db: Any, pg_db_scoped: Any, mock_vault_client: Any
+        self, monkeypatch: pytest.MonkeyPatch, pg_db: Any, pg_db_scoped: Any, mock_vault_client: Any
     ) -> None:
         """Proves ``_cross_tenant_scope()`` -- not an app-level filter, since
         Consume has none -- is what lets the scoped ``api-manager-rw`` role
@@ -928,7 +951,7 @@ class TestCrossTenantScopeRLS:
         assert direct is None, "RLS did not filter the scoped role -- test is not proving anything"
 
         # Positive: the real servicer path applies _cross_tenant_scope() itself.
-        app = _make_app(db=pg_db_scoped, vault_client=mock_vault_client)
+        app = _make_app(monkeypatch, db=pg_db_scoped, vault_client=mock_vault_client)
         request = Mock(secret_id=secret_id, node_id="")
         context = FakeGrpcContext()
 
@@ -937,3 +960,54 @@ class TestCrossTenantScopeRLS:
 
         assert context.aborted is None
         assert response.decrypted_secret == plaintext
+
+
+# =============================================================================
+# Regression: gh-22 -- servicer DB path works with NO Quart app context
+# =============================================================================
+
+
+class TestNoAppContextRequired:
+    """The bug this whole conversion exists to fix: gRPC servicers run as a
+    background ``asyncio.ensure_future()`` task (see
+    ``app/__init__.py``'s ``_start_grpc``), which has NO Quart app context
+    once the ``before_serving`` hook that scheduled it returns -- every
+    servicer call in a real deployment ran (and, before the gRPC-stub-import
+    fix landed in the same gh-22 task, would have run) with no app context
+    at all. Every OTHER test in this file wraps its servicer call in
+    ``async with app.app_context():`` -- harmless now, but it would have
+    silently hidden this exact bug (``app.models.get_db()`` needs an app
+    context; ``async with app.app_context():`` always supplies one, so a
+    suite built entirely that way could never have caught servicers
+    depending on it). This test is the one that actually proves the fix:
+    no app, no app context, real Postgres.
+    """
+
+    async def test_list_secrets_succeeds_with_no_app_context_against_real_pg(
+        self, monkeypatch: pytest.MonkeyPatch, pg_db: Any, mock_vault_client: Any
+    ) -> None:
+        """``JoinerSecretsServicer.List`` -- chosen because, unlike
+        ``Emit``/``Consume``/``Rotate``, it touches no Vault-provided
+        material and no ``CLUSTER_ID`` parsing, isolating the assertion to
+        exactly the thing under test: the DB accessor itself.
+        """
+        from quart import has_app_context
+
+        import app.db.database as db_database_mod
+
+        node_id = _seed_node(pg_db)
+        _seed_joiner_secret(pg_db, vault_client=mock_vault_client, emitter_node_id=node_id)
+
+        monkeypatch.setattr(db_database_mod, "get_db", lambda: pg_db)
+
+        assert not has_app_context(), "sanity: genuinely no app context in this test"
+
+        request = Mock(node_id=str(node_id), limit=50, cursor="")
+        context = FakeGrpcContext()
+
+        # No `async with app.app_context():` anywhere -- the whole point.
+        response = await JoinerSecretsServicer().List(request, context)
+
+        assert context.aborted is None
+        assert len(response.secrets) == 1
+        assert response.secrets[0].node_id == str(node_id)

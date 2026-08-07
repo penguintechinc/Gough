@@ -14,22 +14,30 @@ role (table owners are RLS-exempt, which is why this went unnoticed) RLS
 silently filtered every row to zero and the app has been relying entirely on
 its own app-level tenant filters.
 
-This module closes that gap for the request-path connection pool -- the
-engine backing ``app.config["db"]`` (``app.models.get_db()``, wired via
-``install_rls_events`` in ``app.models.init_db``) -- by hanging the GUC
-set/reset off that pool's own ``checkout``/``checkin`` events, rather than by
-having every call site thread a connection through a helper like the old
-``set_tenant_guc`` by hand. That function's last three call sites
+This module closes that gap by hanging the GUC set/reset off a connection
+pool's own ``checkout``/``checkin`` events, rather than by having every call
+site thread a connection through a helper like the old ``set_tenant_guc`` by
+hand. That function's last three call sites
 (``app.api.audit.verify_audit_chain``/``export_audit_log``,
 ``app.api.joiner_secrets.revoke_joiner_secret``) were deleted in the FIX #7a
-cleanup, and the function itself was removed from
-``app.security.tenant`` -- this module (installed once, at engine-init time)
-is now the sole mechanism that applies the GUC. It does NOT cover the
-separate thread-local ``DB`` pool in
-``app.db.database`` (``get_db()`` there, keyed off ``DATABASE_URL``) --
-that pool has no RLS wiring at all today; nothing in this codebase should
-be using it for tenant-scoped reads until it's either wired the same way or
-consolidated away (follow-up, not done here).
+cleanup, and the function itself was removed from ``app.security.tenant`` --
+``install_rls_events`` (called once, at engine-init time) is now the sole
+mechanism that applies the GUC.
+
+Regression: gh-22 (DB pool consolidation). Originally this was wired onto
+only ONE of the two connection pools this service ran -- the request-path
+pool backing ``app.config["db"]`` (``app.models.get_db()``). The second pool
+(``app.db.database``, keyed off a bare ``DATABASE_URL`` set only in CI) had
+no RLS wiring at all, and was reachable with no Quart app context, so it was
+the only option for background workers -- an unwired pool being the sole
+"works without an app context" option meant those workers either ran
+unprotected by RLS or couldn't run at all. Both pools now call
+``install_rls_events`` on their own engine at construction time (see
+``app.models.init_db`` and ``app.db.database.init_db`` respectively) --
+the two pools remain distinct (a request pool and a worker pool legitimately
+coexist), but both are RLS-wired and resolve to the same database. See
+``app.db.database``'s module docstring for the full rule on which pool to
+use where.
 
 Why ``contextvars.ContextVar`` and not ``threading.local``: Quart request
 handlers issue blocking penguin-dal calls via ``asyncio.to_thread()``, which

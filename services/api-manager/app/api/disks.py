@@ -24,7 +24,7 @@ from typing import Any, Optional
 from pydantic import BaseModel, ConfigDict, Field, ValidationError, field_validator
 from quart import Blueprint, current_app, g, jsonify, request
 
-from ..db.database import get_db
+from ..models import get_db
 from ..middleware import auth_required
 from ..security.scope_enforcement import require_scopes
 
