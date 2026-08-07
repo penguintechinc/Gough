@@ -465,9 +465,12 @@ async def export_audit_log():
     export stream itself remains deliberately cross-tenant (see
     ``_stream_audit_events_jsonl``'s docstring) -- callers whose token
     carries ``cross_tenant=True`` get the RLS cross-tenant sentinel pushed
-    by the tenant middleware, which is required for both the export
-    stream and the chain-head lookup inside ``audit_writer.append()`` to
-    see the true global chain head rather than silently forking it.
+    by the tenant middleware, which is required for the export stream.
+    The chain-head lookup inside ``audit_writer.append()`` no longer
+    depends on that caller-supplied claim: ``append()`` now self-applies
+    the cross-tenant scope internally via its own ``_cross_tenant_scope()``
+    helper, so it sees the true global chain head regardless of the
+    caller's own tenant claim.
     """
     tenant_id = _get_tenant_id()
     mfa_block_required = _mfa_required_for_tenant(tenant_id) and not _request_has_mfa()

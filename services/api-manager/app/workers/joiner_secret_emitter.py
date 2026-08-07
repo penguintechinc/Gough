@@ -433,7 +433,7 @@ class JoinerSecretEmitter:
         """Run the post-deploy extractor flow for one biome_instance.
 
         Args:
-            biome_instance_id: Primary key of the ``node_biome_assignments``
+            biome_instance_id: Primary key of the ``node_egg_assignments``
                 row whose status has just transitioned to ``ready``.
 
         Returns:
