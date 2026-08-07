@@ -25,7 +25,7 @@ import json
 import logging
 import uuid
 from datetime import datetime, timezone
-from typing import Any, AsyncIterator, Iterable, Optional
+from typing import Any, AsyncIterator, Optional
 
 from prometheus_client import Counter
 from quart import Blueprint, Response, current_app, g, jsonify, request
@@ -38,6 +38,7 @@ from app.security.audit_chain import (
 )
 from app.security.scope_enforcement import require_scopes
 
+from ..db.run_db import run_db
 from ..models import get_db
 
 log = logging.getLogger(__name__)
@@ -234,6 +235,11 @@ async def list_audit_events():
     ``set_tenant_guc`` -- tenant isolation here is enforced by the explicit
     ``tenant_id ==`` filter below (Layer 1/2 app-level scoping), same as
     those modules.
+
+    Regression: gh-22. The page SELECT runs off the event loop via
+    ``run_db()`` (``app.db.run_db``) -- this service is single-process,
+    single-loop (gRPC shares it), so a synchronous multi-hundred-row query
+    here would stall every other request/RPC until it returned.
     """
     tenant_id = _get_tenant_id()
 
@@ -306,9 +312,12 @@ async def list_audit_events():
         # so compare against the string form, not the uuid.UUID object.
         query = query & (db.audit_events.id > str(cursor_uuid))
 
-    rows = db(query).select(
-        orderby=db.audit_events.id, limitby=(0, page_size + 1)
-    )
+    def _fetch_page() -> Any:
+        return db(query).select(
+            orderby=db.audit_events.id, limitby=(0, page_size + 1)
+        )
+
+    rows = await run_db(_fetch_page)
     has_more = len(rows) > page_size
     rows = list(rows)[:page_size]
     next_cursor = str(rows[-1].id) if rows and has_more else None
@@ -375,15 +384,46 @@ async def verify_audit_chain():
     return jsonify(out), 200
 
 
-def _stream_audit_events_jsonl(
+def _fetch_audit_export_batch(db: Any, last_id: str, batch_size: int) -> list[Any]:
+    """Blocking: fetch one keyset-paginated batch of ``audit_events`` rows.
+
+    Split out of ``_stream_audit_events_jsonl`` so each batch's SELECT (the
+    only DB statement in this unit of work) can run off the event loop via
+    ``run_db()`` -- see that function's docstring for why.
+    """
+    return list(
+        db(db.audit_events.id > last_id).select(
+            orderby=db.audit_events.id, limitby=(0, batch_size)
+        )
+    )
+
+
+def _sign_export_digest(
+    vault_client: Optional[Any], signing_key: str, digest: bytes
+) -> Any:
+    """Blocking: Vault-transit-sign the rolling export digest.
+
+    Returns ``"unsigned"`` if no Vault client is configured, or a
+    ``"vault-sign-error:..."`` string if signing fails -- both surfaced
+    verbatim in the export footer rather than failing the whole export.
+    """
+    if vault_client is None:
+        return "unsigned"
+    try:
+        return vault_client.transit_sign(signing_key, digest)
+    except Exception as exc:  # pragma: no cover — surfaced to footer
+        return f"vault-sign-error:{exc}"
+
+
+async def _stream_audit_events_jsonl(
     db: Any,
     cluster_id_label: str,
     target_sub: Optional[str],
     vault_client: Optional[Any],
     signing_key: str,
     batch_size: int = 500,
-) -> Iterable[bytes]:
-    """Synchronously yield JSONL bytes for the entire ``audit_events`` table.
+) -> AsyncIterator[bytes]:
+    """Asynchronously yield JSONL bytes for the entire ``audit_events`` table.
 
     ``db`` is a penguin-dal ``DB`` instance. penguin-dal's ``.select()`` has
     no server-side cursor (it materializes its full result set per call), so
@@ -393,6 +433,17 @@ def _stream_audit_events_jsonl(
     increasing), each batch's last id feeding the next batch's ``WHERE id >
     :last_id``. Cross-tenant by design (superadmin-only export, unchanged
     from the pre-conversion behavior -- no tenant filter here).
+
+    Regression: gh-22. This used to be a synchronous generator run inline
+    inside the request's async stream -- every batch SELECT and the final
+    Vault signature call blocked the single shared event loop for their
+    entire duration (this service is single-process/single-loop, gRPC
+    included). Each batch fetch and the signing call now go through
+    ``run_db()`` (``app.db.run_db``) individually, so the generator stays
+    both memory-bounded (only one batch materialized at a time) and
+    loop-friendly (every other request/RPC can make progress between
+    batches). Per-row canonicalization/hashing stays inline -- pure CPU, no
+    I/O, and cheap enough per row not to warrant its own thread hop.
 
     Each row is hashed (SHA-256 over JCS canonical form) into a rolling export
     digest. The final line is a Vault-transit signature over that digest so a
@@ -406,9 +457,12 @@ def _stream_audit_events_jsonl(
     last_id = str(uuid.UUID(int=0))
 
     while True:
-        batch = db(db.audit_events.id > last_id).select(
-            orderby=db.audit_events.id, limitby=(0, batch_size)
-        )
+        current_last_id = last_id
+
+        def _fetch_batch() -> list[Any]:
+            return _fetch_audit_export_batch(db, current_last_id, batch_size)
+
+        batch = await run_db(_fetch_batch)
         if not batch:
             break
         for row in batch:
@@ -423,13 +477,9 @@ def _stream_audit_events_jsonl(
 
     digest = rolling.digest()
 
-    if vault_client is not None:
-        try:
-            signature = vault_client.transit_sign(signing_key, digest)
-        except Exception as exc:  # pragma: no cover — surfaced to footer
-            signature = f"vault-sign-error:{exc}"
-    else:
-        signature = "unsigned"
+    signature = await run_db(
+        lambda: _sign_export_digest(vault_client, signing_key, digest)
+    )
 
     if isinstance(signature, bytes):
         signature_str = signature.decode("utf-8", errors="replace")
@@ -525,7 +575,7 @@ async def export_audit_log():
 
     @stream_with_context
     async def _async_stream() -> AsyncIterator[bytes]:
-        for chunk in _stream_audit_events_jsonl(
+        async for chunk in _stream_audit_events_jsonl(
             dal_db,
             cluster_id_label=cluster_id_label,
             target_sub=target_sub,

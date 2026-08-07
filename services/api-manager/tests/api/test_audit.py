@@ -683,19 +683,31 @@ class TestVerifyAuditChain:
 # =============================================================================
 
 
+@pytest.mark.asyncio
 class TestStreamAuditEventsJsonl:
     """``db`` is a real penguin-dal DB (pg_db) now, not a SQLAlchemy session --
     this helper does its own keyset-paginated SELECT (see the docstring on
     ``_stream_audit_events_jsonl``), so it needs real ``audit_events`` rows.
+
+    Regression: gh-22. ``_stream_audit_events_jsonl`` is now an async
+    generator (each batch fetch + the final Vault signature run via
+    ``run_db()`` off the event loop) -- collect via ``async for`` instead of
+    ``list(...)``. Assertions are unchanged: this proves the stream still
+    yields every row, batch-wise, in the same shape as before.
     """
 
-    def test_stream_yields_one_line_per_row_plus_signature(self, pg_db: Any) -> None:
+    async def _collect(self, gen: Any) -> list[bytes]:
+        return [chunk async for chunk in gen]
+
+    async def test_stream_yields_one_line_per_row_plus_signature(
+        self, pg_db: Any
+    ) -> None:
         _seed_audit_event(pg_db)
         _seed_audit_event(pg_db)
         vault = MagicMock()
         vault.transit_sign.return_value = "vault:v1:sig"
 
-        chunks = list(
+        chunks = await self._collect(
             _stream_audit_events_jsonl(
                 pg_db,
                 cluster_id_label="test-cluster",
@@ -717,8 +729,8 @@ class TestStreamAuditEventsJsonl:
         assert footer["signature"] == "vault:v1:sig"
         assert footer["target_sub"] == "auditor@acme"
 
-    def test_stream_empty_table_yields_only_footer(self, pg_db: Any) -> None:
-        chunks = list(
+    async def test_stream_empty_table_yields_only_footer(self, pg_db: Any) -> None:
+        chunks = await self._collect(
             _stream_audit_events_jsonl(
                 pg_db,
                 cluster_id_label="test-cluster",
@@ -732,11 +744,17 @@ class TestStreamAuditEventsJsonl:
         footer = json.loads(body[0])
         assert footer["rows_exported"] == 0
 
-    def test_stream_paginates_across_batch_boundary(self, pg_db: Any) -> None:
-        """More rows than ``batch_size`` -- keyset loop must fetch every page."""
+    async def test_stream_paginates_across_batch_boundary(self, pg_db: Any) -> None:
+        """# regression: gh-22
+
+        More rows than ``batch_size`` -- keyset loop must fetch every page.
+        Each batch fetch now runs off the event loop via ``run_db()``; this
+        proves the async-generator conversion still yields every row across
+        multiple batch hops, not just within a single batch.
+        """
         for _ in range(5):
             _seed_audit_event(pg_db)
-        chunks = list(
+        chunks = await self._collect(
             _stream_audit_events_jsonl(
                 pg_db,
                 cluster_id_label="test-cluster",
@@ -751,9 +769,9 @@ class TestStreamAuditEventsJsonl:
         footer = json.loads(body[-1])
         assert footer["rows_exported"] == 5
 
-    def test_stream_with_no_vault_emits_unsigned(self, pg_db: Any) -> None:
+    async def test_stream_with_no_vault_emits_unsigned(self, pg_db: Any) -> None:
         _seed_audit_event(pg_db)
-        chunks = list(
+        chunks = await self._collect(
             _stream_audit_events_jsonl(
                 pg_db,
                 cluster_id_label="test-cluster",
@@ -766,11 +784,11 @@ class TestStreamAuditEventsJsonl:
         footer = json.loads(body[-1])
         assert footer["signature"] == "unsigned"
 
-    def test_stream_handles_vault_error_gracefully(self, pg_db: Any) -> None:
+    async def test_stream_handles_vault_error_gracefully(self, pg_db: Any) -> None:
         _seed_audit_event(pg_db)
         vault = MagicMock()
         vault.transit_sign.side_effect = RuntimeError("vault sealed")
-        chunks = list(
+        chunks = await self._collect(
             _stream_audit_events_jsonl(
                 pg_db,
                 cluster_id_label="test-cluster",
