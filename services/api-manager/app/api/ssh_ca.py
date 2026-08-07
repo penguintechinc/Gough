@@ -91,17 +91,20 @@ async def initialize_ca():
 
         current_user = get_current_user()
 
-        # Audit log
+        # Audit log. Regression: gh-22. AuditLogger.log() issues its own
+        # synchronous db.system_logs.insert()+commit() -- off the event
+        # loop via run_db() instead of blocking the request coroutine
+        # inline.
         audit_logger = get_audit_logger()
         if audit_logger:
-            audit_logger.log(
+            await run_db(lambda: audit_logger.log(
                 event_type=AuditEventType.CERT_ISSUED,
                 message=f"SSH CA initialized: {ca_name}",
                 user_id=current_user["id"],
                 resource_type="ssh_ca",
                 resource_id="0",
                 details={"action": "ca_initialization", "ca_name": ca_name},
-            )
+            ))
 
         log.info(f"SSH CA initialized by user {current_user['id']}")
 
@@ -273,10 +276,13 @@ async def sign_certificate():
         # Calculate validity end time
         valid_until = datetime.utcnow() + timedelta(seconds=validity_seconds)
 
-        # Audit log
+        # Audit log. Regression: gh-22. AuditLogger.log() issues its own
+        # synchronous db.system_logs.insert()+commit() -- off the event
+        # loop via run_db() instead of blocking the request coroutine
+        # inline.
         audit_logger = get_audit_logger()
         if audit_logger:
-            audit_logger.log(
+            await run_db(lambda: audit_logger.log(
                 event_type=AuditEventType.CERT_ISSUED,
                 message=f"Certificate signed for {resource_type}/{resource_id}",
                 user_id=current_user["id"],
@@ -288,7 +294,7 @@ async def sign_certificate():
                     "validity_seconds": validity_seconds,
                     "key_id": key_id,
                 },
-            )
+            ))
 
         log.info(
             f"SSH certificate signed for user {current_user['id']} "
