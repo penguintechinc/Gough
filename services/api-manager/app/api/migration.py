@@ -268,15 +268,21 @@ def _load_cluster_state(cluster_id: str) -> ClusterState:
 
 
 def _load_biome_snapshot(biome_instance_id: int) -> Optional[BiomeSnapshot]:
-    """Hydrate a ``BiomeSnapshot`` from ``node_biome_assignments`` + ``biomes``."""
+    """Hydrate a ``BiomeSnapshot`` from ``node_egg_assignments`` + ``biomes``.
+
+    ``node_egg_assignments`` is the real, baseline-created table (gh-21:
+    ``node_biome_assignments`` was a phantom name that never existed, so
+    this check was always False and every migration trigger request 404'd
+    unconditionally before this fix).
+    """
     db = get_db()
-    if ("node_biome_assignments" not in getattr(db, "tables", [])
+    if ("node_egg_assignments" not in getattr(db, "tables", [])
             or "biomes" not in getattr(db, "tables", [])):
         return None
-    nba = db(db.node_biome_assignments.id == biome_instance_id).select().first()
+    nba = db(db.node_egg_assignments.id == biome_instance_id).select().first()
     if nba is None:
         return None
-    biome = db(db.biomes.id == nba.biome_id).select().first()
+    biome = db(db.biomes.id == nba.egg_id).select().first()
     if biome is None:
         return None
     requires = frozenset(getattr(biome, "requires_hardware_tags", None) or [])
@@ -320,7 +326,13 @@ def _record_safety_event(
         "violations": violations_to_dicts(result.violations),
         "requested_target_node_id": plan.requested_target_node_id,
     }
+    # ``id`` (VARCHAR(36) UUID, app.models_m1.UUID) has no server-side or
+    # Python-side default -- this insert previously omitted it entirely.
+    # Unreachable in production until the gh-21 ``_load_biome_snapshot`` fix
+    # (this function's only caller stopped 404ing before ever reaching it),
+    # so the resulting NotNullViolation never surfaced; fixed alongside it.
     row_id = db.migration_events.insert(
+        id=str(uuid.uuid4()),
         biome_instance_id=biome.biome_instance_id,
         biome_id=biome.biome_id,
         biome_kind=biome.biome_kind,
