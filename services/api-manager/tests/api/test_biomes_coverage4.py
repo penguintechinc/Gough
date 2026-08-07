@@ -56,7 +56,7 @@ def biomes_app(monkeypatch):
     mock_db = MagicMock()
     mock_db.biomes.id = 1
     mock_db.nodes.id = 1
-    mock_db.node_biome_assignments.id = 1
+    mock_db.node_egg_assignments.id = 1
     mock_db.node_tags_operator.id = 1
     monkeypatch.setattr(biomes_mod, "get_db", lambda: mock_db)
 

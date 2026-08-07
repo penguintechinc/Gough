@@ -112,13 +112,13 @@ def dal(tmp_path, monkeypatch):
         migrate=True,
     )
     db.define_table(
-        "node_biome_assignments",
+        "node_egg_assignments",
         Field("node_id", "integer", notnull=True),
-        Field("biome_id", "integer", notnull=True),
+        Field("egg_id", "integer", notnull=True),
         Field("tenant_id", "string", default="__default__"),
         Field("phase", "string"),
         Field("status", "string", default="pending"),
-        Field("depends_on_biome_instance_id", "integer"),
+        Field("depends_on_egg_instance_id", "integer"),
         Field("readiness_probe_state", "string", default="not_started"),
         Field("assigned_at", "datetime"),
         Field("deployed_at", "datetime"),

@@ -755,9 +755,9 @@ class TestDeleteBiome:
         """Biome in active assignment cannot be deleted."""
         node = dal_with_groups(dal_with_groups.nodes.id > 0).select().first()
         if node:
-            dal_with_groups.node_biome_assignments.insert(
+            dal_with_groups.node_egg_assignments.insert(
                 node_id=int(node.id),
-                biome_id=sample_biome_id,
+                egg_id=sample_biome_id,
                 status="ready",
             )
             dal_with_groups.commit()

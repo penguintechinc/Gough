@@ -4,10 +4,34 @@ Provides a Quart test client with blueprints registered and auth stubbed.
 """
 
 import importlib
+import uuid
 from types import SimpleNamespace
 
 import pytest
 from quart import Quart, g
+from sqlalchemy import Column, String, Table
+
+
+def _define_table_with_string_id(dal_db, name, *fields):
+    """Like ``dal_db.define_table`` but with a VARCHAR(36) string ``id``
+    primary key instead of penguin_dal's auto-added Integer autoincrement id.
+
+    ``penguin_dal.field.Field``'s ``type_="id"`` shortcut is hardcoded to an
+    Integer column with no way to override -- but the real physical schema
+    for app-supplied-UUID tables (``migration_policy``, ``migration_events``;
+    see ``app.models_m1.UUID``, VARCHAR(36)) has a string primary key with no
+    default. On SQLite, an auto-added ``INTEGER PRIMARY KEY`` becomes a rowid
+    alias that rejects a string id with ``datatype mismatch`` -- this builds
+    the table via raw SQLAlchemy against the DB's own metadata/engine
+    (mirroring what ``define_table`` does internally, minus the auto-id
+    logic) so ``dal_db.<name>`` resolves normally via ``DB.__getattr__``.
+    """
+    if name in getattr(dal_db, "tables", []):
+        return
+    columns = [Column("id", String(36), primary_key=True)]
+    columns.extend(field.to_sa_column() for field in fields)
+    table = Table(name, dal_db.metadata, *columns)
+    dal_db.metadata.create_all(dal_db.engine, tables=[table])
 
 
 def _passthrough_decorator(*dargs, **dkwargs):
@@ -55,53 +79,58 @@ def client(dal, monkeypatch):
             Field("storage_requirements_json", "json"),
             migrate=True,
         )
-    if "node_biome_assignments" not in getattr(dal, "tables", []):
+    # ``node_egg_assignments`` is the real, baseline-created table (gh-21:
+    # ``node_biome_assignments`` was a phantom name that never existed).
+    if "node_egg_assignments" not in getattr(dal, "tables", []):
         dal.define_table(
-            "node_biome_assignments",
+            "node_egg_assignments",
             Field("node_id", "integer", notnull=True),
-            Field("biome_id", "integer", notnull=True),
+            Field("egg_id", "integer", notnull=True),
             Field("tenant_id", "string", default="__default__"),
             Field("status", "string", default="pending"),
             migrate=True,
         )
-    if "migration_policy" not in getattr(dal, "tables", []):
-        dal.define_table(
-            "migration_policy",
-            Field("cluster_id", "string", notnull=True),
-            Field("enabled", "boolean", default=False),
-            Field("evaluation_interval_seconds", "integer", default=300),
-            Field("min_healthy_nodes", "integer", default=3),
-            Field("max_concurrent_migrations", "integer", default=1),
-            Field("require_target_capacity_headroom_cpu_pct", "integer", default=20),
-            Field("require_target_capacity_headroom_mem_pct", "integer", default=20),
-            Field("require_target_capacity_headroom_disk_pct", "integer", default=15),
-            Field("rollback_on_destination_failure", "boolean", default=True),
-            Field("rollback_window_seconds", "integer", default=300),
-            Field("forbid_migration_during_partition", "boolean", default=True),
-            Field("forbid_migration_during_maintenance", "boolean", default=True),
-            Field("waddleai_risk_threshold", "float", default=0.75),
-            Field("capacity_forecast_horizon_days", "integer", default=7),
-            Field("created_at", "datetime"),
-            Field("updated_at", "datetime"),
-            migrate=True,
-        )
-    if "migration_events" not in getattr(dal, "tables", []):
-        dal.define_table(
-            "migration_events",
-            Field("biome_instance_id", "integer"),
-            Field("biome_id", "integer"),
-            Field("biome_kind", "string"),
-            Field("src_node_id", "integer"),
-            Field("dst_node_id", "integer"),
-            Field("reason", "string"),
-            Field("result", "string"),
-            Field("rejection_reason", "string"),
-            Field("safety_check_details_json", "json"),
-            Field("started_at", "datetime"),
-            Field("completed_at", "datetime"),
-            Field("duration_seconds", "float"),
-            migrate=True,
-        )
+    # ``id`` is app-supplied VARCHAR(36) UUID on the real table (see
+    # app.api.migration.patch_migration_policy's ``id=str(uuid.uuid4())``)
+    # -- use the string-id helper, not ``dal.define_table``'s auto Integer id.
+    _define_table_with_string_id(
+        dal,
+        "migration_policy",
+        Field("cluster_id", "string", notnull=True),
+        Field("enabled", "boolean", default=False),
+        Field("evaluation_interval_seconds", "integer", default=300),
+        Field("min_healthy_nodes", "integer", default=3),
+        Field("max_concurrent_migrations", "integer", default=1),
+        Field("require_target_capacity_headroom_cpu_pct", "integer", default=20),
+        Field("require_target_capacity_headroom_mem_pct", "integer", default=20),
+        Field("require_target_capacity_headroom_disk_pct", "integer", default=15),
+        Field("rollback_on_destination_failure", "boolean", default=True),
+        Field("rollback_window_seconds", "integer", default=300),
+        Field("forbid_migration_during_partition", "boolean", default=True),
+        Field("forbid_migration_during_maintenance", "boolean", default=True),
+        Field("waddleai_risk_threshold", "float", default=0.75),
+        Field("capacity_forecast_horizon_days", "integer", default=7),
+        Field("created_at", "datetime"),
+        Field("updated_at", "datetime"),
+    )
+    # ``id`` is app-supplied VARCHAR(36) UUID on the real table (see
+    # app.api.migration._record_safety_event's ``id=str(uuid.uuid4())``).
+    _define_table_with_string_id(
+        dal,
+        "migration_events",
+        Field("biome_instance_id", "integer"),
+        Field("biome_id", "integer"),
+        Field("biome_kind", "string"),
+        Field("src_node_id", "integer"),
+        Field("dst_node_id", "integer"),
+        Field("reason", "string"),
+        Field("result", "string"),
+        Field("rejection_reason", "string"),
+        Field("safety_check_details_json", "json"),
+        Field("started_at", "datetime"),
+        Field("completed_at", "datetime"),
+        Field("duration_seconds", "float"),
+    )
 
     # Seed nodes, biome, assignment, and policy for migration tests
     _now = datetime.now(timezone.utc)
@@ -120,12 +149,15 @@ def client(dal, monkeypatch):
         name="test-biome", biome_kind="custom", lock_to_host=False,
     )
     # First insert gets id=1 in SQLite — used by POST trigger tests
-    dal.node_biome_assignments.insert(
-        node_id=int(_node_id), biome_id=int(_biome_id),
+    dal.node_egg_assignments.insert(
+        node_id=int(_node_id), egg_id=int(_biome_id),
         tenant_id="default", status="active",
     )
-    # Seed policy with min_healthy_nodes=1 to match single-node test cluster
+    # Seed policy with min_healthy_nodes=1 to match single-node test cluster.
+    # ``id`` is app-supplied VARCHAR(36) UUID -- no default (see
+    # _define_table_with_string_id above).
     dal.migration_policy.insert(
+        id=str(uuid.uuid4()),
         cluster_id="default",
         enabled=False,
         evaluation_interval_seconds=300,
@@ -318,7 +350,7 @@ def app(monkeypatch):
 def dal_with_eggs(dal):
     """Alias for dal_with_biomes for backward-compat.
 
-    Extends dal with biomes + node_biome_assignments tables.
+    Extends dal with biomes + node_egg_assignments tables.
     """
     from penguin_dal import Field
 
@@ -376,17 +408,19 @@ def dal_with_eggs(dal):
         migrate=True,
     )
 
-    # Define node_biome_assignments table
+    # Define node_egg_assignments table (gh-21: the real, baseline-created
+    # table -- ``node_biome_assignments`` was a phantom name that never
+    # existed in production).
     dal.define_table(
-        "node_biome_assignments",
+        "node_egg_assignments",
         Field("node_id", "integer", notnull=True),
-        Field("biome_id", "integer", notnull=True),
+        Field("egg_id", "integer", notnull=True),
         Field("tenant_id", "string", default="__default__"),
         Field("status", "string", default="pending"),
         Field("annotation", "string"),
         Field("phase", "string", default="post_deploy"),
         Field("readiness_probe_state", "string", default="pending"),
-        Field("depends_on_biome_instance_id", "integer"),
+        Field("depends_on_egg_instance_id", "integer"),
         Field("assigned_at", "datetime"),
         Field("deployed_at", "datetime"),
         Field("removed_at", "datetime"),

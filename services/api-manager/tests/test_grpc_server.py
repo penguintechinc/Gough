@@ -1,5 +1,5 @@
 """Real-Postgres tests for ``app.grpc_server`` (JoinerSecretsServicer,
-AuditServicer, IdentityServicer.VerifyOTPN).
+AuditServicer, IdentityServicer.VerifyOTPN, BiomesServicer.DeployBiome).
 
 Covers the penguin-dal conversion of these servicers: filter + empty-result
 cases for reads, the atomic revoke+persist transaction for ``Rotate``, and a
@@ -32,6 +32,7 @@ from quart import Quart
 
 from app.grpc_server import (
     AuditServicer,
+    BiomesServicer,
     IdentityServicer,
     JoinerSecretsServicer,
 )
@@ -718,6 +719,103 @@ class TestAuditExportRange:
             response = await AuditServicer().ExportRange(request, context)
 
         assert response.export_data == b""
+
+
+# =============================================================================
+# BiomesServicer.DeployBiome
+# =============================================================================
+
+
+class TestDeployBiome:
+    """Regression (gh-21): ``DeployBiome`` used to insert into
+    ``db.node_biome_assignments``, a table that exists nowhere -- the
+    ``hasattr`` guard in front of it was always False, so the insert
+    unconditionally raised ``RuntimeError`` and every call aborted INTERNAL.
+    These prove the real ``node_egg_assignments`` row actually lands, with
+    the correct physical column mapping (``egg_id``, not ``biome_id``)."""
+
+    async def test_deploy_biome_persists_assignment_row(self, pg_db: Any) -> None:
+        node_id = _seed_node(pg_db, tenant_id="acme")
+        biome_id = _seed_biome(pg_db, tenant_id="acme", phase="pre_deploy")
+
+        app = _make_app(db=pg_db)
+        request = Mock(biome_id=biome_id, node_id=node_id, config="", params={})
+        context = FakeGrpcContext()
+
+        async with app.app_context():
+            response = await BiomesServicer().DeployBiome(request, context)
+
+        assert context.aborted is None
+        assert response.status == "pending"
+        assert response.deployment_id
+
+        row = (
+            pg_db(pg_db.node_egg_assignments.id == int(response.deployment_id))
+            .select()
+            .first()
+        )
+        assert row is not None
+        assert row.node_id == node_id
+        assert row.egg_id == biome_id
+        assert row.tenant_id == "acme"
+        assert row.phase == "pre_deploy"
+        assert row.status == "pending"
+        assert row.assigned_at is not None
+        assert row.created_at is not None
+        assert row.updated_at is not None
+
+    async def test_deploy_biome_defaults_phase_when_biome_has_none(
+        self, pg_db: Any
+    ) -> None:
+        """``phase`` is NOT NULL with no server default on the real table --
+        falls back to ``post_deploy`` when the biome row's own phase is
+        falsy, matching ``app.api.nodes.deploy_node``'s established
+        convention."""
+        node_id = _seed_node(pg_db, tenant_id="acme")
+        biome_id = _seed_biome(pg_db, tenant_id="acme")
+        pg_db(pg_db.biomes.id == biome_id).update(phase="")
+        pg_db.commit()
+
+        app = _make_app(db=pg_db)
+        request = Mock(biome_id=biome_id, node_id=node_id, config="", params={})
+        context = FakeGrpcContext()
+
+        async with app.app_context():
+            response = await BiomesServicer().DeployBiome(request, context)
+
+        assert context.aborted is None
+        row = (
+            pg_db(pg_db.node_egg_assignments.id == int(response.deployment_id))
+            .select()
+            .first()
+        )
+        assert row.phase == "post_deploy"
+
+    async def test_deploy_biome_not_found_biome(self, pg_db: Any) -> None:
+        node_id = _seed_node(pg_db)
+        app = _make_app(db=pg_db)
+        request = Mock(biome_id=999999, node_id=node_id, config="", params={})
+        context = FakeGrpcContext()
+
+        async with app.app_context():
+            with pytest.raises(_AbortCalled):
+                await BiomesServicer().DeployBiome(request, context)
+
+        code, _ = context.aborted
+        assert "NOT_FOUND" in str(code)
+
+    async def test_deploy_biome_not_found_node(self, pg_db: Any) -> None:
+        biome_id = _seed_biome(pg_db)
+        app = _make_app(db=pg_db)
+        request = Mock(biome_id=biome_id, node_id=999999, config="", params={})
+        context = FakeGrpcContext()
+
+        async with app.app_context():
+            with pytest.raises(_AbortCalled):
+                await BiomesServicer().DeployBiome(request, context)
+
+        code, _ = context.aborted
+        assert "NOT_FOUND" in str(code)
 
 
 # =============================================================================
