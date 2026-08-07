@@ -17,16 +17,33 @@ penguin-dal conversion notes (Task 8a):
 * The chain-head lookup (``SELECT hash FROM audit_events ORDER BY ts DESC,
   id DESC LIMIT 1``) is intentionally NOT tenant-filtered -- the hash chain
   is one global, cluster-wide sequence spanning every tenant's events, not
-  one chain per tenant. Callers MUST ensure RLS visibility spans every
-  tenant for this call (e.g. via ``app.db.rls.CROSS_TENANT_SENTINEL``) --
-  running it under a single-tenant GUC scope would silently return a
-  prev_hash that skips every other tenant's more-recent rows and fork the
-  chain. This module deliberately does not bake that scope in itself (it's
-  a generic writer/verifier, and scope selection is the caller's call to
-  make, matching the ``persist_extracted_material``/``_cross_tenant_scope()``
-  precedent in ``app.workers.joiner_secret_emitter`` /
-  ``app.grpc_server``) -- ``AuditChainWriter`` (the only in-scope live
-  caller) applies it.
+  one chain per tenant. FIX (gh-22): ``append()`` now self-applies the RLS
+  cross-tenant sentinel (``app.db.rls.CROSS_TENANT_SENTINEL``, via the
+  local ``_cross_tenant_scope()`` helper below) tightly around its own DB
+  work (the caller-provided-``tx`` branch and the self-opened-transaction
+  branch alike) -- running the chain-head SELECT under a single-tenant GUC
+  scope would otherwise silently return a prev_hash that skips every other
+  tenant's more-recent rows and fork the chain. This used to be left to the
+  caller (matching the ``persist_extracted_material``/
+  ``_cross_tenant_scope()`` precedent in ``app.workers.joiner_secret_emitter``
+  / ``app.grpc_server``); two live request-path callers never applied it
+  (see the fixed bullet below) and could fork the chain under an ordinary
+  per-tenant GUC. ``AuditChainWriter.append_event()`` still wraps its own
+  call in ``_cross_tenant_scope()`` too -- no longer load-bearing (its
+  ``tx``'s connection is already checked out under that scope by the time
+  it reaches ``append()``), kept as-is since it's harmless (setting an
+  already-sentinel ContextVar to the sentinel again) and this task doesn't
+  touch that module.
+  ``verify_chain()`` deliberately does NOT get the same self-applied scope
+  -- unlike ``append()`` it has two callers with genuinely different scope
+  needs: ``AuditChainWriter.verify_chain_scheduled`` (background, needs the
+  full cross-tenant chain, wraps it itself) and
+  ``app.api.audit.verify_audit_chain`` (the ``POST /verify`` endpoint,
+  intentionally tenant-scoped -- a non-superadmin caller's verification is
+  scoped to their own tenant's rows via the ordinary per-request GUC).
+  Baking the sentinel into ``verify_chain()`` itself would silently break
+  that intentional per-tenant behavior, so scope selection stays the
+  caller's call to make there.
 * Constructor keyword is still named ``db_session`` for source compatibility.
   ``app.api.audit._build_audit_writer`` and ``app.api.joiner_secrets
   ._build_audit_writer`` (FIX #7a cleanup) now pass ``app.models.get_db()``
@@ -39,18 +56,23 @@ penguin-dal conversion notes (Task 8a):
   into the app factory, out of scope for both this file and that one.
   Despite the keyword name, the value must be a penguin-dal ``DB`` instance,
   not a SQLAlchemy Session.
-* Follow-up flagged, not fixed here: ``export_audit_log``'s self-audit-log
-  write and ``revoke_joiner_secret``'s both call ``AuditEventWriter.append()``
-  without wrapping it in ``app.db.rls.CROSS_TENANT_SENTINEL`` the way
-  ``AuditChainWriter`` (the background worker) does -- see the chain-head
-  lookup note above. They rely entirely on the ContextVar the tenant
-  middleware set from the caller's own JWT (their own tenant, or the
-  sentinel only if that JWT carries ``cross_tenant=True``), matching the
+* FIX (gh-22): ``export_audit_log``'s self-audit-log write and
+  ``revoke_joiner_secret``'s both call ``AuditEventWriter.append()`` without
+  wrapping it in ``app.db.rls.CROSS_TENANT_SENTINEL`` themselves -- unlike
+  ``AuditChainWriter`` (the background worker), they ran under whatever
+  tenant GUC the caller's own JWT set (their own tenant, or the sentinel
+  only if that JWT carried ``cross_tenant=True``), matching the
   pre-conversion ``set_tenant_guc(db, tenant_id)`` behavior exactly (that
-  also used the caller's own ``tenant_id``, never the sentinel) -- so this
-  isn't a regression, but it means a superadmin ``/export`` call without a
-  ``cross_tenant=True`` token still risks forking the chain head the same
-  way it always could have, now that the call path is actually reachable.
+  also used the caller's own ``tenant_id``, never the sentinel) -- so a
+  superadmin ``/export`` call without a ``cross_tenant=True`` token risked
+  forking the chain head. ``append()`` now self-applies the cross-tenant
+  scope (see the chain-head lookup bullet above), fixing this at the
+  source for every caller regardless of what GUC scope it happens to be
+  running under. The row's own ``tenant_id`` *column* is unaffected by this
+  -- it's still the caller-supplied ``tenant_id=`` keyword argument, read
+  from the request's JWT/tenant context by both callers before ``append()``
+  is ever invoked; only the RLS *visibility* scope for the chain-head
+  SELECT/INSERT changes.
 """
 
 from __future__ import annotations
@@ -155,7 +177,7 @@ class AuditEvent(BaseModel):
 def _cross_tenant_scope() -> Iterator[None]:
     """Push the RLS cross-tenant sentinel for one cluster-global DB unit.
 
-    Used only by :func:`insert_genesis_row` -- a one-time, cluster-bootstrap
+    Used by :func:`insert_genesis_row` -- a one-time, cluster-bootstrap
     operation with no tenant of its own (its INSERT carries no ``tenant_id``
     column at all, so the row's ``tenant_id`` is NULL; the baseline
     ``tenant_isolation`` policy's ``USING (current_setting(...) IN
@@ -163,9 +185,11 @@ def _cross_tenant_scope() -> Iterator[None]:
     ``tenant_id`` against an ordinary per-tenant setting, only against the
     literal ``'__default__'``/``'__all__'`` sentinels -- so both the
     idempotency SELECT and the INSERT itself need this scope to work at
-    all, let alone correctly). See module docstring for why
-    ``AuditEventWriter``/``verify_chain`` leave this to their callers
-    instead of self-applying it.
+    all, let alone correctly), and by :meth:`AuditEventWriter.append` (FIX
+    gh-22) -- the chain-head SELECT + INSERT must always see the true
+    global chain head regardless of the caller's own per-tenant GUC scope.
+    See module docstring for why ``verify_chain`` alone still leaves this to
+    its callers instead of self-applying it.
     """
     previous = get_current_tenant()
     set_current_tenant(CROSS_TENANT_SENTINEL)
@@ -229,37 +253,45 @@ class AuditEventWriter:
         pinned connection for the duration (see ``AuditChainWriter
         .append_event()``). If omitted, a private transaction is opened here
         so the read+insert still commit/rollback together as one unit.
+
+        FIX (gh-22): the read+insert always runs under the RLS cross-tenant
+        sentinel (``app.db.rls.CROSS_TENANT_SENTINEL``), self-applied here
+        via ``_cross_tenant_scope()`` -- see the module docstring's
+        chain-head-lookup bullet for why. This is a visibility-scope change
+        only: the inserted row's own ``tenant_id`` column is whatever the
+        caller passed as ``tenant_id=`` above, never the sentinel.
         """
-        if tx is not None:
-            return self._append_on_tx(
-                tx,
-                actor_sub=actor_sub,
-                action=action,
-                resource_kind=resource_kind,
-                resource_id=resource_id,
-                tenant_id=tenant_id,
-                actor_scope=actor_scope,
-                before=before,
-                after=after,
-                request_id=request_id,
-                source_ip=source_ip,
-                user_agent=user_agent,
-            )
-        with self.db.transaction() as opened_tx:
-            return self._append_on_tx(
-                opened_tx,
-                actor_sub=actor_sub,
-                action=action,
-                resource_kind=resource_kind,
-                resource_id=resource_id,
-                tenant_id=tenant_id,
-                actor_scope=actor_scope,
-                before=before,
-                after=after,
-                request_id=request_id,
-                source_ip=source_ip,
-                user_agent=user_agent,
-            )
+        with _cross_tenant_scope():
+            if tx is not None:
+                return self._append_on_tx(
+                    tx,
+                    actor_sub=actor_sub,
+                    action=action,
+                    resource_kind=resource_kind,
+                    resource_id=resource_id,
+                    tenant_id=tenant_id,
+                    actor_scope=actor_scope,
+                    before=before,
+                    after=after,
+                    request_id=request_id,
+                    source_ip=source_ip,
+                    user_agent=user_agent,
+                )
+            with self.db.transaction() as opened_tx:
+                return self._append_on_tx(
+                    opened_tx,
+                    actor_sub=actor_sub,
+                    action=action,
+                    resource_kind=resource_kind,
+                    resource_id=resource_id,
+                    tenant_id=tenant_id,
+                    actor_scope=actor_scope,
+                    before=before,
+                    after=after,
+                    request_id=request_id,
+                    source_ip=source_ip,
+                    user_agent=user_agent,
+                )
 
     def _append_on_tx(
         self,
