@@ -23,6 +23,7 @@ import yaml
 from quart import Blueprint, jsonify, request, g, current_app
 from werkzeug.utils import secure_filename
 
+from ..db.run_db import run_db
 from ..middleware import admin_required, auth_required, get_current_user, maintainer_or_admin_required
 from ..models import get_db
 from .. import metrics as _metrics
@@ -441,13 +442,19 @@ async def list_biomes():
     if name_contains:
         conds.append(table.name.contains(name_contains))
 
-    if conds:
-        q = conds[0]
-        for c in conds[1:]:
-            q = q & c
-        rows = db(q).select(orderby=table.display_name)
-    else:
-        rows = db(table.id > 0).select(orderby=table.display_name)
+    # Regression: gh-22. Unbounded SELECT over the full biomes table -- now
+    # run off the event loop via run_db() instead of blocking the request
+    # coroutine inline (this service is single-process/single-loop, gRPC
+    # included).
+    def _fetch() -> Any:
+        if conds:
+            q = conds[0]
+            for c in conds[1:]:
+                q = q & c
+            return db(q).select(orderby=table.display_name)
+        return db(table.id > 0).select(orderby=table.display_name)
+
+    rows = await run_db(_fetch)
 
     # Post-filter for: requires_tag (AND across each, against the biome's
     # declared ``requires_hardware_tags``) and node-eligibility.
@@ -741,8 +748,14 @@ async def delete_biome(biome_id: int):
         )
 
     # Legacy iPXE machines blocker (only if table exists; for hard delete only).
+    # Regression: gh-22. Unindexed JSON-containment scan over the full
+    # ipxe_machines table -- now off the event loop via run_db() instead of
+    # blocking the request coroutine inline.
     if hard and hasattr(db, "ipxe_machines"):
-        machines_with_biome = db(db.ipxe_machines.assigned_biomes.contains(str(biome_id))).select()
+        def _fetch_biome_machines() -> Any:
+            return db(db.ipxe_machines.assigned_biomes.contains(str(biome_id))).select()
+
+        machines_with_biome = await run_db(_fetch_biome_machines)
         if machines_with_biome:
             return err_conflict(
                 "Biome is assigned to iPXE machines; remove assignments first",
@@ -1038,7 +1051,20 @@ async def upgrade_biome(biome_id: int):
 async def _execute_upgrade_orchestration(
     biome_id: int, run_id: str, target_version: str, rollout_plan: dict
 ) -> None:
-    """Execute upgrade orchestration: canary → batched → all phases."""
+    """Execute upgrade orchestration: canary → batched → all phases.
+
+    Regression: gh-22. Runs as a Quart background task on the SAME shared
+    event loop as every request handler and the gRPC server
+    (``current_app.add_background_task`` -- see ``upgrade_biome`` above),
+    not off in some separate worker -- every ``db(...).select()``/
+    ``.update()`` call here used to block that loop for its whole
+    duration, exactly like a blocking request handler would. Each DB
+    statement below is its own unit of work (a single SELECT or a single
+    status-checkpoint UPDATE, no shared transaction across them), so each
+    now runs through its own ``run_db()`` hop rather than one giant
+    closure spanning the whole multi-phase rollout -- the poll sleeps
+    between phases stay plain ``await asyncio.sleep()``, not blocking work.
+    """
     import asyncio
     import aiohttp
     from datetime import datetime, timezone
@@ -1046,10 +1072,16 @@ async def _execute_upgrade_orchestration(
     db = get_db()
     batch_size = rollout_plan.get("batch_size", 2) if rollout_plan else 2
 
+    def _update_run(**fields: Any) -> None:
+        db(db.upgrade_runs.id == run_id).update(**fields)
+
+    def _fetch_deployment_rows() -> Any:
+        return db(
+            (db.deployments.biome_id == biome_id) & (db.deployments.status == "completed")
+        ).select()
+
     # Derive target nodes from completed deployments for this biome
-    deployment_rows = db(
-        (db.deployments.biome_id == biome_id) & (db.deployments.status == "completed")
-    ).select()
+    deployment_rows = await run_db(_fetch_deployment_rows)
     target_nodes = [str(row.node_id) for row in deployment_rows]
 
     if not target_nodes:
@@ -1057,19 +1089,19 @@ async def _execute_upgrade_orchestration(
             "upgrade.no_target_nodes",
             extra={"biome_id": biome_id, "run_id": run_id},
         )
-        db(db.upgrade_runs.id == run_id).update(
+        await run_db(lambda: _update_run(
             status="failed",
             phase="canary",
             completed_at=datetime.now(timezone.utc),
             rollback_reason="no_target_nodes_available",
-        )
+        ))
         return
 
-    db(db.upgrade_runs.id == run_id).update(
+    await run_db(lambda: _update_run(
         status="running",
         started_at=datetime.now(timezone.utc),
         nodes_total=len(target_nodes),
-    )
+    ))
 
     # Canary phase
     log.info("upgrade.canary.start", extra={"run_id": run_id, "biome_id": biome_id})
@@ -1079,13 +1111,13 @@ async def _execute_upgrade_orchestration(
     )
 
     if not canary_ok:
-        db(db.upgrade_runs.id == run_id).update(
+        await run_db(lambda: _update_run(
             status="rolled_back",
             phase="canary",
             nodes_failed=len(canary_nodes),
             completed_at=datetime.now(timezone.utc),
             rollback_reason="canary_failed",
-        )
+        ))
         log.info("upgrade.canary.failed", extra={"run_id": run_id, "biome_id": biome_id})
         return
 
@@ -1100,39 +1132,65 @@ async def _execute_upgrade_orchestration(
             batch, biome_id, target_version, run_id
         )
         if not batch_ok:
-            db(db.upgrade_runs.id == run_id).update(
+            await run_db(lambda: _update_run(
                 status="failed",
                 phase="batched",
                 nodes_failed=len(batch),
                 completed_at=datetime.now(timezone.utc),
                 rollback_reason="batched_phase_failed",
-            )
+            ))
             log.info("upgrade.batched.failed", extra={"run_id": run_id, "biome_id": biome_id})
             return
         completed += len(batch)
-        db(db.upgrade_runs.id == run_id).update(nodes_completed=completed)
+        await run_db(lambda: _update_run(nodes_completed=completed))
 
     # All phase: parallel deploy to any remaining
     log.info("upgrade.all.start", extra={"run_id": run_id, "biome_id": biome_id})
 
-    db(db.upgrade_runs.id == run_id).update(
+    await run_db(lambda: _update_run(
         status="completed",
         phase="done",
         nodes_completed=len(target_nodes),
         completed_at=datetime.now(timezone.utc),
-    )
+    ))
     log.info("upgrade.completed", extra={"run_id": run_id, "biome_id": biome_id})
 
 
 async def _deploy_and_health_check(
     nodes: list[str], biome_id: int, target_version: str, run_id: str
 ) -> bool:
-    """Deploy to nodes and health-check (5s intervals, 60s timeout)."""
+    """Deploy to nodes and health-check (5s intervals, 60s timeout).
+
+    Regression: gh-22. Same shared-event-loop background task as
+    ``_execute_upgrade_orchestration`` above. The per-node lookup here ran
+    once per node in the deploy loop AND once per node per health-check
+    attempt (12 attempts x N nodes) -- every one of those was a blocking
+    call inline on the loop. Both now go through ``run_db()``; the 5s poll
+    interval stays plain ``await asyncio.sleep()``.
+
+    Also fixes a pre-existing bug this sweep's own end-to-end test
+    surfaced: the health-check phase below references ``aiohttp`` but this
+    function never imported it (only the sibling
+    ``_execute_upgrade_orchestration`` did, and a local ``import`` inside
+    one function does not leak into another's namespace) -- every upgrade
+    run's health-check phase unconditionally raised ``NameError`` and
+    timed out after 60s. No prior test caught it because every existing
+    test mocks ``_deploy_and_health_check`` away entirely.
+    """
     import asyncio
     import subprocess
 
+    import aiohttp
+
     db = get_db()
-    biome = db(db.biomes.id == biome_id).select().first()
+
+    def _fetch_node(node_id: int) -> Any:
+        return db(db.nodes.id == node_id).select().first()
+
+    def _fetch_biome() -> Any:
+        return db(db.biomes.id == biome_id).select().first()
+
+    biome = await run_db(_fetch_biome)
     if not biome:
         log.error(
             "upgrade.biome_not_found",
@@ -1150,7 +1208,7 @@ async def _deploy_and_health_check(
         )
         try:
             node_id = int(node_id_str)
-            node_row = db(db.nodes.id == node_id).select().first()
+            node_row = await run_db(lambda: _fetch_node(node_id))
             if not node_row:
                 log.warning(
                     "upgrade.node_not_found",
@@ -1208,7 +1266,7 @@ async def _deploy_and_health_check(
             async with aiohttp.ClientSession() as session:
                 for node_id_str in nodes:
                     node_id = int(node_id_str)
-                    node_row = db(db.nodes.id == node_id).select().first()
+                    node_row = await run_db(lambda: _fetch_node(node_id))
                     if not node_row:
                         all_healthy = False
                         break
@@ -1217,7 +1275,9 @@ async def _deploy_and_health_check(
                     url = f"http://{node_hostname}:8080/healthz"
 
                     try:
-                        async with session.get(url, timeout=2) as resp:
+                        async with session.get(
+                            url, timeout=aiohttp.ClientTimeout(total=2)
+                        ) as resp:
                             if resp.status != 200:
                                 all_healthy = False
                                 break
@@ -1837,8 +1897,10 @@ async def get_deployment_logs(deployment_id: str):
         except ValueError:
             return err_bad_request(f"Invalid since timestamp: {since}")
 
-    # Fetch logs ordered by created_at ascending
-    logs_rows = query.select(orderby=db.deployment_logs.created_at)
+    # Fetch logs ordered by created_at ascending. Regression: gh-22 -- now
+    # off the event loop via run_db() instead of blocking the request
+    # coroutine inline.
+    logs_rows = await run_db(lambda: query.select(orderby=db.deployment_logs.created_at))
 
     logs = []
     for row in logs_rows:
