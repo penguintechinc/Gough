@@ -25,6 +25,7 @@ from urllib.parse import urlparse
 
 from quart import Blueprint, current_app, g, jsonify, request
 
+from ..db.run_db import run_db
 from ..middleware import auth_required
 from ..models import get_db
 from ..security.scope_enforcement import require_scopes
@@ -176,9 +177,15 @@ async def list_webhooks():
     """List webhook endpoints for the caller's tenant."""
     tenant_id = _current_tenant()
     db = get_db()
-    rows = db(db.webhook_endpoints.tenant_id == tenant_id).select(
-        orderby=db.webhook_endpoints.id
-    )
+
+    # Regression: gh-22. Off the event loop via run_db() instead of
+    # blocking the request coroutine inline.
+    def _fetch() -> Any:
+        return db(db.webhook_endpoints.tenant_id == tenant_id).select(
+            orderby=db.webhook_endpoints.id
+        )
+
+    rows = await run_db(_fetch)
     return jsonify({"endpoints": [_row_to_dict(r) for r in rows]}), 200
 
 
@@ -237,17 +244,24 @@ async def create_webhook():
     # unambiguous, in-file, one-line correction, not a schema guess.
     now = datetime.now(timezone.utc)
     db = get_db()
-    new_id = db.webhook_endpoints.insert(
-        tenant_id=tenant_id,
-        url=url,
-        signing_mode=signing_mode,
-        active=True,
-        event_filter=event_filter,
-        retry_policy=retry_policy,
-        created_at=now,
-        updated_at=now,
-    )
-    row = db(db.webhook_endpoints.id == new_id).select().first()
+
+    # Regression: gh-22. Insert + the post-insert refetch is one unit of
+    # work -- stays in one run_db() closure per the house rule (see
+    # app/db/run_db.py).
+    def _insert_and_fetch() -> Any:
+        new_id = db.webhook_endpoints.insert(
+            tenant_id=tenant_id,
+            url=url,
+            signing_mode=signing_mode,
+            active=True,
+            event_filter=event_filter,
+            retry_policy=retry_policy,
+            created_at=now,
+            updated_at=now,
+        )
+        return db(db.webhook_endpoints.id == new_id).select().first()
+
+    row = await run_db(_insert_and_fetch)
 
     return jsonify(_row_to_dict(row)), 201
 
@@ -262,9 +276,15 @@ async def delete_webhook(webhook_id: str):
     if wid is None:
         return jsonify({"error": "not_found"}), 404
     db = get_db()
-    rowcount = db(
-        (db.webhook_endpoints.id == wid) & (db.webhook_endpoints.tenant_id == tenant_id)
-    ).delete()
+
+    # Regression: gh-22. Off the event loop via run_db() instead of
+    # blocking the request coroutine inline.
+    def _delete() -> int:
+        return db(
+            (db.webhook_endpoints.id == wid) & (db.webhook_endpoints.tenant_id == tenant_id)
+        ).delete()
+
+    rowcount = await run_db(_delete)
     if not rowcount:
         return jsonify({"error": "not_found"}), 404
     return ("", 204)
@@ -280,9 +300,15 @@ async def test_webhook(webhook_id: str):
     if wid is None:
         return jsonify({"error": "not_found"}), 404
     db = get_db()
-    row = db(
-        (db.webhook_endpoints.id == wid) & (db.webhook_endpoints.tenant_id == tenant_id)
-    ).select().first()
+
+    # Regression: gh-22. Off the event loop via run_db() instead of
+    # blocking the request coroutine inline.
+    def _fetch() -> Any:
+        return db(
+            (db.webhook_endpoints.id == wid) & (db.webhook_endpoints.tenant_id == tenant_id)
+        ).select().first()
+
+    row = await run_db(_fetch)
     if row is None:
         return jsonify({"error": "not_found"}), 404
     record = _row_to_dict(row)

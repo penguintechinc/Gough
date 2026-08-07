@@ -31,6 +31,7 @@ from .rls import (
     install_rls_events,
     set_current_tenant,
 )
+from .run_db import run_db
 
 __all__ = [
     # penguin-dal runtime operations
@@ -51,4 +52,6 @@ __all__ = [
     'get_current_tenant',
     'install_rls_events',
     'set_current_tenant',
+    # Event-loop-unblocking helper (gh-22)
+    'run_db',
 ]

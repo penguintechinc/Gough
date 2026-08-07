@@ -6,9 +6,11 @@ Provides REST API for managing cloud providers and machines.
 from __future__ import annotations
 
 import logging
+from typing import Any
 
 from quart import Blueprint, jsonify, request
 
+from ..db.run_db import run_db
 from ..middleware import auth_required, roles_accepted, roles_required
 from ..clouds import (
     CLOUD_REGISTRY,
@@ -43,7 +45,10 @@ async def list_providers():
     """
     db = get_db()
 
-    providers = db(db.cloud_providers).select().as_list()
+    def _fetch_providers() -> Any:
+        return db(db.cloud_providers).select().as_list()
+
+    providers = await run_db(_fetch_providers)
 
     # Don't expose sensitive config data to non-admins
     for provider in providers:
@@ -113,19 +118,30 @@ async def add_provider():
     # Store in database
     db = get_db()
 
-    # Check for duplicate name
-    existing = db(db.cloud_providers.name == name).count()
+    # Regression: gh-22. Off the event loop via run_db() instead of
+    # blocking the request coroutine inline.
+    def _check_name_exists() -> int:
+        return db(db.cloud_providers.name == name).count()
+
+    existing = await run_db(_check_name_exists)
     if existing > 0:
         return jsonify({"error": f"Provider with name '{name}' already exists"}), 409
 
-    provider_id = db.cloud_providers.insert(
-        name=name,
-        provider_type=provider_type,
-        config=config,
-        status="connected",
-        enabled=enabled,
-    )
-    db.commit()
+    # Regression: gh-22. insert + commit is one unit of work -- a
+    # penguin-dal connection checkout isn't safe to resume on a different
+    # thread hop, so both stay inside one run_db() closure.
+    def _insert_provider() -> Any:
+        new_id = db.cloud_providers.insert(
+            name=name,
+            provider_type=provider_type,
+            config=config,
+            status="connected",
+            enabled=enabled,
+        )
+        db.commit()
+        return new_id
+
+    provider_id = await run_db(_insert_provider)
 
     log.info(f"Cloud provider created: {name} ({provider_type})")
 
@@ -156,7 +172,12 @@ async def get_provider(provider_id: int):
     """
     db = get_db()
 
-    provider = db(db.cloud_providers.id == provider_id).select().first()
+    # Regression: gh-22. Off the event loop via run_db() instead of
+    # blocking the request coroutine inline.
+    def _fetch_provider() -> Any:
+        return db(db.cloud_providers.id == provider_id).select().first()
+
+    provider = await run_db(_fetch_provider)
 
     if not provider:
         return jsonify({"error": "Provider not found"}), 404
@@ -190,7 +211,12 @@ async def update_provider(provider_id: int):
     """
     db = get_db()
 
-    provider = db(db.cloud_providers.id == provider_id).select().first()
+    # Regression: gh-22. Off the event loop via run_db() instead of
+    # blocking the request coroutine inline.
+    def _fetch_provider() -> Any:
+        return db(db.cloud_providers.id == provider_id).select().first()
+
+    provider = await run_db(_fetch_provider)
 
     if not provider:
         return jsonify({"error": "Provider not found"}), 404
@@ -217,8 +243,13 @@ async def update_provider(provider_id: int):
             return jsonify({"error": f"Invalid configuration: {e}"}), 400
 
     if updates:
-        db(db.cloud_providers.id == provider_id).update(**updates)
-        db.commit()
+        # Regression: gh-22. update + commit is one unit of work -- stays
+        # in one run_db() closure per the house rule (see app/db/run_db.py).
+        def _apply_update() -> None:
+            db(db.cloud_providers.id == provider_id).update(**updates)
+            db.commit()
+
+        await run_db(_apply_update)
 
     return jsonify({"message": "Provider updated successfully"}), 200
 
@@ -238,21 +269,34 @@ async def delete_provider(provider_id: int):
     """
     db = get_db()
 
-    provider = db(db.cloud_providers.id == provider_id).select().first()
+    # Regression: gh-22. Off the event loop via run_db() instead of
+    # blocking the request coroutine inline.
+    def _fetch_provider() -> Any:
+        return db(db.cloud_providers.id == provider_id).select().first()
+
+    provider = await run_db(_fetch_provider)
 
     if not provider:
         return jsonify({"error": "Provider not found"}), 404
 
     # Check for existing machines
-    machine_count = db(db.cloud_machines.provider_id == provider_id).count()
+    def _count_machines() -> int:
+        return db(db.cloud_machines.provider_id == provider_id).count()
+
+    machine_count = await run_db(_count_machines)
     if machine_count > 0:
         return jsonify({
             "error": f"Cannot delete provider with {machine_count} machines",
             "hint": "Delete or migrate machines first",
         }), 409
 
-    db(db.cloud_providers.id == provider_id).delete()
-    db.commit()
+    # Regression: gh-22. delete + commit is one unit of work -- stays in
+    # one run_db() closure per the house rule.
+    def _delete_provider() -> None:
+        db(db.cloud_providers.id == provider_id).delete()
+        db.commit()
+
+    await run_db(_delete_provider)
 
     log.info(f"Cloud provider deleted: {provider.name}")
 
@@ -275,18 +319,26 @@ async def test_provider(provider_id: int):
     """
     db = get_db()
 
-    provider = db(db.cloud_providers.id == provider_id).select().first()
+    # Regression: gh-22. Off the event loop via run_db() instead of
+    # blocking the request coroutine inline.
+    def _fetch_provider() -> Any:
+        return db(db.cloud_providers.id == provider_id).select().first()
+
+    provider = await run_db(_fetch_provider)
 
     if not provider:
         return jsonify({"error": "Provider not found"}), 404
+
+    def _set_status(new_status: str) -> None:
+        db(db.cloud_providers.id == provider_id).update(status=new_status)
+        db.commit()
 
     try:
         cloud = get_cloud_provider(provider.provider_type, provider.config)
         cloud.authenticate()
 
         # Update status
-        db(db.cloud_providers.id == provider_id).update(status="connected")
-        db.commit()
+        await run_db(lambda: _set_status("connected"))
 
         return jsonify({
             "status": "connected",
@@ -294,13 +346,11 @@ async def test_provider(provider_id: int):
         }), 200
 
     except CloudAuthError as e:
-        db(db.cloud_providers.id == provider_id).update(status="auth_error")
-        db.commit()
+        await run_db(lambda: _set_status("auth_error"))
         return jsonify({"status": "auth_error", "error": str(e)}), 401
 
     except CloudError as e:
-        db(db.cloud_providers.id == provider_id).update(status="error")
-        db.commit()
+        await run_db(lambda: _set_status("error"))
         return jsonify({"status": "error", "error": str(e)}), 500
 
 
@@ -327,7 +377,12 @@ async def list_machines(provider_id: int):
     """
     db = get_db()
 
-    provider = db(db.cloud_providers.id == provider_id).select().first()
+    # Regression: gh-22. Off the event loop via run_db() instead of
+    # blocking the request coroutine inline.
+    def _fetch_provider() -> Any:
+        return db(db.cloud_providers.id == provider_id).select().first()
+
+    provider = await run_db(_fetch_provider)
 
     if not provider:
         return jsonify({"error": "Provider not found"}), 404
@@ -341,8 +396,10 @@ async def list_machines(provider_id: int):
             cloud.authenticate()
             machines = cloud.list_machines()
 
-            # Sync to database
-            _sync_machines_to_db(db, provider_id, machines)
+            # Sync to database -- one run_db() closure for the whole sync
+            # (existing-machines scan + per-machine insert/update/delete),
+            # not left blocking the event loop inline (gh-22).
+            await run_db(lambda: _sync_machines_to_db(db, provider_id, machines))
 
             return jsonify({
                 "machines": [m.to_dict() for m in machines],
@@ -355,7 +412,10 @@ async def list_machines(provider_id: int):
             return jsonify({"error": str(e)}), 500
 
     # Return from database
-    machines = db(db.cloud_machines.provider_id == provider_id).select().as_list()
+    def _fetch_machines() -> Any:
+        return db(db.cloud_machines.provider_id == provider_id).select().as_list()
+
+    machines = await run_db(_fetch_machines)
 
     return jsonify({
         "machines": machines,
@@ -388,7 +448,12 @@ async def create_machine(provider_id: int):
     """
     db = get_db()
 
-    provider = db(db.cloud_providers.id == provider_id).select().first()
+    # Regression: gh-22. Off the event loop via run_db() instead of
+    # blocking the request coroutine inline.
+    def _fetch_provider() -> Any:
+        return db(db.cloud_providers.id == provider_id).select().first()
+
+    provider = await run_db(_fetch_provider)
 
     if not provider:
         return jsonify({"error": "Provider not found"}), 404
@@ -430,21 +495,27 @@ async def create_machine(provider_id: int):
         cloud.authenticate()
         machine = cloud.create_machine(spec)
 
-        # Store in database
-        machine_id = db.cloud_machines.insert(
-            provider_id=provider_id,
-            cloud_id=machine.id,
-            name=machine.name,
-            state=machine.state.value,
-            region=machine.region,
-            image=machine.image,
-            size=machine.size,
-            public_ips=machine.public_ips,
-            private_ips=machine.private_ips,
-            tags=machine.tags,
-            extra=machine.extra,
-        )
-        db.commit()
+        # Store in database.  Regression: gh-22. insert + commit is one
+        # unit of work -- stays in one run_db() closure per the house rule
+        # (see app/db/run_db.py).
+        def _store_machine() -> Any:
+            new_id = db.cloud_machines.insert(
+                provider_id=provider_id,
+                cloud_id=machine.id,
+                name=machine.name,
+                state=machine.state.value,
+                region=machine.region,
+                image=machine.image,
+                size=machine.size,
+                public_ips=machine.public_ips,
+                private_ips=machine.private_ips,
+                tags=machine.tags,
+                extra=machine.extra,
+            )
+            db.commit()
+            return new_id
+
+        machine_id = await run_db(_store_machine)
 
         log.info(f"Machine created: {machine.name} on {provider.name}")
 
@@ -477,7 +548,12 @@ async def get_machine(provider_id: int, machine_id: str):
     """
     db = get_db()
 
-    provider = db(db.cloud_providers.id == provider_id).select().first()
+    # Regression: gh-22. Off the event loop via run_db() instead of
+    # blocking the request coroutine inline.
+    def _fetch_provider() -> Any:
+        return db(db.cloud_providers.id == provider_id).select().first()
+
+    provider = await run_db(_fetch_provider)
 
     if not provider:
         return jsonify({"error": "Provider not found"}), 404
@@ -512,7 +588,12 @@ async def destroy_machine(provider_id: int, machine_id: str):
     """
     db = get_db()
 
-    provider = db(db.cloud_providers.id == provider_id).select().first()
+    # Regression: gh-22. Off the event loop via run_db() instead of
+    # blocking the request coroutine inline.
+    def _fetch_provider() -> Any:
+        return db(db.cloud_providers.id == provider_id).select().first()
+
+    provider = await run_db(_fetch_provider)
 
     if not provider:
         return jsonify({"error": "Provider not found"}), 404
@@ -522,12 +603,16 @@ async def destroy_machine(provider_id: int, machine_id: str):
         cloud.authenticate()
         cloud.destroy_machine(machine_id)
 
-        # Remove from database
-        db(
-            (db.cloud_machines.provider_id == provider_id) & (
-                db.cloud_machines.cloud_id == machine_id)
-        ).delete()
-        db.commit()
+        # Remove from database. Regression: gh-22. delete + commit is one
+        # unit of work -- stays in one run_db() closure.
+        def _delete_machine() -> None:
+            db(
+                (db.cloud_machines.provider_id == provider_id) & (
+                    db.cloud_machines.cloud_id == machine_id)
+            ).delete()
+            db.commit()
+
+        await run_db(_delete_machine)
 
         log.info(f"Machine destroyed: {machine_id} on {provider.name}")
 
@@ -556,7 +641,12 @@ async def start_machine(provider_id: int, machine_id: str):
     """
     db = get_db()
 
-    provider = db(db.cloud_providers.id == provider_id).select().first()
+    # Regression: gh-22. Off the event loop via run_db() instead of
+    # blocking the request coroutine inline.
+    def _fetch_provider() -> Any:
+        return db(db.cloud_providers.id == provider_id).select().first()
+
+    provider = await run_db(_fetch_provider)
 
     if not provider:
         return jsonify({"error": "Provider not found"}), 404
@@ -566,12 +656,16 @@ async def start_machine(provider_id: int, machine_id: str):
         cloud.authenticate()
         cloud.start_machine(machine_id)
 
-        # Update database
-        db(
-            (db.cloud_machines.provider_id == provider_id) & (
-                db.cloud_machines.cloud_id == machine_id)
-        ).update(state="running")
-        db.commit()
+        # Update database. Regression: gh-22. update + commit is one unit
+        # of work -- stays in one run_db() closure.
+        def _mark_running() -> None:
+            db(
+                (db.cloud_machines.provider_id == provider_id) & (
+                    db.cloud_machines.cloud_id == machine_id)
+            ).update(state="running")
+            db.commit()
+
+        await run_db(_mark_running)
 
         return jsonify({"message": "Machine started"}), 200
 
@@ -598,7 +692,12 @@ async def stop_machine(provider_id: int, machine_id: str):
     """
     db = get_db()
 
-    provider = db(db.cloud_providers.id == provider_id).select().first()
+    # Regression: gh-22. Off the event loop via run_db() instead of
+    # blocking the request coroutine inline.
+    def _fetch_provider() -> Any:
+        return db(db.cloud_providers.id == provider_id).select().first()
+
+    provider = await run_db(_fetch_provider)
 
     if not provider:
         return jsonify({"error": "Provider not found"}), 404
@@ -608,12 +707,16 @@ async def stop_machine(provider_id: int, machine_id: str):
         cloud.authenticate()
         cloud.stop_machine(machine_id)
 
-        # Update database
-        db(
-            (db.cloud_machines.provider_id == provider_id) & (
-                db.cloud_machines.cloud_id == machine_id)
-        ).update(state="stopped")
-        db.commit()
+        # Update database. Regression: gh-22. update + commit is one unit
+        # of work -- stays in one run_db() closure.
+        def _mark_stopped() -> None:
+            db(
+                (db.cloud_machines.provider_id == provider_id) & (
+                    db.cloud_machines.cloud_id == machine_id)
+            ).update(state="stopped")
+            db.commit()
+
+        await run_db(_mark_stopped)
 
         return jsonify({"message": "Machine stopped"}), 200
 
@@ -640,7 +743,12 @@ async def reboot_machine(provider_id: int, machine_id: str):
     """
     db = get_db()
 
-    provider = db(db.cloud_providers.id == provider_id).select().first()
+    # Regression: gh-22. Off the event loop via run_db() instead of
+    # blocking the request coroutine inline.
+    def _fetch_provider() -> Any:
+        return db(db.cloud_providers.id == provider_id).select().first()
+
+    provider = await run_db(_fetch_provider)
 
     if not provider:
         return jsonify({"error": "Provider not found"}), 404
@@ -671,7 +779,12 @@ async def list_images(provider_id: int):
     """List available images for a provider."""
     db = get_db()
 
-    provider = db(db.cloud_providers.id == provider_id).select().first()
+    # Regression: gh-22. Off the event loop via run_db() instead of
+    # blocking the request coroutine inline.
+    def _fetch_provider() -> Any:
+        return db(db.cloud_providers.id == provider_id).select().first()
+
+    provider = await run_db(_fetch_provider)
 
     if not provider:
         return jsonify({"error": "Provider not found"}), 404
@@ -694,7 +807,12 @@ async def list_sizes(provider_id: int):
     """List available machine sizes for a provider."""
     db = get_db()
 
-    provider = db(db.cloud_providers.id == provider_id).select().first()
+    # Regression: gh-22. Off the event loop via run_db() instead of
+    # blocking the request coroutine inline.
+    def _fetch_provider() -> Any:
+        return db(db.cloud_providers.id == provider_id).select().first()
+
+    provider = await run_db(_fetch_provider)
 
     if not provider:
         return jsonify({"error": "Provider not found"}), 404
@@ -717,7 +835,12 @@ async def list_regions(provider_id: int):
     """List available regions for a provider."""
     db = get_db()
 
-    provider = db(db.cloud_providers.id == provider_id).select().first()
+    # Regression: gh-22. Off the event loop via run_db() instead of
+    # blocking the request coroutine inline.
+    def _fetch_provider() -> Any:
+        return db(db.cloud_providers.id == provider_id).select().first()
+
+    provider = await run_db(_fetch_provider)
 
     if not provider:
         return jsonify({"error": "Provider not found"}), 404
@@ -739,7 +862,20 @@ async def list_regions(provider_id: int):
 
 
 def _sync_machines_to_db(db, provider_id: int, machines: list) -> None:
-    """Sync machines from cloud API to database."""
+    """Sync machines from cloud API to database.
+
+    Regression: gh-22. This used to run its unbounded existing-machines
+    SELECT plus a per-machine insert/update/delete loop synchronously,
+    inline in the request coroutine -- callers now run this whole function
+    as a single ``run_db()`` closure (see ``list_machines`` above) instead
+    of leaving it blocking the event loop. New-machine inserts and
+    stale-machine deletes are batched into one statement each (trivially
+    batchable: same field set / a single ``IN`` predicate); per-machine
+    updates are NOT batched -- each row's field values differ, and
+    penguin-dal has no bulk-UPDATE-with-per-row-values primitive, so
+    batching those would mean hand-rolling a ``CASE WHEN`` statement, which
+    is out of scope for this sweep.
+    """
     # Get existing machines
     existing = {
         m.cloud_id: m.id
@@ -747,6 +883,7 @@ def _sync_machines_to_db(db, provider_id: int, machines: list) -> None:
     }
 
     cloud_ids = set()
+    new_rows: list[dict[str, Any]] = []
 
     for machine in machines:
         cloud_ids.add(machine.id)
@@ -762,8 +899,7 @@ def _sync_machines_to_db(db, provider_id: int, machines: list) -> None:
                 tags=machine.tags,
             )
         else:
-            # Insert new
-            db.cloud_machines.insert(
+            new_rows.append(dict(
                 provider_id=provider_id,
                 cloud_id=machine.id,
                 name=machine.name,
@@ -775,14 +911,18 @@ def _sync_machines_to_db(db, provider_id: int, machines: list) -> None:
                 private_ips=machine.private_ips,
                 tags=machine.tags,
                 extra=machine.extra,
-            )
+            ))
 
-    # Remove machines that no longer exist in cloud
-    for cloud_id in existing:
-        if cloud_id not in cloud_ids:
-            db(
-                (db.cloud_machines.provider_id == provider_id) & (
-                    db.cloud_machines.cloud_id == cloud_id)
-            ).delete()
+    if new_rows:
+        db.cloud_machines.bulk_insert(new_rows)
+
+    # Remove machines that no longer exist in cloud -- one batched DELETE
+    # instead of one per stale machine.
+    stale_cloud_ids = [cid for cid in existing if cid not in cloud_ids]
+    if stale_cloud_ids:
+        db(
+            (db.cloud_machines.provider_id == provider_id)
+            & (db.cloud_machines.cloud_id.belongs(stale_cloud_ids))
+        ).delete()
 
     db.commit()

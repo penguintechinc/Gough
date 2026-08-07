@@ -40,6 +40,7 @@ from app.workers.joiner_secret_emitter import (
     persist_extracted_material,
 )
 
+from ..db.run_db import run_db
 from ..models import get_db
 
 log = logging.getLogger(__name__)
@@ -250,7 +251,12 @@ async def list_joiner_secrets(cluster_id: uuid.UUID):
     if scope_filter:
         query = query & (db.joiner_secrets.scope == scope_filter)
 
-    rows = db(query).select(orderby=db.joiner_secrets.created_at.desc())
+    # Regression: gh-22. Off the event loop via run_db() instead of
+    # blocking the request coroutine inline.
+    def _fetch_rows() -> Any:
+        return db(query).select(orderby=db.joiner_secrets.created_at.desc())
+
+    rows = await run_db(_fetch_rows)
     items = [_serialize_joiner_secret(r) for r in rows]
 
     if status_filter in {"active", "expiring-soon", "revoked"}:
@@ -311,15 +317,21 @@ async def rotate_joiner_secret(cluster_id: uuid.UUID, js_id: uuid.UUID):
         )
 
     db = get_db()
-    row: Any = (
-        db(
-            (db.joiner_secrets.id == str(js_id))
-            & (db.joiner_secrets.cluster_id == str(cluster_id))
-            & (db.joiner_secrets.tenant_id == tenant_id)
+
+    # Regression: gh-22. Off the event loop via run_db() instead of
+    # blocking the request coroutine inline.
+    def _fetch_row() -> Any:
+        return (
+            db(
+                (db.joiner_secrets.id == str(js_id))
+                & (db.joiner_secrets.cluster_id == str(cluster_id))
+                & (db.joiner_secrets.tenant_id == tenant_id)
+            )
+            .select()
+            .first()
         )
-        .select()
-        .first()
-    )
+
+    row: Any = await run_db(_fetch_row)
     if row is None:
         return jsonify({"error": "not_found"}), 404
     if row.revoked_at is not None:
@@ -357,13 +369,35 @@ async def rotate_joiner_secret(cluster_id: uuid.UUID, js_id: uuid.UUID):
     request_id = request.headers.get("X-Request-Id")
     now = datetime.now(timezone.utc)
 
-    try:
+    # Regression: gh-22. The whole transaction (revoke-mark, persist the
+    # new secret, refetch) stays in one run_db() closure -- a penguin-dal
+    # transaction/connection checkout is not safe to resume from a
+    # different thread hop (see app/db/run_db.py), so this can't be split
+    # across multiple run_db() calls. db.transaction()'s own
+    # commit-on-clean-exit / rollback-on-exception still applies unchanged,
+    # just now running on the worker thread instead of blocking the event
+    # loop.
+    #
+    # Fix-round (gh-22): the `row.revoked_at is not None` check above is a
+    # fast-path only -- two concurrent rotate requests on the same js_id
+    # can both read revoked_at=NULL before either writes (a run_db()
+    # closure boundary is a thread boundary, not a transaction boundary).
+    # The *authoritative* guard is this closure's revoke UPDATE: it's
+    # conditional on `revoked_at IS NULL` and its rowcount is checked
+    # *inside this same transaction*, before persist_extracted_material()
+    # runs -- so a losing request never mints a second successor secret
+    # for an already-rotated row.
+    def _rotate_in_tx() -> tuple[str, Any, Any]:
         with db.transaction() as tx:
-            tx.executesql(
+            claimed = tx.executesql(
                 "UPDATE joiner_secrets SET revoked_at = %s, rotated_at = %s "
-                "WHERE id = %s",
+                "WHERE id = %s AND revoked_at IS NULL",
                 (now, now, str(js_id)),
+                return_rowcount=True,
             )
+            if not claimed:
+                return "already_revoked", None, None
+
             new_id, audit_event_id, _expires_at = persist_extracted_material(
                 tx,
                 cluster_id=str(cluster_id),
@@ -388,6 +422,20 @@ async def rotate_joiner_secret(cluster_id: uuid.UUID, js_id: uuid.UUID):
                     (new_id,),
                     as_dict=True,
                 ),
+            )
+        return "ok", audit_event_id, new_row_data
+
+    try:
+        status, audit_event_id, new_row_data = await run_db(_rotate_in_tx)
+        if status == "already_revoked":
+            return (
+                jsonify(
+                    {
+                        "error": "already_revoked",
+                        "message": "cannot rotate a revoked secret",
+                    }
+                ),
+                409,
             )
     except Exception:
         _metrics.joiner_secret_decryption_failure.inc()
@@ -440,36 +488,48 @@ async def revoke_joiner_secret(cluster_id: uuid.UUID, js_id: uuid.UUID):
         )
 
     db = get_db()
-    row: Any = (
-        db(
-            (db.joiner_secrets.id == str(js_id))
-            & (db.joiner_secrets.cluster_id == str(cluster_id))
-            & (db.joiner_secrets.tenant_id == tenant_id)
+
+    # Regression: gh-22. Off the event loop via run_db() instead of
+    # blocking the request coroutine inline.
+    def _fetch_row() -> Any:
+        return (
+            db(
+                (db.joiner_secrets.id == str(js_id))
+                & (db.joiner_secrets.cluster_id == str(cluster_id))
+                & (db.joiner_secrets.tenant_id == tenant_id)
+            )
+            .select()
+            .first()
         )
-        .select()
-        .first()
-    )
+
+    row: Any = await run_db(_fetch_row)
     if row is None:
         return jsonify({"error": "not_found"}), 404
     if row.revoked_at is not None:
         return jsonify({"error": "already_revoked"}), 409
 
     now = datetime.now(timezone.utc)
-    db(db.joiner_secrets.id == str(js_id)).update(revoked_at=now)
-    row.revoked_at = now
-
     audit_writer = _build_audit_writer(cluster_id)
-    audit_writer.append(
-        actor_sub=_get_actor_sub(),
-        actor_scope=_get_actor_scope(),
-        action="joiner.secret.revoke",
-        resource_kind="joiner_secret",
-        resource_id=str(row.id),
-        tenant_id=tenant_id,
-        before={"revoked_at": None},
-        after={"revoked_at": now.isoformat(), "reason": reason},
-        request_id=request.headers.get("X-Request-Id"),
-    )
+
+    # Regression: gh-22. Revoke-mark + self-audit-log write is one unit of
+    # work -- stays in one run_db() closure per the house rule (see
+    # app/db/run_db.py).
+    def _revoke_and_audit() -> None:
+        db(db.joiner_secrets.id == str(js_id)).update(revoked_at=now)
+        audit_writer.append(
+            actor_sub=_get_actor_sub(),
+            actor_scope=_get_actor_scope(),
+            action="joiner.secret.revoke",
+            resource_kind="joiner_secret",
+            resource_id=str(row.id),
+            tenant_id=tenant_id,
+            before={"revoked_at": None},
+            after={"revoked_at": now.isoformat(), "reason": reason},
+            request_id=request.headers.get("X-Request-Id"),
+        )
+
+    await run_db(_revoke_and_audit)
+    row.revoked_at = now
 
     return jsonify({"revoked": _serialize_joiner_secret(row)}), 200
 

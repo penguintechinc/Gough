@@ -10,6 +10,8 @@ Provides REST API for managing iPXE/MAAS-like provisioning operations:
 
 from __future__ import annotations
 
+import base64
+import json
 import logging
 import secrets
 import threading
@@ -22,6 +24,7 @@ from typing import Any, Callable, Literal, Optional
 import jwt
 from quart import Blueprint, Response, current_app, g, jsonify, request
 
+from ..db.run_db import run_db
 from ..middleware import auth_required, admin_required, maintainer_or_admin_required
 from ..models import get_db
 from .. import metrics as _metrics
@@ -34,6 +37,43 @@ ipxe_bp = Blueprint("ipxe", __name__)
 # =============================================================================
 # Helper Functions
 # =============================================================================
+
+# Regression: gh-22. Pagination defaults for list_machines/list_images --
+# page_size default is deliberately generous so existing callers that never
+# pass page_size/cursor see the same result set as before the sweep, unless
+# their table has actually grown past the default.
+_DEFAULT_PAGE_SIZE = 500
+_MAX_PAGE_SIZE = 2000
+
+
+def _encode_ipxe_cursor(item_id: int, ts: Optional[datetime]) -> str:
+    """Encode (id, ts) into a base64 opaque pagination cursor.
+
+    Mirrors ``app.api.nodes``'s cursor pattern (gh-22). ``ts`` may be
+    ``None`` (e.g. a machine that has never reported ``last_seen_at``).
+    """
+    payload = json.dumps({"id": item_id, "ts": ts.isoformat() if ts else None})
+    return base64.urlsafe_b64encode(payload.encode()).decode()
+
+
+def _decode_ipxe_cursor(cursor: str) -> tuple[int, Optional[datetime]]:
+    """Decode an opaque pagination cursor back to (id, ts).
+
+    Raises ValueError on bad/tampered input.
+    """
+    try:
+        payload = json.loads(base64.urlsafe_b64decode(cursor.encode()).decode())
+        item_id = int(payload["id"])
+        ts_raw = payload.get("ts")
+        ts: Optional[datetime] = None
+        if ts_raw:
+            ts = datetime.fromisoformat(ts_raw)
+            if ts.tzinfo is None:
+                ts = ts.replace(tzinfo=timezone.utc)
+        return item_id, ts
+    except Exception as exc:
+        raise ValueError(f"Invalid cursor: {exc}") from exc
+
 
 def _validate_required_fields(data: dict, required: list[str]) -> Optional[tuple]:
     """Validate required fields in request data.
@@ -190,8 +230,12 @@ async def get_ipxe_config():
     """
     db = get_db()
 
-    # Get active configuration
-    config = db(db.ipxe_config.is_active).select().first()
+    # Regression: gh-22. Off the event loop via run_db() instead of
+    # blocking the request coroutine inline.
+    def _fetch() -> Any:
+        return db(db.ipxe_config.is_active).select().first()
+
+    config = await run_db(_fetch)
 
     if not config:
         return jsonify({"error": "No active iPXE configuration found"}), 404
@@ -237,7 +281,10 @@ async def update_ipxe_config():
     db = get_db()
 
     # Check if configuration exists
-    existing = db(db.ipxe_config.name == data["name"]).select().first()
+    def _fetch_existing() -> Any:
+        return db(db.ipxe_config.name == data["name"]).select().first()
+
+    existing = await run_db(_fetch_existing)
 
     update_fields = {
         "dhcp_mode": data.get("dhcp_mode", "proxy"),
@@ -257,19 +304,25 @@ async def update_ipxe_config():
     }
 
     if existing:
-        # Update existing configuration
-        db(db.ipxe_config.id == existing.id).update(**update_fields)
-        db.commit()
+        # Regression: gh-22. update + commit + refetch is one unit of
+        # work -- one run_db() closure per the house rule.
+        def _apply_update() -> Any:
+            db(db.ipxe_config.id == existing.id).update(**update_fields)
+            db.commit()
+            return db(db.ipxe_config.id == existing.id).select().first()
 
-        updated = db(db.ipxe_config.id == existing.id).select().first()
+        updated = await run_db(_apply_update)
         return jsonify(updated.as_dict()), 200
     else:
         # Create new configuration
         update_fields["name"] = data["name"]
-        config_id = db.ipxe_config.insert(**update_fields)
-        db.commit()
 
-        created = db(db.ipxe_config.id == config_id).select().first()
+        def _apply_insert() -> Any:
+            config_id = db.ipxe_config.insert(**update_fields)
+            db.commit()
+            return db(db.ipxe_config.id == config_id).select().first()
+
+        created = await run_db(_apply_insert)
         return jsonify(created.as_dict()), 201
 
 
@@ -286,9 +339,22 @@ async def list_machines():
         status: Filter by status (unknown/discovered/commissioning/ready/deploying/deployed/failed)
         zone: Filter by zone
         pool: Filter by pool
+        page_size: Max rows to return (default 500, max 2000)
+        cursor: Opaque pagination cursor from a previous response's next_cursor
 
     Returns:
         200: List of machines
+
+    Regression: gh-22. This was an unbounded ``SELECT *`` over the entire
+    ``ipxe_machines`` table run synchronously on the shared event loop --
+    now the SELECT runs off-loop via ``run_db()`` and is bounded by
+    ``page_size`` (default generous enough that existing callers see the
+    same response shape/content unless their table has actually grown past
+    it). Cursor filtering mirrors ``app.api.nodes.list_nodes``: the DB
+    fetch always pulls the first ``page_size + 1`` rows of the ordered set,
+    then the cursor is applied client-side over that fixed window (same
+    known limitation nodes.py has -- not a true DB-side seek beyond the
+    first window; out of scope for this sweep to redesign).
     """
     db = get_db()
 
@@ -296,7 +362,14 @@ async def list_machines():
     query = db.ipxe_machines.id > 0
 
     # Apply filters
-    args = await request.args
+    # Regression: gh-22. `request.args` is a sync `cached_property`
+    # (`ImmutableMultiDict`), not a coroutine -- `await`ing it raised
+    # `TypeError: object ImmutableMultiDict can't be used in 'await'
+    # expression` on every real call, a pre-existing bug this sweep's own
+    # end-to-end pagination tests surfaced (prior tests all mocked `db` and
+    # asserted a permissive `status_code in (200, 401, 500)`, so the 500
+    # this raised went unnoticed).
+    args = request.args
     if args.get("status"):
         query &= (db.ipxe_machines.status == args["status"])
     if args.get("zone"):
@@ -304,11 +377,54 @@ async def list_machines():
     if args.get("pool"):
         query &= (db.ipxe_machines.pool == args["pool"])
 
-    machines = db(query).select(orderby=~db.ipxe_machines.last_seen_at)
+    try:
+        page_size = min(int(args.get("page_size", _DEFAULT_PAGE_SIZE)), _MAX_PAGE_SIZE)
+        if page_size < 1:
+            page_size = _DEFAULT_PAGE_SIZE
+    except (TypeError, ValueError):
+        return jsonify({"error": "page_size must be an integer"}), 400
+
+    cursor_raw = args.get("cursor")
+    cursor_after_id: Optional[int] = None
+    cursor_after_ts: Optional[datetime] = None
+    if cursor_raw:
+        try:
+            cursor_after_id, cursor_after_ts = _decode_ipxe_cursor(cursor_raw)
+        except ValueError:
+            return jsonify({"error": "cursor is invalid or tampered"}), 400
+
+    def _fetch() -> Any:
+        return db(query).select(
+            orderby=~db.ipxe_machines.last_seen_at, limitby=(0, page_size + 1)
+        )
+
+    machines = await run_db(_fetch)
+
+    if cursor_after_id is not None:
+        floor_ts = datetime.min.replace(tzinfo=timezone.utc)
+        cursor_key = (cursor_after_ts or floor_ts, cursor_after_id)
+        filtered = []
+        for m in machines:
+            row_ts = m.last_seen_at
+            if row_ts is not None and row_ts.tzinfo is None:
+                row_ts = row_ts.replace(tzinfo=timezone.utc)
+            # Descending order (~last_seen_at): the next page is strictly
+            # "less than" the cursor's position.
+            if (row_ts or floor_ts, m.id) < cursor_key:
+                filtered.append(m)
+        machines = filtered
+
+    next_cursor: Optional[str] = None
+    out_machines = list(machines)
+    if len(out_machines) > page_size:
+        out_machines = out_machines[:page_size]
+        last = out_machines[-1]
+        next_cursor = _encode_ipxe_cursor(last.id, last.last_seen_at)
 
     return jsonify({
-        "machines": [m.as_dict() for m in machines],
-        "count": len(machines)
+        "machines": [m.as_dict() for m in out_machines],
+        "count": len(out_machines),
+        "next_cursor": next_cursor,
     }), 200
 
 
@@ -324,7 +440,9 @@ async def get_machine(machine_id: str):
         200: Machine details
         404: Machine not found
     """
-    machine = _get_machine_by_id(machine_id)
+    # Regression: gh-22. Off the event loop via run_db() instead of
+    # blocking the request coroutine inline.
+    machine = await run_db(lambda: _get_machine_by_id(machine_id))
 
     if not machine:
         return jsonify({"error": f"Machine not found: {machine_id}"}), 404
@@ -348,7 +466,9 @@ async def commission_machine(machine_id: str):
         400: Invalid machine state
         404: Machine not found
     """
-    machine = _get_machine_by_id(machine_id)
+    # Regression: gh-22. Off the event loop via run_db() instead of
+    # blocking the request coroutine inline.
+    machine = await run_db(lambda: _get_machine_by_id(machine_id))
 
     if not machine:
         return jsonify({"error": f"Machine not found: {machine_id}"}), 404
@@ -363,20 +483,23 @@ async def commission_machine(machine_id: str):
     db = get_db()
 
     # Update machine status
-    db(db.ipxe_machines.id == machine["id"]).update(
-        status="commissioning",
-        updated_at=datetime.utcnow()
-    )
-    db.commit()
+    def _update_status() -> None:
+        db(db.ipxe_machines.id == machine["id"]).update(
+            status="commissioning",
+            updated_at=datetime.utcnow()
+        )
+        db.commit()
+
+    await run_db(_update_status)
 
     # Log event
-    _log_boot_event(
+    await run_db(lambda: _log_boot_event(
         machine_id=machine["id"],
         mac_address=machine["mac_address"],
         event_type="boot_start",
         details={"action": "commission"},
         status="started"
-    )
+    ))
 
     log.info(f"Machine {machine['system_id']} commissioning started")
 
@@ -406,7 +529,9 @@ async def deploy_machine(machine_id: str):
         400: Invalid request or machine state
         404: Machine not found
     """
-    machine = _get_machine_by_id(machine_id)
+    # Regression: gh-22. Off the event loop via run_db() instead of
+    # blocking the request coroutine inline.
+    machine = await run_db(lambda: _get_machine_by_id(machine_id))
 
     if not machine:
         return jsonify({"error": f"Machine not found: {machine_id}"}), 404
@@ -431,12 +556,19 @@ async def deploy_machine(machine_id: str):
     boot_config_id = data.get("boot_config_id")
     biomes = data.get("biomes", [])
 
-    # Validate image exists
-    if not _get_image_by_id(image_id):
-        return jsonify({"error": f"Boot image not found: {image_id}"}), 404
+    # Validate image + boot config existence -- both reads feeding
+    # validation, one run_db() closure.
+    def _validate_refs() -> Optional[str]:
+        if not _get_image_by_id(image_id):
+            return "image_not_found"
+        if boot_config_id and not _get_boot_config_by_id(boot_config_id):
+            return "boot_config_not_found"
+        return None
 
-    # Validate boot config if provided
-    if boot_config_id and not _get_boot_config_by_id(boot_config_id):
+    validation_failure = await run_db(_validate_refs)
+    if validation_failure == "image_not_found":
+        return jsonify({"error": f"Boot image not found: {image_id}"}), 404
+    if validation_failure == "boot_config_not_found":
         return jsonify({"error": f"Boot config not found: {boot_config_id}"}), 404
 
     db = get_db()
@@ -447,25 +579,28 @@ async def deploy_machine(machine_id: str):
     user_id = user["id"] if user else None
 
     # Create deployment job
-    job_id = _create_deployment_job(
+    job_id = await run_db(lambda: _create_deployment_job(
         machine_id=machine["id"],
         image_id=image_id,
         boot_config_id=boot_config_id,
         biomes_to_deploy=biomes,
         user_id=user_id
-    )
+    ))
 
     # Update machine status and biomes
-    db(db.ipxe_machines.id == machine["id"]).update(
-        status="deploying",
-        boot_config_id=boot_config_id,
-        assigned_biomes=biomes,
-        updated_at=datetime.utcnow()
-    )
-    db.commit()
+    def _update_status() -> None:
+        db(db.ipxe_machines.id == machine["id"]).update(
+            status="deploying",
+            boot_config_id=boot_config_id,
+            assigned_biomes=biomes,
+            updated_at=datetime.utcnow()
+        )
+        db.commit()
+
+    await run_db(_update_status)
 
     # Log event
-    _log_boot_event(
+    await run_db(lambda: _log_boot_event(
         machine_id=machine["id"],
         mac_address=machine["mac_address"],
         event_type="boot_start",
@@ -476,7 +611,7 @@ async def deploy_machine(machine_id: str):
             "biomes": biomes
         },
         status="started"
-    )
+    ))
 
     log.info(f"Machine {machine['system_id']} deployment started (job: {job_id})")
 
@@ -502,7 +637,9 @@ async def release_machine(machine_id: str):
         400: Invalid machine state
         404: Machine not found
     """
-    machine = _get_machine_by_id(machine_id)
+    # Regression: gh-22. Off the event loop via run_db() instead of
+    # blocking the request coroutine inline.
+    machine = await run_db(lambda: _get_machine_by_id(machine_id))
 
     if not machine:
         return jsonify({"error": f"Machine not found: {machine_id}"}), 404
@@ -517,22 +654,25 @@ async def release_machine(machine_id: str):
     db = get_db()
 
     # Update machine status
-    db(db.ipxe_machines.id == machine["id"]).update(
-        status="ready",
-        assigned_biomes=[],
-        deployed_at=None,
-        updated_at=datetime.utcnow()
-    )
-    db.commit()
+    def _update_status() -> None:
+        db(db.ipxe_machines.id == machine["id"]).update(
+            status="ready",
+            assigned_biomes=[],
+            deployed_at=None,
+            updated_at=datetime.utcnow()
+        )
+        db.commit()
+
+    await run_db(_update_status)
 
     # Log event
-    _log_boot_event(
+    await run_db(lambda: _log_boot_event(
         machine_id=machine["id"],
         mac_address=machine["mac_address"],
         event_type="deployment_complete",
         details={"action": "release"},
         status="released"
-    )
+    ))
 
     log.info(f"Machine {machine['system_id']} released to ready pool")
 
@@ -558,7 +698,9 @@ async def power_control(machine_id: str, action: str):
         400: Invalid action or power type
         404: Machine not found
     """
-    machine = _get_machine_by_id(machine_id)
+    # Regression: gh-22. Off the event loop via run_db() instead of
+    # blocking the request coroutine inline.
+    machine = await run_db(lambda: _get_machine_by_id(machine_id))
 
     if not machine:
         return jsonify({"error": f"Machine not found: {machine_id}"}), 404
@@ -580,7 +722,7 @@ async def power_control(machine_id: str, action: str):
         }), 400
 
     # Log the power action
-    _log_boot_event(
+    await run_db(lambda: _log_boot_event(
         machine_id=machine["id"],
         mac_address=machine["mac_address"],
         event_type="boot_start",
@@ -590,7 +732,7 @@ async def power_control(machine_id: str, action: str):
             "bmc_address": machine.get("bmc_address")
         },
         status="initiated"
-    )
+    ))
 
     log.info(f"Power {action} initiated for machine {machine['system_id']} via {power_type}")
 
@@ -619,7 +761,9 @@ async def update_machine_biomes(machine_id: str):
         400: Invalid request
         404: Machine not found
     """
-    machine = _get_machine_by_id(machine_id)
+    # Regression: gh-22. Off the event loop via run_db() instead of
+    # blocking the request coroutine inline.
+    machine = await run_db(lambda: _get_machine_by_id(machine_id))
 
     if not machine:
         return jsonify({"error": f"Machine not found: {machine_id}"}), 404
@@ -637,11 +781,14 @@ async def update_machine_biomes(machine_id: str):
     db = get_db()
 
     # Update assigned biomes
-    db(db.ipxe_machines.id == machine["id"]).update(
-        assigned_biomes=biomes,
-        updated_at=datetime.utcnow()
-    )
-    db.commit()
+    def _update_biomes() -> None:
+        db(db.ipxe_machines.id == machine["id"]).update(
+            assigned_biomes=biomes,
+            updated_at=datetime.utcnow()
+        )
+        db.commit()
+
+    await run_db(_update_biomes)
 
     log.info(f"Machine {machine['system_id']} biomes updated: {biomes}")
 
@@ -666,7 +813,9 @@ async def delete_machine(machine_id: str):
         400: Machine is deployed (must release first)
         404: Machine not found
     """
-    machine = _get_machine_by_id(machine_id)
+    # Regression: gh-22. Off the event loop via run_db() instead of
+    # blocking the request coroutine inline.
+    machine = await run_db(lambda: _get_machine_by_id(machine_id))
 
     if not machine:
         return jsonify({"error": f"Machine not found: {machine_id}"}), 404
@@ -681,8 +830,11 @@ async def delete_machine(machine_id: str):
     db = get_db()
 
     # Delete machine
-    db(db.ipxe_machines.id == machine["id"]).delete()
-    db.commit()
+    def _delete_machine() -> None:
+        db(db.ipxe_machines.id == machine["id"]).delete()
+        db.commit()
+
+    await run_db(_delete_machine)
 
     log.info(f"Machine {machine['system_id']} deleted from inventory")
 
@@ -704,9 +856,16 @@ async def list_images():
     Query Parameters:
         architecture: Filter by architecture (amd64/arm64)
         os_version: Filter by OS version
+        page_size: Max rows to return (default 500, max 2000)
+        cursor: Opaque pagination cursor from a previous response's next_cursor
 
     Returns:
         200: List of boot images
+
+    Regression: gh-22. Same conversion as ``list_machines`` above -- the
+    SELECT now runs off-loop via ``run_db()`` and is bounded by
+    ``page_size``; see that handler's docstring for the pagination/cursor
+    semantics (mirrors ``app.api.nodes.list_nodes``).
     """
     db = get_db()
 
@@ -714,17 +873,67 @@ async def list_images():
     query = db.ipxe_images.id > 0
 
     # Apply filters
-    args = await request.args
+    # Regression: gh-22. `request.args` is a sync `cached_property`
+    # (`ImmutableMultiDict`), not a coroutine -- `await`ing it raised
+    # `TypeError: object ImmutableMultiDict can't be used in 'await'
+    # expression` on every real call, a pre-existing bug this sweep's own
+    # end-to-end pagination tests surfaced (prior tests all mocked `db` and
+    # asserted a permissive `status_code in (200, 401, 500)`, so the 500
+    # this raised went unnoticed).
+    args = request.args
     if args.get("architecture"):
         query &= (db.ipxe_images.architecture == args["architecture"])
     if args.get("os_version"):
         query &= (db.ipxe_images.os_version == args["os_version"])
 
-    images = db(query).select(orderby=~db.ipxe_images.created_at)
+    try:
+        page_size = min(int(args.get("page_size", _DEFAULT_PAGE_SIZE)), _MAX_PAGE_SIZE)
+        if page_size < 1:
+            page_size = _DEFAULT_PAGE_SIZE
+    except (TypeError, ValueError):
+        return jsonify({"error": "page_size must be an integer"}), 400
+
+    cursor_raw = args.get("cursor")
+    cursor_after_id: Optional[int] = None
+    cursor_after_ts: Optional[datetime] = None
+    if cursor_raw:
+        try:
+            cursor_after_id, cursor_after_ts = _decode_ipxe_cursor(cursor_raw)
+        except ValueError:
+            return jsonify({"error": "cursor is invalid or tampered"}), 400
+
+    def _fetch() -> Any:
+        return db(query).select(
+            orderby=~db.ipxe_images.created_at, limitby=(0, page_size + 1)
+        )
+
+    images = await run_db(_fetch)
+
+    if cursor_after_id is not None:
+        floor_ts = datetime.min.replace(tzinfo=timezone.utc)
+        cursor_key = (cursor_after_ts or floor_ts, cursor_after_id)
+        filtered = []
+        for img in images:
+            row_ts = img.created_at
+            if row_ts is not None and row_ts.tzinfo is None:
+                row_ts = row_ts.replace(tzinfo=timezone.utc)
+            # Descending order (~created_at): the next page is strictly
+            # "less than" the cursor's position.
+            if (row_ts or floor_ts, img.id) < cursor_key:
+                filtered.append(img)
+        images = filtered
+
+    next_cursor: Optional[str] = None
+    out_images = list(images)
+    if len(out_images) > page_size:
+        out_images = out_images[:page_size]
+        last = out_images[-1]
+        next_cursor = _encode_ipxe_cursor(last.id, last.created_at)
 
     return jsonify({
-        "images": [img.as_dict() for img in images],
-        "count": len(images)
+        "images": [img.as_dict() for img in out_images],
+        "count": len(out_images),
+        "next_cursor": next_cursor,
     }), 200
 
 
@@ -769,31 +978,37 @@ async def create_image():
     db = get_db()
 
     # Check for duplicate name
-    existing = db(db.ipxe_images.name == data["name"]).select().first()
+    def _check_name_exists() -> Any:
+        return db(db.ipxe_images.name == data["name"]).select().first()
+
+    existing = await run_db(_check_name_exists)
     if existing:
         return jsonify({"error": f"Image name already exists: {data['name']}"}), 409
 
-    # Create image
-    image_id = db.ipxe_images.insert(
-        name=data["name"],
-        display_name=data["display_name"],
-        os_name=data.get("os_name", "ubuntu"),
-        os_version=data["os_version"],
-        architecture=data["architecture"],
-        kernel_path=data["kernel_path"],
-        initrd_path=data["initrd_path"],
-        squashfs_path=data.get("squashfs_path"),
-        kernel_params=data.get("kernel_params"),
-        image_type=data.get("image_type", "minimal"),
-        minio_bucket=data.get("minio_bucket"),
-        is_default=data.get("is_default", False),
-        is_active=data.get("is_active", True),
-        checksum=data.get("checksum"),
-        size_bytes=data.get("size_bytes", 0)
-    )
-    db.commit()
+    # Create image. Regression: gh-22. insert + commit + refetch is one
+    # unit of work -- one run_db() closure per the house rule.
+    def _create_image() -> Any:
+        image_id = db.ipxe_images.insert(
+            name=data["name"],
+            display_name=data["display_name"],
+            os_name=data.get("os_name", "ubuntu"),
+            os_version=data["os_version"],
+            architecture=data["architecture"],
+            kernel_path=data["kernel_path"],
+            initrd_path=data["initrd_path"],
+            squashfs_path=data.get("squashfs_path"),
+            kernel_params=data.get("kernel_params"),
+            image_type=data.get("image_type", "minimal"),
+            minio_bucket=data.get("minio_bucket"),
+            is_default=data.get("is_default", False),
+            is_active=data.get("is_active", True),
+            checksum=data.get("checksum"),
+            size_bytes=data.get("size_bytes", 0)
+        )
+        db.commit()
+        return db(db.ipxe_images.id == image_id).select().first()
 
-    created = db(db.ipxe_images.id == image_id).select().first()
+    created = await run_db(_create_image)
 
     log.info(f"Boot image created: {data['name']}")
 
@@ -812,7 +1027,9 @@ async def get_image(image_id: int):
         200: Image details
         404: Image not found
     """
-    image = _get_image_by_id(image_id)
+    # Regression: gh-22. Off the event loop via run_db() instead of
+    # blocking the request coroutine inline.
+    image = await run_db(lambda: _get_image_by_id(image_id))
 
     if not image:
         return jsonify({"error": f"Boot image not found: {image_id}"}), 404
@@ -845,7 +1062,9 @@ async def update_image(image_id: int):
         400: Invalid request
         404: Image not found
     """
-    image = _get_image_by_id(image_id)
+    # Regression: gh-22. Off the event loop via run_db() instead of
+    # blocking the request coroutine inline.
+    image = await run_db(lambda: _get_image_by_id(image_id))
 
     if not image:
         return jsonify({"error": f"Boot image not found: {image_id}"}), 404
@@ -870,11 +1089,14 @@ async def update_image(image_id: int):
         if field in data:
             update_fields[field] = data[field]
 
-    # Update image
-    db(db.ipxe_images.id == image_id).update(**update_fields)
-    db.commit()
+    # Update image. Regression: gh-22. update + commit + refetch is one
+    # unit of work -- one run_db() closure per the house rule.
+    def _apply_update() -> Any:
+        db(db.ipxe_images.id == image_id).update(**update_fields)
+        db.commit()
+        return db(db.ipxe_images.id == image_id).select().first()
 
-    updated = db(db.ipxe_images.id == image_id).select().first()
+    updated = await run_db(_apply_update)
 
     log.info(f"Boot image updated: {image['name']}")
 
@@ -895,30 +1117,41 @@ async def delete_image(image_id: int):
         400: Image is in use
         404: Image not found
     """
-    image = _get_image_by_id(image_id)
+    # Regression: gh-22. Off the event loop via run_db() instead of
+    # blocking the request coroutine inline.
+    image = await run_db(lambda: _get_image_by_id(image_id))
 
     if not image:
         return jsonify({"error": f"Boot image not found: {image_id}"}), 404
 
     db = get_db()
 
-    # Check if image is in use
-    machines_using = db(db.ipxe_machines.status == "deploying").select()
-    for machine in machines_using:
-        job = db(
-            (db.deployment_jobs.machine_id == machine.id) &
-            (db.deployment_jobs.image_id == image_id) &
-            (db.deployment_jobs.status.belongs(["pending", "power_on", "pxe_boot", "os_install"]))
-        ).select().first()
-        if job:
-            return jsonify({
-                "error": "Image is in use by active deployments",
-                "image_id": image_id
-            }), 400
+    # Check if image is in use -- deploying-machines scan + per-machine
+    # job lookup is a sequence of reads feeding validation, one closure.
+    def _check_in_use() -> bool:
+        machines_using = db(db.ipxe_machines.status == "deploying").select()
+        for machine in machines_using:
+            job = db(
+                (db.deployment_jobs.machine_id == machine.id) &
+                (db.deployment_jobs.image_id == image_id) &
+                (db.deployment_jobs.status.belongs(["pending", "power_on", "pxe_boot", "os_install"]))
+            ).select().first()
+            if job:
+                return True
+        return False
+
+    if await run_db(_check_in_use):
+        return jsonify({
+            "error": "Image is in use by active deployments",
+            "image_id": image_id
+        }), 400
 
     # Delete image
-    db(db.ipxe_images.id == image_id).delete()
-    db.commit()
+    def _delete_image() -> None:
+        db(db.ipxe_images.id == image_id).delete()
+        db.commit()
+
+    await run_db(_delete_image)
 
     log.info(f"Boot image deleted: {image['name']}")
 
@@ -942,7 +1175,12 @@ async def list_boot_configs():
     """
     db = get_db()
 
-    configs = db(db.ipxe_boot_configs).select(orderby=~db.ipxe_boot_configs.created_at)
+    # Regression: gh-22. Off the event loop via run_db() instead of
+    # blocking the request coroutine inline.
+    def _fetch() -> Any:
+        return db(db.ipxe_boot_configs).select(orderby=~db.ipxe_boot_configs.created_at)
+
+    configs = await run_db(_fetch)
 
     return jsonify({
         "boot_configs": [cfg.as_dict() for cfg in configs],
@@ -984,25 +1222,31 @@ async def create_boot_config():
     db = get_db()
 
     # Check for duplicate name
-    existing = db(db.ipxe_boot_configs.name == data["name"]).select().first()
+    def _check_name_exists() -> Any:
+        return db(db.ipxe_boot_configs.name == data["name"]).select().first()
+
+    existing = await run_db(_check_name_exists)
     if existing:
         return jsonify({"error": f"Boot config name already exists: {data['name']}"}), 409
 
-    # Create boot config
-    config_id = db.ipxe_boot_configs.insert(
-        name=data["name"],
-        description=data.get("description"),
-        ipxe_script=data.get("ipxe_script"),
-        kernel_params=data.get("kernel_params"),
-        boot_order=data.get("boot_order", []),
-        timeout_seconds=data.get("timeout_seconds", 30),
-        default_image_id=data.get("default_image_id"),
-        assigned_biome_group_id=data.get("assigned_biome_group_id"),
-        is_default=data.get("is_default", False)
-    )
-    db.commit()
+    # Create boot config. Regression: gh-22. insert + commit + refetch is
+    # one unit of work -- one run_db() closure per the house rule.
+    def _create_config() -> Any:
+        config_id = db.ipxe_boot_configs.insert(
+            name=data["name"],
+            description=data.get("description"),
+            ipxe_script=data.get("ipxe_script"),
+            kernel_params=data.get("kernel_params"),
+            boot_order=data.get("boot_order", []),
+            timeout_seconds=data.get("timeout_seconds", 30),
+            default_image_id=data.get("default_image_id"),
+            assigned_biome_group_id=data.get("assigned_biome_group_id"),
+            is_default=data.get("is_default", False)
+        )
+        db.commit()
+        return db(db.ipxe_boot_configs.id == config_id).select().first()
 
-    created = db(db.ipxe_boot_configs.id == config_id).select().first()
+    created = await run_db(_create_config)
 
     log.info(f"Boot config created: {data['name']}")
 
@@ -1021,7 +1265,9 @@ async def get_boot_config(config_id: int):
         200: Boot config details
         404: Config not found
     """
-    config = _get_boot_config_by_id(config_id)
+    # Regression: gh-22. Off the event loop via run_db() instead of
+    # blocking the request coroutine inline.
+    config = await run_db(lambda: _get_boot_config_by_id(config_id))
 
     if not config:
         return jsonify({"error": f"Boot config not found: {config_id}"}), 404
@@ -1053,7 +1299,9 @@ async def update_boot_config(config_id: int):
         400: Invalid request
         404: Config not found
     """
-    config = _get_boot_config_by_id(config_id)
+    # Regression: gh-22. Off the event loop via run_db() instead of
+    # blocking the request coroutine inline.
+    config = await run_db(lambda: _get_boot_config_by_id(config_id))
 
     if not config:
         return jsonify({"error": f"Boot config not found: {config_id}"}), 404
@@ -1077,11 +1325,14 @@ async def update_boot_config(config_id: int):
         if field in data:
             update_fields[field] = data[field]
 
-    # Update boot config
-    db(db.ipxe_boot_configs.id == config_id).update(**update_fields)
-    db.commit()
+    # Update boot config. Regression: gh-22. update + commit + refetch is
+    # one unit of work -- one run_db() closure per the house rule.
+    def _apply_update() -> Any:
+        db(db.ipxe_boot_configs.id == config_id).update(**update_fields)
+        db.commit()
+        return db(db.ipxe_boot_configs.id == config_id).select().first()
 
-    updated = db(db.ipxe_boot_configs.id == config_id).select().first()
+    updated = await run_db(_apply_update)
 
     log.info(f"Boot config updated: {config['name']}")
 
@@ -1102,7 +1353,9 @@ async def delete_boot_config(config_id: int):
         400: Config is in use
         404: Config not found
     """
-    config = _get_boot_config_by_id(config_id)
+    # Regression: gh-22. Off the event loop via run_db() instead of
+    # blocking the request coroutine inline.
+    config = await run_db(lambda: _get_boot_config_by_id(config_id))
 
     if not config:
         return jsonify({"error": f"Boot config not found: {config_id}"}), 404
@@ -1110,7 +1363,10 @@ async def delete_boot_config(config_id: int):
     db = get_db()
 
     # Check if config is in use
-    machines_using = db(db.ipxe_machines.boot_config_id == config_id).count()
+    def _count_in_use() -> int:
+        return db(db.ipxe_machines.boot_config_id == config_id).count()
+
+    machines_using = await run_db(_count_in_use)
     if machines_using > 0:
         return jsonify({
             "error": f"Boot config is in use by {machines_using} machines",
@@ -1118,8 +1374,11 @@ async def delete_boot_config(config_id: int):
         }), 400
 
     # Delete boot config
-    db(db.ipxe_boot_configs.id == config_id).delete()
-    db.commit()
+    def _delete_config() -> None:
+        db(db.ipxe_boot_configs.id == config_id).delete()
+        db.commit()
+
+    await run_db(_delete_config)
 
     log.info(f"Boot config deleted: {config['name']}")
 
@@ -1141,15 +1400,21 @@ async def preview_boot_config(config_id: int):
         200: Rendered iPXE script
         404: Config not found
     """
-    config = _get_boot_config_by_id(config_id)
+    # Regression: gh-22. Config fetch + default-image fetch is a sequence
+    # of reads feeding the response -- one run_db() closure.
+    def _fetch_config_and_image() -> tuple[Any, Any]:
+        config = _get_boot_config_by_id(config_id)
+        if not config:
+            return None, None
+        image = None
+        if config.get("default_image_id"):
+            image = _get_image_by_id(config["default_image_id"])
+        return config, image
+
+    config, image = await run_db(_fetch_config_and_image)
 
     if not config:
         return jsonify({"error": f"Boot config not found: {config_id}"}), 404
-
-    # Get default image if set
-    image = None
-    if config.get("default_image_id"):
-        image = _get_image_by_id(config["default_image_id"])
 
     # Build preview script
     script_lines = ["#!ipxe", ""]
@@ -1206,7 +1471,9 @@ async def sync_machine_to_elder(machine_id: str):
     """
     from ..integrations import get_elder_client
 
-    machine = _get_machine_by_id(machine_id)
+    # Regression: gh-22. Off the event loop via run_db() instead of
+    # blocking the request coroutine inline.
+    machine = await run_db(lambda: _get_machine_by_id(machine_id))
 
     if not machine:
         return jsonify({"error": f"Machine not found: {machine_id}"}), 404
@@ -1228,11 +1495,14 @@ async def sync_machine_to_elder(machine_id: str):
             result = await elder_client.sync_machine(machine)
 
         # Update last sync timestamp
-        db(db.ipxe_machines.id == machine["id"]).update(
-            elder_synced_at=datetime.utcnow(),
-            updated_at=datetime.utcnow()
-        )
-        db.commit()
+        def _update_sync_timestamp() -> None:
+            db(db.ipxe_machines.id == machine["id"]).update(
+                elder_synced_at=datetime.utcnow(),
+                updated_at=datetime.utcnow()
+            )
+            db.commit()
+
+        await run_db(_update_sync_timestamp)
 
         log.info(f"Machine synced to Elder: {machine['system_id']}")
 
@@ -1714,7 +1984,9 @@ async def get_helper_ipxe_script(mac: str):
     if not normalized:
         return jsonify({"error": f"Invalid MAC address: {mac}"}), 400
 
-    record = _find_node_or_machine_by_mac(normalized)
+    # Regression: gh-22. Off the event loop via run_db() instead of
+    # blocking the request coroutine inline.
+    record = await run_db(lambda: _find_node_or_machine_by_mac(normalized))
     if not record:
         log.warning(f"iPXE helper requested for unknown MAC {normalized}")
         return jsonify({"error": f"MAC not found: {normalized}"}), 404
@@ -1722,11 +1994,11 @@ async def get_helper_ipxe_script(mac: str):
     firmware = _detect_firmware_from_query()
     primary_url = _primary_base_url()
 
-    token, nonce = _mint_bootstrap_jwt(
+    token, nonce = await run_db(lambda: _mint_bootstrap_jwt(
         normalized,
         phase="helper",
         dmi_uuid_hint=record.get("dmi_uuid"),
-    )
+    ))
 
     script = _render_helper_ipxe_script(
         normalized, token, primary_url, firmware=firmware
@@ -1757,17 +2029,19 @@ async def get_deploy_ipxe_script(mac: str):
     if not normalized:
         return jsonify({"error": f"Invalid MAC address: {mac}"}), 400
 
-    record = _find_node_or_machine_by_mac(normalized)
+    # Regression: gh-22. Off the event loop via run_db() instead of
+    # blocking the request coroutine inline.
+    record = await run_db(lambda: _find_node_or_machine_by_mac(normalized))
     if not record:
         log.warning(f"iPXE deploy requested for unknown MAC {normalized}")
         return jsonify({"error": f"MAC not found: {normalized}"}), 404
 
     primary_url = _primary_base_url()
-    token, nonce = _mint_bootstrap_jwt(
+    token, nonce = await run_db(lambda: _mint_bootstrap_jwt(
         normalized,
         phase="deploy",
         dmi_uuid_hint=record.get("dmi_uuid"),
-    )
+    ))
 
     script = _render_deploy_ipxe_script(normalized, token, primary_url)
 
@@ -1856,21 +2130,27 @@ async def bind_mac():
     requested_node_id = data.get("node_id")
 
     if "nodes" in db.tables:
-        node = None
-        if requested_node_id:
-            node = db(db.nodes.id == int(requested_node_id)).select().first()
-            if not node:
-                return jsonify({"error": f"Node not found: {requested_node_id}"}), 404
-        else:
-            node = db(db.nodes.dmi_uuid == dmi_uuid).select().first()
+        # Regression: gh-22. Off the event loop via run_db() instead of
+        # blocking the request coroutine inline.
+        def _fetch_node() -> Any:
+            if requested_node_id:
+                return db(db.nodes.id == int(requested_node_id)).select().first()
+            return db(db.nodes.dmi_uuid == dmi_uuid).select().first()
+
+        node = await run_db(_fetch_node)
+        if requested_node_id and not node:
+            return jsonify({"error": f"Node not found: {requested_node_id}"}), 404
 
         if node:
-            db(db.nodes.id == node.id).update(
-                primary_nic_mac=normalized,
-                dmi_uuid=dmi_uuid,
-                updated_at=datetime.now(timezone.utc),
-            )
-            db.commit()
+            def _update_node() -> None:
+                db(db.nodes.id == node.id).update(
+                    primary_nic_mac=normalized,
+                    dmi_uuid=dmi_uuid,
+                    updated_at=datetime.now(timezone.utc),
+                )
+                db.commit()
+
+            await run_db(_update_node)
             log.info(f"MAC bound to existing node id={node.id} mac={normalized} dmi={dmi_uuid}")
             return jsonify({
                 "node_id": node.id,
@@ -1880,14 +2160,18 @@ async def bind_mac():
             }), 200
 
         # Create a new node row in 'new' state for the binding.
-        new_id = db.nodes.insert(
-            tenant_id="__default__",
-            name=f"node-{normalized.replace(':', '')}",
-            state="new",
-            dmi_uuid=dmi_uuid,
-            primary_nic_mac=normalized,
-        )
-        db.commit()
+        def _create_node() -> Any:
+            new_id = db.nodes.insert(
+                tenant_id="__default__",
+                name=f"node-{normalized.replace(':', '')}",
+                state="new",
+                dmi_uuid=dmi_uuid,
+                primary_nic_mac=normalized,
+            )
+            db.commit()
+            return new_id
+
+        new_id = await run_db(_create_node)
         log.info(f"MAC bound; new node id={new_id} mac={normalized} dmi={dmi_uuid}")
         return jsonify({
             "node_id": new_id,
@@ -1930,15 +2214,17 @@ async def mint_bootstrap_token():
     if phase not in ("helper", "deploy"):
         return jsonify({"error": "phase must be 'helper' or 'deploy'"}), 400
 
-    record = _find_node_or_machine_by_mac(normalized)
+    # Regression: gh-22. Off the event loop via run_db() instead of
+    # blocking the request coroutine inline.
+    record = await run_db(lambda: _find_node_or_machine_by_mac(normalized))
     if not record:
         return jsonify({"error": f"MAC not found: {normalized}"}), 404
 
-    token, nonce = _mint_bootstrap_jwt(
+    token, nonce = await run_db(lambda: _mint_bootstrap_jwt(
         normalized,
         phase=phase,
         dmi_uuid_hint=record.get("dmi_uuid"),
-    )
+    ))
 
     log.info(f"Operator minted bootstrap token mac={normalized} phase={phase}")
 
@@ -1992,7 +2278,10 @@ async def update_elder_config():
         }), 400
 
     # Get or create default configuration
-    existing = db(db.elder_config.name == "default").select().first()
+    def _fetch_existing() -> Any:
+        return db(db.elder_config.name == "default").select().first()
+
+    existing = await run_db(_fetch_existing)
 
     update_fields = {
         "elder_url": data["elder_url"],
@@ -2004,11 +2293,14 @@ async def update_elder_config():
     }
 
     if existing:
-        # Update existing configuration
-        db(db.elder_config.id == existing.id).update(**update_fields)
-        db.commit()
+        # Update existing configuration. Regression: gh-22. update +
+        # commit + refetch is one unit of work -- one run_db() closure.
+        def _apply_update() -> Any:
+            db(db.elder_config.id == existing.id).update(**update_fields)
+            db.commit()
+            return db(db.elder_config.id == existing.id).select().first()
 
-        updated = db(db.elder_config.id == existing.id).select().first()
+        updated = await run_db(_apply_update)
         log.info("Elder configuration updated")
 
         return jsonify({
@@ -2017,12 +2309,16 @@ async def update_elder_config():
         }), 200
 
     else:
-        # Create new configuration
+        # Create new configuration. Regression: gh-22. insert + commit +
+        # refetch is one unit of work -- one run_db() closure.
         update_fields["name"] = "default"
-        config_id = db.elder_config.insert(**update_fields)
-        db.commit()
 
-        created = db(db.elder_config.id == config_id).select().first()
+        def _create_config() -> Any:
+            config_id = db.elder_config.insert(**update_fields)
+            db.commit()
+            return db(db.elder_config.id == config_id).select().first()
+
+        created = await run_db(_create_config)
         log.info("Elder configuration created")
 
         return jsonify({

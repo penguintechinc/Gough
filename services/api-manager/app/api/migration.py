@@ -25,6 +25,7 @@ from typing import Any, Callable, Optional
 
 from quart import Blueprint, current_app, g, jsonify, request
 
+from ..db.run_db import run_db
 from ..middleware import auth_required
 from ..models import get_db
 from ..workers.migration_engine import (
@@ -222,49 +223,60 @@ def _policy_dict_to_dataclass(d: dict) -> PolicyDC:
     )
 
 
-def _load_cluster_state(cluster_id: str) -> ClusterState:
+async def _load_cluster_state(cluster_id: str) -> ClusterState:
     """Load a ``ClusterState`` snapshot from the live DB.
 
     The capacity provider (WaddleAI) is consulted in M2 to populate the
     ``forecast_*`` fields; M1 falls back to the current free-percent values
     captured on the ``nodes.hardware_json`` blob.
+
+    Regression: gh-22. Unbounded full-table scan over ``nodes`` -- genuinely
+    needed here (a migration safety decision has to see every node's live
+    capacity, not a page of them), so this is a wrap-only conversion, not a
+    pagination one. Both reads (the node scan + the in-flight migration
+    count) are one logical "cluster state" snapshot, so they run in a single
+    ``run_db()`` closure rather than two separate thread hops.
     """
     db = get_db()
-    nodes: list[NodeSnapshot] = []
-    if "nodes" in getattr(db, "tables", []):
-        rows = db(db.nodes.id > 0).select()
-        for row in rows:
-            hw = getattr(row, "hardware_json", None) or {}
-            cpu_free = float(hw.get("cpu_free_pct", 100.0))
-            mem_free = float(hw.get("mem_free_pct", 100.0))
-            disk_free = float(hw.get("disk_free_pct", 100.0))
-            tags = frozenset(hw.get("tags", []) or [])
-            score = float(hw.get("composite_load_score", 0.0))
-            nodes.append(NodeSnapshot(
-                node_id=row.id,
-                state=str(row.state or "unknown"),
-                cpu_free_pct=cpu_free,
-                mem_free_pct=mem_free,
-                disk_free_pct=disk_free,
-                forecast_cpu_free_pct=float(hw.get("forecast_cpu_free_pct",
-                                                    cpu_free)),
-                forecast_mem_free_pct=float(hw.get("forecast_mem_free_pct",
-                                                    mem_free)),
-                forecast_disk_free_pct=float(hw.get("forecast_disk_free_pct",
-                                                     disk_free)),
-                hardware_tags=tags,
-                composite_load_score=score,
-            ))
-    in_flight = 0
-    if "migration_events" in getattr(db, "tables", []):
-        in_flight = db(
-            db.migration_events.result == "in_flight"
-        ).count()
-    return ClusterState(
-        cluster_id=cluster_id,
-        nodes=tuple(nodes),
-        in_flight_migrations=in_flight,
-    )
+
+    def _do_load() -> ClusterState:
+        nodes: list[NodeSnapshot] = []
+        if "nodes" in getattr(db, "tables", []):
+            rows = db(db.nodes.id > 0).select()
+            for row in rows:
+                hw = getattr(row, "hardware_json", None) or {}
+                cpu_free = float(hw.get("cpu_free_pct", 100.0))
+                mem_free = float(hw.get("mem_free_pct", 100.0))
+                disk_free = float(hw.get("disk_free_pct", 100.0))
+                tags = frozenset(hw.get("tags", []) or [])
+                score = float(hw.get("composite_load_score", 0.0))
+                nodes.append(NodeSnapshot(
+                    node_id=row.id,
+                    state=str(row.state or "unknown"),
+                    cpu_free_pct=cpu_free,
+                    mem_free_pct=mem_free,
+                    disk_free_pct=disk_free,
+                    forecast_cpu_free_pct=float(hw.get("forecast_cpu_free_pct",
+                                                        cpu_free)),
+                    forecast_mem_free_pct=float(hw.get("forecast_mem_free_pct",
+                                                        mem_free)),
+                    forecast_disk_free_pct=float(hw.get("forecast_disk_free_pct",
+                                                         disk_free)),
+                    hardware_tags=tags,
+                    composite_load_score=score,
+                ))
+        in_flight = 0
+        if "migration_events" in getattr(db, "tables", []):
+            in_flight = db(
+                db.migration_events.result == "in_flight"
+            ).count()
+        return ClusterState(
+            cluster_id=cluster_id,
+            nodes=tuple(nodes),
+            in_flight_migrations=in_flight,
+        )
+
+    return await run_db(_do_load)
 
 
 def _load_biome_snapshot(biome_instance_id: int) -> Optional[BiomeSnapshot]:
@@ -397,7 +409,9 @@ def _principal_scopes() -> frozenset[str]:
 async def get_policy():
     """Return the cluster's migration policy."""
     cluster_id = _cluster_id()
-    policy = _load_or_default_policy(cluster_id)
+    # Regression: gh-22. Off the event loop via run_db() instead of
+    # blocking the request coroutine inline.
+    policy = await run_db(lambda: _load_or_default_policy(cluster_id))
     return jsonify({"status": "success", "data": policy}), 200
 
 
@@ -436,13 +450,22 @@ async def patch_policy():
         }), 422
 
     cluster_id = _cluster_id()
-    current = _load_or_default_policy(cluster_id)
+
+    # Regression: gh-22. Current-policy read + cluster-size count is one
+    # unit of work -- off the event loop via run_db() instead of blocking
+    # the request coroutine inline.
+    def _load_current_and_size() -> tuple[dict[str, Any], int]:
+        current = _load_or_default_policy(cluster_id)
+        db = get_db()
+        cluster_size = 0
+        if "nodes" in getattr(db, "tables", []):
+            cluster_size = db(db.nodes.id > 0).count()
+        return current, cluster_size
+
+    current, cluster_size = await run_db(_load_current_and_size)
     merged = {**current, **body}
 
     db = get_db()
-    cluster_size = 0
-    if "nodes" in getattr(db, "tables", []):
-        cluster_size = db(db.nodes.id > 0).count()
 
     combo_violations = validate_combination(
         merged, cluster_size=cluster_size or None
@@ -469,25 +492,32 @@ async def patch_policy():
         }), 500
 
     now = datetime.now(timezone.utc)
-    existing = db(db.migration_policy.cluster_id == cluster_id).select().first()
-    update_fields = {k: v for k, v in body.items() if k in POLICY_FIELDS}
-    update_fields["updated_at"] = now
-    if existing is None:
-        insert_payload = {**merged, **update_fields}
-        insert_payload.pop("created_at", None)
-        insert_payload.pop("updated_at", None)
-        db.migration_policy.insert(
-            id=str(uuid.uuid4()),
-            cluster_id=cluster_id,
-            created_at=now,
-            updated_at=now,
-            **{k: v for k, v in insert_payload.items() if k in POLICY_FIELDS},
-        )
-    else:
-        db(db.migration_policy.cluster_id == cluster_id).update(**update_fields)
-    db.commit()
 
-    refreshed = _load_or_default_policy(cluster_id)
+    # Regression: gh-22. Existing-row check + insert-or-update + commit +
+    # the post-commit refetch is one unit of work -- stays in one run_db()
+    # closure per the house rule (see app/db/run_db.py).
+    def _apply_patch() -> dict[str, Any]:
+        existing = db(db.migration_policy.cluster_id == cluster_id).select().first()
+        update_fields = {k: v for k, v in body.items() if k in POLICY_FIELDS}
+        update_fields["updated_at"] = now
+        if existing is None:
+            insert_payload = {**merged, **update_fields}
+            insert_payload.pop("created_at", None)
+            insert_payload.pop("updated_at", None)
+            db.migration_policy.insert(
+                id=str(uuid.uuid4()),
+                cluster_id=cluster_id,
+                created_at=now,
+                updated_at=now,
+                **{k: v for k, v in insert_payload.items() if k in POLICY_FIELDS},
+            )
+        else:
+            db(db.migration_policy.cluster_id == cluster_id).update(**update_fields)
+        db.commit()
+
+        return _load_or_default_policy(cluster_id)
+
+    refreshed = await run_db(_apply_patch)
     log.info(
         "migration_policy patched cluster_id=%s actor=%s fields=%s",
         cluster_id, _principal_sub(), sorted(body.keys()),
@@ -539,7 +569,9 @@ async def trigger_migration(instance_id: int):
             "message": "ignore_lock=true requires the override-lock scope",
         }), 403
 
-    biome = _load_biome_snapshot(instance_id)
+    # Regression: gh-22. Off the event loop via run_db() instead of
+    # blocking the request coroutine inline.
+    biome = await run_db(lambda: _load_biome_snapshot(instance_id))
     if biome is None:
         return jsonify({
             "error": "biome_instance_not_found",
@@ -547,8 +579,8 @@ async def trigger_migration(instance_id: int):
         }), 404
 
     cluster_id = _cluster_id()
-    cluster_state = _load_cluster_state(cluster_id)
-    policy_dict = _load_or_default_policy(cluster_id)
+    cluster_state = await _load_cluster_state(cluster_id)
+    policy_dict = await run_db(lambda: _load_or_default_policy(cluster_id))
     policy = _policy_dict_to_dataclass(policy_dict)
 
     plan = MigrationPlan(
@@ -559,8 +591,11 @@ async def trigger_migration(instance_id: int):
     )
     result = evaluate(plan, cluster_state, policy)
 
-    event_id = _record_safety_event(
-        cluster_id, biome, plan, result, _principal_sub()
+    # Regression: gh-22. Off the event loop via run_db() instead of
+    # blocking the request coroutine inline.
+    actor_sub = _principal_sub()
+    event_id = await run_db(
+        lambda: _record_safety_event(cluster_id, biome, plan, result, actor_sub)
     )
 
     response_data = {
@@ -699,11 +734,18 @@ async def list_events():
         else:
             return jsonify({"error": "Invalid 'result' filter"}), 400
 
-    total = db(query).count()
-    rows = db(query).select(
-        orderby=~db.migration_events.started_at,
-        limitby=(offset, offset + limit),
-    )
+    # Regression: gh-22. Count + page select is one unit of work -- off
+    # the event loop via run_db() instead of blocking the request
+    # coroutine inline.
+    def _fetch_page() -> tuple[int, Any]:
+        total = db(query).count()
+        rows = db(query).select(
+            orderby=~db.migration_events.started_at,
+            limitby=(offset, offset + limit),
+        )
+        return total, rows
+
+    total, rows = await run_db(_fetch_page)
     events = [_serialise_event(r) for r in rows]
 
     return jsonify({
@@ -747,15 +789,23 @@ def _serialise_event(row: Any) -> dict:
 async def get_safety_envelope():
     """Return current policy + the most recent 100 safety-check results."""
     cluster_id = _cluster_id()
-    policy = _load_or_default_policy(cluster_id)
-    db = get_db()
-    last_results: list[dict] = []
-    if "migration_events" in getattr(db, "tables", []):
-        rows = db(db.migration_events.result == "safety_check").select(
-            orderby=~db.migration_events.started_at,
-            limitby=(0, 100),
-        )
-        last_results = [_serialise_event(r) for r in rows]
+
+    # Regression: gh-22. Policy read + recent-events select is one unit of
+    # work -- off the event loop via run_db() instead of blocking the
+    # request coroutine inline.
+    def _load_envelope() -> tuple[dict[str, Any], list[dict[str, Any]]]:
+        policy = _load_or_default_policy(cluster_id)
+        db = get_db()
+        last_results: list[dict] = []
+        if "migration_events" in getattr(db, "tables", []):
+            rows = db(db.migration_events.result == "safety_check").select(
+                orderby=~db.migration_events.started_at,
+                limitby=(0, 100),
+            )
+            last_results = [_serialise_event(r) for r in rows]
+        return policy, last_results
+
+    policy, last_results = await run_db(_load_envelope)
     return jsonify({
         "status": "success",
         "data": {

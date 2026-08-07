@@ -555,6 +555,21 @@ class TestListNodes:
         meta = (await _json(resp))["meta"]
         assert meta.get("next_cursor") is not None
 
+    @pytest.mark.asyncio
+    async def test_list_select_runs_off_event_loop(self, nodes_app, seed_node):
+        """# regression: gh-22
+
+        list_nodes' SELECT now runs via run_db()/asyncio.to_thread() instead
+        of blocking the request coroutine inline -- proves the endpoint
+        still returns the seeded node correctly through that thread hop
+        (thread-local penguin-dal connection + RLS ContextVar propagation).
+        """
+        async with nodes_app.test_client() as client:
+            resp = await client.get("/api/v1/nodes/")
+        assert resp.status_code == 200
+        nodes = (await _json(resp))["data"]["nodes"]
+        assert any(n["id"] == seed_node for n in nodes)
+
 
 # ---------------------------------------------------------------------------
 # GET /api/v1/nodes/{id}

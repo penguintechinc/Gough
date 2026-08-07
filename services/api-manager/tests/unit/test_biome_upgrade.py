@@ -448,3 +448,117 @@ class TestUpgradeBiome:
         assert response.status_code == 404  # 1
         data = await response.get_json()
         assert data is not None  # basic validation
+
+
+class _FakeHealthzResponse:
+    def __init__(self, status: int) -> None:
+        self.status = status
+
+    async def __aenter__(self) -> "_FakeHealthzResponse":
+        return self
+
+    async def __aexit__(self, *exc: object) -> bool:
+        return False
+
+
+class _FakeClientSession:
+    """Stand-in for ``aiohttp.ClientSession`` -- no real network calls."""
+
+    def __init__(self, *args: object, **kwargs: object) -> None:
+        self._status = 200
+
+    async def __aenter__(self) -> "_FakeClientSession":
+        return self
+
+    async def __aexit__(self, *exc: object) -> bool:
+        return False
+
+    def get(self, url: str, timeout: int = 2) -> _FakeHealthzResponse:
+        return _FakeHealthzResponse(self._status)
+
+
+class TestDeployAndHealthCheck:
+    """``_deploy_and_health_check`` (gh-22): per-node DB lookups in the deploy
+    loop AND the 12x-attempt health-poll loop now run via ``run_db()``.
+    Exercises those lookups against a real (sqlite) ``db`` fixture --
+    subprocess/aiohttp are mocked (no real lxc/kubectl/network calls), but
+    the node/biome reads are real DB round-trips through the thread hop.
+    """
+
+    @pytest.mark.asyncio
+    async def test_deploy_and_healthcheck_succeeds_with_real_node_lookup(
+        self, test_client, db, monkeypatch
+    ) -> None:
+        """# regression: gh-22
+
+        Seeds a real biome + node, deploys, and health-checks -- proves
+        both the deploy-loop node lookup and the health-check-loop node
+        lookup (previously two separate blocking-inline DB reads) still
+        resolve correctly through run_db()/asyncio.to_thread(). Depends on
+        ``test_client`` (unused directly) purely to get the ``biomes``
+        table defined on the shared ``dal`` instance -- see that fixture.
+        """
+        import app.api.biomes as biomes_mod
+
+        biome_id = db.biomes.insert(
+            name="test-lxc-biome",
+            biome_kind="lxc",
+            workload_type="container",
+            phase="post_deploy",
+            tenant_id="__default__",
+        )
+        node_id = db.nodes.insert(
+            name="node-1",
+            state="ready",
+            dmi_uuid="00000000-0000-0000-0000-000000000001",
+            primary_nic_mac="aa:bb:cc:dd:ee:01",
+            tenant_id="__default__",
+        )
+        db.commit()
+
+        monkeypatch.setattr(biomes_mod, "get_db", lambda: db)
+        monkeypatch.setattr("subprocess.run", MagicMock())
+        monkeypatch.setattr("aiohttp.ClientSession", _FakeClientSession)
+
+        result = await biomes_mod._deploy_and_health_check(
+            [str(node_id)], biome_id, "v1.1.0", "test-run-healthcheck"
+        )
+
+        assert result is True
+
+    @pytest.mark.asyncio
+    async def test_returns_false_when_biome_not_found(
+        self, test_client, db, monkeypatch
+    ) -> None:
+        import app.api.biomes as biomes_mod
+
+        monkeypatch.setattr(biomes_mod, "get_db", lambda: db)
+
+        result = await biomes_mod._deploy_and_health_check(
+            ["1"], 999999, "v1.1.0", "test-run-missing-biome"
+        )
+
+        assert result is False
+
+    @pytest.mark.asyncio
+    async def test_returns_false_when_node_not_found(
+        self, test_client, db, monkeypatch
+    ) -> None:
+        import app.api.biomes as biomes_mod
+
+        biome_id = db.biomes.insert(
+            name="test-lxc-biome-2",
+            biome_kind="lxc",
+            workload_type="container",
+            phase="post_deploy",
+            tenant_id="__default__",
+        )
+        db.commit()
+
+        monkeypatch.setattr(biomes_mod, "get_db", lambda: db)
+
+        result = await biomes_mod._deploy_and_health_check(
+            ["999999"], biome_id, "v1.1.0", "test-run-missing-node"
+        )
+
+        assert result is False

@@ -24,6 +24,7 @@ from typing import Any, Optional
 from pydantic import BaseModel, ConfigDict, Field, ValidationError, field_validator
 from quart import Blueprint, current_app, g, jsonify, request
 
+from ..db.run_db import run_db
 from ..models import get_db
 from ..middleware import auth_required
 from ..security.scope_enforcement import require_scopes
@@ -320,14 +321,23 @@ async def list_node_disks(node_id: int):
     tenant_id = _tenant_id()
     db = get_db()
 
-    node = _load_node(db, node_id, tenant_id)
+    # Regression: gh-22. Node check + disks select is one unit of work --
+    # off the event loop via run_db() instead of blocking the request
+    # coroutine inline.
+    def _fetch() -> tuple[Any, Any]:
+        node = _load_node(db, node_id, tenant_id)
+        if node is None:
+            return None, None
+        rows = (
+            db((db.disks.node_id == node_id) & (db.disks.tenant_id == tenant_id))
+            .select(orderby=db.disks.device_path)
+        )
+        return node, rows
+
+    node, rows = await run_db(_fetch)
     if node is None:
         return jsonify({"error": "Node not found"}), 404
 
-    rows = (
-        db((db.disks.node_id == node_id) & (db.disks.tenant_id == tenant_id))
-        .select(orderby=db.disks.device_path)
-    )
     return (
         jsonify(
             {
@@ -360,7 +370,9 @@ async def create_disk_plan(node_id: int, disk_id: int):
     tenant_id = _tenant_id()
     db = get_db()
 
-    disk = _load_disk(db, node_id, disk_id, tenant_id)
+    # Regression: gh-22. Off the event loop via run_db() instead of
+    # blocking the request coroutine inline.
+    disk = await run_db(lambda: _load_disk(db, node_id, disk_id, tenant_id))
     if disk is None:
         return jsonify({"error": "Disk not found"}), 404
 
@@ -413,8 +425,12 @@ async def create_disk_plan(node_id: int, disk_id: int):
         )
 
     mount_points = [p.mount_point for p in plan_req.partitions]
-    collision = detect_write_files_collision(
-        db, node_id, disk_id, mount_points, tenant_id
+    # Regression: gh-22. Off the event loop via run_db() instead of
+    # blocking the request coroutine inline.
+    collision = await run_db(
+        lambda: detect_write_files_collision(
+            db, node_id, disk_id, mount_points, tenant_id
+        )
     )
     if collision is not None:
         return (
@@ -453,30 +469,36 @@ async def create_disk_plan(node_id: int, disk_id: int):
             200,
         )
 
-    # Replace any existing plans for this disk (idempotent re-plan)
-    db(
-        (db.disk_plans.disk_id == disk_id)
-        & (db.disk_plans.tenant_id == tenant_id)
-    ).delete()
+    # Regression: gh-22. Delete-existing + insert-new + commit + refetch is
+    # one unit of work -- stays in one run_db() closure per the house rule
+    # (see app/db/run_db.py).
+    def _persist_plan() -> Any:
+        # Replace any existing plans for this disk (idempotent re-plan)
+        db(
+            (db.disk_plans.disk_id == disk_id)
+            & (db.disk_plans.tenant_id == tenant_id)
+        ).delete()
 
-    created_ids: list[int] = []
-    for part in plan_req.partitions:
-        new_id = db.disk_plans.insert(
-            node_id=node_id,
-            disk_id=disk_id,
-            tenant_id=tenant_id,
-            partition_index=part.index,
-            mount_point=part.mount_point,
-            size_bytes=part.size_mb * 1024 * 1024,
-            fs_type=part.fs_type,
-            encryption=part.encryption,
-            created_at=datetime.now(timezone.utc),
-            updated_at=datetime.now(timezone.utc),
-        )
-        created_ids.append(int(new_id))
-    db.commit()
+        created_ids: list[int] = []
+        for part in plan_req.partitions:
+            new_id = db.disk_plans.insert(
+                node_id=node_id,
+                disk_id=disk_id,
+                tenant_id=tenant_id,
+                partition_index=part.index,
+                mount_point=part.mount_point,
+                size_bytes=part.size_mb * 1024 * 1024,
+                fs_type=part.fs_type,
+                encryption=part.encryption,
+                created_at=datetime.now(timezone.utc),
+                updated_at=datetime.now(timezone.utc),
+            )
+            created_ids.append(int(new_id))
+        db.commit()
 
-    rows = db(db.disk_plans.id.belongs(created_ids)).select() if created_ids else []
+        return db(db.disk_plans.id.belongs(created_ids)).select() if created_ids else []
+
+    rows = await run_db(_persist_plan)
     return (
         jsonify(
             {
@@ -504,7 +526,9 @@ async def patch_disk(node_id: int, disk_id: int):
     tenant_id = _tenant_id()
     db = get_db()
 
-    disk = _load_disk(db, node_id, disk_id, tenant_id)
+    # Regression: gh-22. Off the event loop via run_db() instead of
+    # blocking the request coroutine inline.
+    disk = await run_db(lambda: _load_disk(db, node_id, disk_id, tenant_id))
     if disk is None:
         return jsonify({"error": "Disk not found"}), 404
 
@@ -549,14 +573,20 @@ async def patch_disk(node_id: int, disk_id: int):
             422,
         )
 
-    db(
-        (db.disks.id == disk_id)
-        & (db.disks.node_id == node_id)
-        & (db.disks.tenant_id == tenant_id)
-    ).update(**update_fields)
-    db.commit()
+    # Regression: gh-22. Update + commit + the post-commit refetch is one
+    # unit of work -- stays in one run_db() closure per the house rule
+    # (see app/db/run_db.py).
+    def _apply_patch() -> Any:
+        db(
+            (db.disks.id == disk_id)
+            & (db.disks.node_id == node_id)
+            & (db.disks.tenant_id == tenant_id)
+        ).update(**update_fields)
+        db.commit()
 
-    refreshed = _load_disk(db, node_id, disk_id, tenant_id)
+        return _load_disk(db, node_id, disk_id, tenant_id)
+
+    refreshed = await run_db(_apply_patch)
     return (
         jsonify(
             {
@@ -582,11 +612,16 @@ async def smart_recheck(node_id: int, disk_id: int):
     tenant_id = _tenant_id()
     db = get_db()
 
-    disk = _load_disk(db, node_id, disk_id, tenant_id)
+    # Regression: gh-22. Off the event loop via run_db() instead of
+    # blocking the request coroutine inline.
+    disk = await run_db(lambda: _load_disk(db, node_id, disk_id, tenant_id))
     if disk is None:
         return jsonify({"error": "Disk not found"}), 404
 
-    mode = _publish_smart_recheck(node_id, disk_id)
+    # _publish_smart_recheck() falls back to a direct penguin-dal
+    # insert+commit when no NATS client is attached -- off the event loop
+    # via run_db() instead of blocking the request coroutine inline.
+    mode = await run_db(lambda: _publish_smart_recheck(node_id, disk_id))
     return (
         jsonify(
             {

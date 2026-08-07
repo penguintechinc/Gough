@@ -144,7 +144,14 @@ class TestInitializeCA:
                             return None
                         if "chmod" in str(func):
                             return None
-                        return await asyncio.coroutine(func)(*args, **kwargs)
+                        # gh-22: initialize_ca()'s DB-config-store closure
+                        # (_store_ca_config) also now runs via
+                        # asyncio.to_thread (through run_db()) -- it's a
+                        # plain sync callable like every other function
+                        # this fixture routes through to_thread, so just
+                        # call it directly (asyncio.to_thread never wraps
+                        # an async function in real usage).
+                        return func(*args, **kwargs)
 
                     mock_to_thread.side_effect = side_effect_async
 

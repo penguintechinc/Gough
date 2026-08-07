@@ -36,6 +36,7 @@ from typing import Any, Callable, Optional
 from quart import Blueprint, current_app, g, jsonify, request
 
 from ..clients import lxd_extra
+from ..db.run_db import run_db
 from ..middleware import auth_required
 from ..models import get_db
 
@@ -146,12 +147,20 @@ def _require_cluster_tenant(fn: Callable) -> Callable:
     async def _wrapper(cluster_id: str, *args: Any, **kwargs: Any):
         if not _is_cross_tenant():
             db = get_db()
-            if hasattr(db, "clusters"):
-                cluster = db(db.clusters.id == cluster_id).select().first()
-                if cluster is None or getattr(
-                    cluster, "tenant_id", "__default__"
-                ) != _current_tenant_id():
-                    return jsonify({"error": "Cluster not found"}), 404
+
+            # Regression: gh-22. Off the event loop via run_db() instead
+            # of blocking the request coroutine inline.
+            def _check_ownership() -> bool:
+                if hasattr(db, "clusters"):
+                    cluster = db(db.clusters.id == cluster_id).select().first()
+                    if cluster is None or getattr(
+                        cluster, "tenant_id", "__default__"
+                    ) != _current_tenant_id():
+                        return False
+                return True
+
+            if not await run_db(_check_ownership):
+                return jsonify({"error": "Cluster not found"}), 404
         return await fn(cluster_id, *args, **kwargs)
 
     return _wrapper
@@ -312,21 +321,30 @@ async def list_storage_backends(cluster_id: str):
     """List the cluster's storage backends with credentials redacted."""
     db = get_db()
 
-    # Tenant isolation (FIX #17): verify cluster ownership before listing
-    if not _is_cross_tenant():
-        if hasattr(db, "clusters"):
-            cluster = db(db.clusters.id == cluster_id).select().first()
-            if cluster is None:
-                return jsonify({"error": "Cluster not found"}), 404
-            cluster_tenant = getattr(cluster, "tenant_id", "__default__")
-            if cluster_tenant != _current_tenant_id():
-                return jsonify({"error": "Cluster not found"}), 404
+    # Regression: gh-22. Tenant-ownership check + backends select combined
+    # into one closure -- off the event loop via run_db() instead of
+    # blocking the request coroutine inline.
+    def _check_and_fetch() -> tuple[bool, list[Any]]:
+        # Tenant isolation (FIX #17): verify cluster ownership before listing
+        if not _is_cross_tenant():
+            if hasattr(db, "clusters"):
+                cluster = db(db.clusters.id == cluster_id).select().first()
+                if cluster is None:
+                    return False, []
+                cluster_tenant = getattr(cluster, "tenant_id", "__default__")
+                if cluster_tenant != _current_tenant_id():
+                    return False, []
 
-    if "storage_backends" not in getattr(db, "tables", []):
-        return jsonify({"status": "success", "data": {"cluster_id": cluster_id, "backends": []}}), 200
-    rows = db(db.storage_backends.cluster_id == cluster_id).select(
-        orderby=~db.storage_backends.is_default
-    )
+        if "storage_backends" not in getattr(db, "tables", []):
+            return True, []
+        rows = db(db.storage_backends.cluster_id == cluster_id).select(
+            orderby=~db.storage_backends.is_default
+        )
+        return True, list(rows)
+
+    found, rows = await run_db(_check_and_fetch)
+    if not found:
+        return jsonify({"error": "Cluster not found"}), 404
     backends = [_serialise_storage_backend(r) for r in rows]
     return jsonify({"status": "success", "data": {
         "cluster_id": cluster_id,
@@ -399,47 +417,57 @@ async def patch_storage_backend(cluster_id: str):
     if "storage_backends" not in getattr(db, "tables", []):
         return jsonify({"status": "success", "data": {"note": "accepted, schema not yet initialized"}}), 200
 
-    existing = db(
-        (db.storage_backends.cluster_id == cluster_id)
-        & (db.storage_backends.name == name)
-    ).select().first()
-
     now = datetime.now(timezone.utc)
-    if existing is None:
-        if not kind:
-            return jsonify({"error": "kind is required to create a backend"}), 422
-        if is_default:
-            db(db.storage_backends.cluster_id == cluster_id).update(is_default=False)
-        backend_id = uuid.uuid4()
-        db.storage_backends.insert(
-            id=backend_id,
-            cluster_id=cluster_id,
-            kind=kind,
-            name=name,
-            is_default=is_default,
-            config_json=config,
-            credentials_ref=credentials_ref,
-            status="initializing",
-            created_at=now,
-            updated_at=now,
-        )
-    else:
-        update_fields: dict = {"updated_at": now}
-        if kind:
-            update_fields["kind"] = kind
-        update_fields["config_json"] = config
-        if credentials_ref is not None:
-            update_fields["credentials_ref"] = credentials_ref
-        if is_default:
-            db(db.storage_backends.cluster_id == cluster_id).update(is_default=False)
-            update_fields["is_default"] = True
-        db(db.storage_backends.id == existing.id).update(**update_fields)
-    db.commit()
 
-    refreshed = db(
-        (db.storage_backends.cluster_id == cluster_id)
-        & (db.storage_backends.name == name)
-    ).select().first()
+    # Regression: gh-22. Existing-row check + insert-or-update + commit +
+    # the post-commit refetch is one unit of work -- stays in one run_db()
+    # closure per the house rule (see app/db/run_db.py).
+    def _apply_patch() -> tuple[bool, Any]:
+        existing = db(
+            (db.storage_backends.cluster_id == cluster_id)
+            & (db.storage_backends.name == name)
+        ).select().first()
+
+        if existing is None:
+            if not kind:
+                return False, None
+            if is_default:
+                db(db.storage_backends.cluster_id == cluster_id).update(is_default=False)
+            backend_id = uuid.uuid4()
+            db.storage_backends.insert(
+                id=backend_id,
+                cluster_id=cluster_id,
+                kind=kind,
+                name=name,
+                is_default=is_default,
+                config_json=config,
+                credentials_ref=credentials_ref,
+                status="initializing",
+                created_at=now,
+                updated_at=now,
+            )
+        else:
+            update_fields: dict = {"updated_at": now}
+            if kind:
+                update_fields["kind"] = kind
+            update_fields["config_json"] = config
+            if credentials_ref is not None:
+                update_fields["credentials_ref"] = credentials_ref
+            if is_default:
+                db(db.storage_backends.cluster_id == cluster_id).update(is_default=False)
+                update_fields["is_default"] = True
+            db(db.storage_backends.id == existing.id).update(**update_fields)
+        db.commit()
+
+        refreshed = db(
+            (db.storage_backends.cluster_id == cluster_id)
+            & (db.storage_backends.name == name)
+        ).select().first()
+        return True, refreshed
+
+    kind_ok, refreshed = await run_db(_apply_patch)
+    if not kind_ok:
+        return jsonify({"error": "kind is required to create a backend"}), 422
 
     log.info(
         "storage_backend patched cluster_id=%s name=%s actor=%s",
@@ -462,21 +490,34 @@ async def switch_primary_storage(cluster_id: str):
     backends_present = "storage_backends" in getattr(db, "tables", [])
     current_primary: Optional[dict] = None
     next_primary: Optional[dict] = None
-    if backends_present:
+
+    # Regression: gh-22. Current-primary lookup + target lookup combined
+    # into one closure -- off the event loop via run_db() instead of
+    # blocking the request coroutine inline. target_backend_id parsing
+    # stays inside the closure too (it sits between the two DB reads with
+    # no intervening await, so splitting it out would force an extra
+    # thread hop for no reason).
+    def _fetch_backends() -> tuple[str, Optional[Any], Optional[Any]]:
         cur = db(
             (db.storage_backends.cluster_id == cluster_id)
             & (db.storage_backends.is_default == True)  # noqa: E712
         ).select().first()
-        if cur is not None:
-            current_primary = _serialise_storage_backend(cur)
         try:
             target_uuid = uuid.UUID(target)
         except ValueError:
-            return jsonify({"error": "Invalid target_backend_id"}), 422
+            return "invalid_target", cur, None
         nxt = db(
             (db.storage_backends.cluster_id == cluster_id)
             & (db.storage_backends.id == target_uuid)
         ).select().first()
+        return "ok", cur, nxt
+
+    if backends_present:
+        status, cur, nxt = await run_db(_fetch_backends)
+        if status == "invalid_target":
+            return jsonify({"error": "Invalid target_backend_id"}), 422
+        if cur is not None:
+            current_primary = _serialise_storage_backend(cur)
         if nxt is None:
             return jsonify({
                 "error": "target_not_found",
@@ -640,7 +681,11 @@ def _save_cluster_doc(cluster_id: str, key: str, value: Any) -> bool:
 @_scope_required("gough.cluster.read")
 @_require_cluster_tenant
 async def get_network_pools(cluster_id: str):
-    pools = _load_cluster_doc(cluster_id, "network_pools", _DEFAULT_NETWORK_POOLS)
+    # Regression: gh-22. Off the event loop via run_db() instead of
+    # blocking the request coroutine inline.
+    pools = await run_db(
+        lambda: _load_cluster_doc(cluster_id, "network_pools", _DEFAULT_NETWORK_POOLS)
+    )
     return jsonify({"status": "success", "data": {"cluster_id": cluster_id, "pools": pools}}), 200
 
 
@@ -661,7 +706,9 @@ async def patch_network_pools(cluster_id: str):
                     "code": "invalid_pool", "message": "Each pool needs a name",
                 }]},
             }), 422
-    saved = _save_cluster_doc(cluster_id, "network_pools", pools)
+    # Regression: gh-22. Off the event loop via run_db() instead of
+    # blocking the request coroutine inline.
+    saved = await run_db(lambda: _save_cluster_doc(cluster_id, "network_pools", pools))
     if not saved:
         return jsonify({"status": "success", "data": {"cluster_id": cluster_id, "pools": [], "note": "accepted"}}), 200
     log.info("network-pools patched cluster_id=%s actor=%s",
@@ -723,8 +770,12 @@ def _validate_baseline_topology(doc: Any) -> list[dict]:
 @_scope_required("gough.cluster.read")
 @_require_cluster_tenant
 async def get_baseline_topology(cluster_id: str):
-    doc = _load_cluster_doc(
-        cluster_id, "network_baseline_topology", _DEFAULT_BASELINE_TOPOLOGY
+    # Regression: gh-22. Off the event loop via run_db() instead of
+    # blocking the request coroutine inline.
+    doc = await run_db(
+        lambda: _load_cluster_doc(
+            cluster_id, "network_baseline_topology", _DEFAULT_BASELINE_TOPOLOGY
+        )
     )
     networks = doc.get("networks", {}) if isinstance(doc, dict) else {}
     return jsonify({"status": "success", "data": {"cluster_id": cluster_id, "networks": networks, "topology": doc}}), 200
@@ -745,8 +796,10 @@ async def patch_baseline_topology(cluster_id: str):
             "error": "validation_failed",
             "details": {"violations": violations},
         }), 422
-    saved = _save_cluster_doc(
-        cluster_id, "network_baseline_topology", topology
+    # Regression: gh-22. Off the event loop via run_db() instead of
+    # blocking the request coroutine inline.
+    saved = await run_db(
+        lambda: _save_cluster_doc(cluster_id, "network_baseline_topology", topology)
     )
     if not saved:
         return jsonify({"status": "success", "data": {"cluster_id": cluster_id, "topology": {}, "note": "accepted"}}), 200
@@ -760,8 +813,10 @@ async def patch_baseline_topology(cluster_id: str):
 @_scope_required("gough.cluster.read")
 @_require_cluster_tenant
 async def get_identity_plane(cluster_id: str):
-    doc = _load_cluster_doc(
-        cluster_id, "identity_plane", _DEFAULT_IDENTITY_PLANE
+    # Regression: gh-22. Off the event loop via run_db() instead of
+    # blocking the request coroutine inline.
+    doc = await run_db(
+        lambda: _load_cluster_doc(cluster_id, "identity_plane", _DEFAULT_IDENTITY_PLANE)
     )
     return jsonify({"status": "success", "data": {"cluster_id": cluster_id, "provider": doc.get("provider"), "identity_plane": doc}}), 200
 
@@ -786,11 +841,18 @@ async def patch_identity_plane(cluster_id: str):
                 ),
             }]},
         }), 422
-    current = _load_cluster_doc(
-        cluster_id, "identity_plane", _DEFAULT_IDENTITY_PLANE
-    )
-    merged = {**current, **body}
-    saved = _save_cluster_doc(cluster_id, "identity_plane", merged)
+    # Regression: gh-22. Current-doc read + merge + save is one unit of
+    # work -- stays in one run_db() closure per the house rule (see
+    # app/db/run_db.py).
+    def _apply() -> tuple[dict[str, Any], bool]:
+        current = _load_cluster_doc(
+            cluster_id, "identity_plane", _DEFAULT_IDENTITY_PLANE
+        )
+        merged = {**current, **body}
+        saved = _save_cluster_doc(cluster_id, "identity_plane", merged)
+        return merged, saved
+
+    merged, saved = await run_db(_apply)
     if not saved:
         return jsonify({"status": "success", "data": {"cluster_id": cluster_id, "provider": merged.get("provider"), "note": "accepted"}}), 200
     log.info("identity-plane patched cluster_id=%s actor=%s",
@@ -845,7 +907,9 @@ async def adopt_cluster(cluster_id: str):
 @_scope_required("gough.cluster.read")
 @_require_cluster_tenant
 async def get_config(cluster_id: str):
-    doc = _load_cluster_doc(cluster_id, "feature_flags", _DEFAULT_CONFIG)
+    # Regression: gh-22. Off the event loop via run_db() instead of
+    # blocking the request coroutine inline.
+    doc = await run_db(lambda: _load_cluster_doc(cluster_id, "feature_flags", _DEFAULT_CONFIG))
     return jsonify({"status": "success", "data": {"cluster_id": cluster_id, "config": doc}}), 200
 
 
@@ -918,9 +982,16 @@ async def patch_config(cluster_id: str):
                 }]},
             }), 422
 
-    current = _load_cluster_doc(cluster_id, "feature_flags", _DEFAULT_CONFIG)
-    merged = {**current, **body}
-    saved = _save_cluster_doc(cluster_id, "feature_flags", merged)
+    # Regression: gh-22. Current-doc read + merge + save is one unit of
+    # work -- stays in one run_db() closure per the house rule (see
+    # app/db/run_db.py).
+    def _apply() -> tuple[dict[str, Any], bool]:
+        current = _load_cluster_doc(cluster_id, "feature_flags", _DEFAULT_CONFIG)
+        merged = {**current, **body}
+        saved = _save_cluster_doc(cluster_id, "feature_flags", merged)
+        return merged, saved
+
+    merged, saved = await run_db(_apply)
     if not saved:
         return jsonify({"status": "success", "data": {"cluster_id": cluster_id, "config": {}, "note": "accepted"}}), 200
     log.info("config patched cluster_id=%s actor=%s fields=%s",
