@@ -15,6 +15,7 @@ from typing import Optional, Any
 from quart import Blueprint, jsonify, request
 
 from ..auth import require_auth, require_role
+from ..db.run_db import run_db
 from ..models import get_db
 from ..services.storage import (
     StorageConfig,
@@ -650,8 +651,9 @@ async def list_storage_quotas():
     if tenant_id_filter:
         query = query(db.storage_quotas.tenant_id == tenant_id_filter)
 
-    # Fetch all quotas
-    quotas_rows = query.select(orderby=~db.storage_quotas.created_at)
+    # Fetch all quotas. Regression: gh-22 -- now off the event loop via
+    # run_db() instead of blocking the request coroutine inline.
+    quotas_rows = await run_db(lambda: query.select(orderby=~db.storage_quotas.created_at))
 
     quotas = []
     for row in quotas_rows:

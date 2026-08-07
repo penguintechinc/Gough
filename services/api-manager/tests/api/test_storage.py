@@ -664,6 +664,12 @@ class TestListStorageQuotas:
 
     @pytest.mark.asyncio
     async def test_returns_quota_list(self, client):
+        """# regression: gh-22
+
+        list_storage_quotas' SELECT now runs via run_db() instead of
+        blocking the request coroutine inline -- proves the endpoint still
+        returns seeded rows correctly through that thread hop.
+        """
         row = _make_quota_row()
         db = _make_db(quota_rows=[row])
         quota_sel = MagicMock()

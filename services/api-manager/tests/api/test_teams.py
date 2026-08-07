@@ -759,7 +759,13 @@ async def test_add_member_invalid_role(teams_app):
 
 @pytest.mark.asyncio
 async def test_list_members_success(teams_app):
-    """Should list team members."""
+    """Should list team members.
+
+    # regression: gh-22
+    list_members' SELECT now runs via run_db() instead of blocking the
+    request coroutine inline -- proves it still returns seeded members
+    correctly through that thread hop.
+    """
     app, teams_mod = teams_app
     mock_db = teams_mod.get_db()
 

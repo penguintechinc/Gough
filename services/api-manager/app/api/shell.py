@@ -9,11 +9,13 @@ from __future__ import annotations
 import logging
 import uuid
 from datetime import datetime
+from typing import Any
 
 from quart import Blueprint, g, jsonify, request
 
 from ..middleware import auth_required, get_current_user, user_has_role
 from ..audit import get_audit_logger
+from ..db.run_db import run_db
 from ..models import get_db
 
 log = logging.getLogger(__name__)
@@ -232,11 +234,16 @@ async def list_sessions():
     db = get_db()
     current_user = get_current_user()
 
-    # Get user's active sessions (not ended)
-    sessions = db(
-        (db.shell_sessions.user_id == current_user["id"]) & (
-            db.shell_sessions.ended_at is None)
-    ).select(orderby=~db.shell_sessions.started_at).as_list()
+    # Get user's active sessions (not ended). Regression: gh-22 -- now off
+    # the event loop via run_db() instead of blocking the request
+    # coroutine inline.
+    def _fetch() -> Any:
+        return db(
+            (db.shell_sessions.user_id == current_user["id"]) & (
+                db.shell_sessions.ended_at is None)
+        ).select(orderby=~db.shell_sessions.started_at).as_list()
+
+    sessions = await run_db(_fetch)
 
     sessions_data = []
     for session in sessions:

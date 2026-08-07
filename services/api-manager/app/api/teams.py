@@ -12,6 +12,7 @@ from datetime import datetime
 
 from quart import Blueprint, g, jsonify, request
 
+from ..db.run_db import run_db
 from ..middleware import auth_required, get_current_user, roles_required, user_has_role
 from ..models import get_db
 
@@ -476,7 +477,9 @@ async def list_members(team_id: int):
         if not member:
             return jsonify({"error": "Access denied"}), 403
 
-    members = db(db.team_members.team_id == team_id).select().as_list()
+    # Regression: gh-22 -- now off the event loop via run_db() instead of
+    # blocking the request coroutine inline.
+    members = await run_db(lambda: db(db.team_members.team_id == team_id).select().as_list())
 
     members_data = []
     for member in members:

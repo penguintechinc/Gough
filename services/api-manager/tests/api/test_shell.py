@@ -281,7 +281,13 @@ class TestListSessions:
 
     @pytest.mark.asyncio
     async def test_list_sessions_with_sessions(self, shell_app):
-        """Test listing active sessions."""
+        """Test listing active sessions.
+
+        # regression: gh-22
+        list_sessions' SELECT now runs via run_db() instead of blocking
+        the request coroutine inline -- proves it still returns seeded
+        sessions correctly through that thread hop.
+        """
         app, _, mock_db = shell_app
 
         # Mock sessions
