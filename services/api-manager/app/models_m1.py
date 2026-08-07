@@ -1005,6 +1005,84 @@ class StorageQuotaRequest(Base):
     )
 
 
+class DeploymentLog(Base):
+    """Append-only per-deployment log stream (``GET /deployments/<id>/logs``).
+
+    SELECT-only in current code (``app.api.biomes.get_deployment_logs``); no
+    writer exists yet -- INSERT is granted for a future writer, matching the
+    approved profile.
+    """
+
+    __tablename__ = "deployment_logs"
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    deployment_id = Column(String(64), ForeignKey("deployments.id", ondelete="CASCADE"), nullable=False)
+    message = Column(Text, nullable=False)
+    level = Column(String(16), nullable=False, server_default="info")
+    created_at = Column(DateTime(timezone=True), nullable=False, server_default=func.now())
+
+    __table_args__ = (
+        Index("ix_deployment_logs_deployment_id", "deployment_id"),
+        Index("ix_deployment_logs_created_at", "created_at"),
+        {"extend_existing": True},
+    )
+
+
+class ResourcePermission(Base):
+    """Per-user, per-resource permission grant (comma-separated permission list).
+
+    Backs ``app.permissions.check_resource_permission`` -- ``permission`` is
+    intentionally a plain comma-separated String, not a JSON/array column:
+    the reader does ``permission in (perms.permission or "").split(",")``.
+    """
+
+    __tablename__ = "resource_permissions"
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    user_id = Column(Integer, ForeignKey("auth_user.id", ondelete="CASCADE"), nullable=False)
+    resource_type = Column(String(64), nullable=False)
+    resource_id = Column(Integer, nullable=False)
+    permission = Column(String(255), nullable=False)
+
+    __table_args__ = (
+        UniqueConstraint(
+            "user_id", "resource_type", "resource_id",
+            name="uq_resource_permissions_user_type_id",
+        ),
+        Index("ix_resource_permissions_user_id", "user_id"),
+        {"extend_existing": True},
+    )
+
+
+class BiomeGroup(Base):
+    """Named, ordered collection of biomes assigned to an iPXE boot config.
+
+    ``tenant_id`` is a NEW column (approved -- biomes is tenant-scoped);
+    current handlers never set it on create, so every row lands on the
+    ``server_default`` ('__default__') until a follow-up threads tenant
+    through ``app.api.biomes``'s group handlers -- with that default, RLS
+    still makes every row visible to the default tenant in the meantime,
+    which is the accepted interim behavior per the approved profile.
+    """
+
+    __tablename__ = "biome_groups"
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    tenant_id = Column(String(255), nullable=False, server_default="__default__")
+    name = Column(String(255), nullable=False, unique=True)
+    display_name = Column(String(255), nullable=False)
+    description = Column(Text, nullable=True)
+    biomes = Column(JSON, nullable=False)
+    is_default = Column(Boolean, nullable=False, server_default='false')
+    created_at = Column(DateTime(timezone=True), nullable=False, server_default=func.now())
+    updated_at = Column(DateTime(timezone=True), nullable=False, server_default=func.now())
+
+    __table_args__ = (
+        Index("ix_biome_groups_tenant_id", "tenant_id"),
+        {"extend_existing": True},
+    )
+
+
 # =============================================================================
 # Backward-compat aliases
 # =============================================================================

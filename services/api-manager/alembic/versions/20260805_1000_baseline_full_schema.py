@@ -314,6 +314,13 @@ def upgrade() -> None:
     op.execute('GRANT SELECT, INSERT, UPDATE ON cluster_config TO "api-manager-rw"')
     op.execute('GRANT SELECT, INSERT, UPDATE ON storage_quotas TO "api-manager-rw"')
     op.execute('GRANT SELECT, INSERT, UPDATE ON storage_quota_requests TO "api-manager-rw"')
+    # deployment_logs is SELECT-only in app.api.biomes.get_deployment_logs
+    # today; INSERT is granted ahead of a future writer per the approved
+    # profile, same "future writer" rationale as clusters/storage_quotas
+    # above.
+    op.execute('GRANT SELECT, INSERT ON deployment_logs TO "api-manager-rw"')
+    op.execute('GRANT SELECT, INSERT, UPDATE, DELETE ON resource_permissions TO "api-manager-rw"')
+    op.execute('GRANT SELECT, INSERT, UPDATE, DELETE ON biome_groups TO "api-manager-rw"')
 
     # gh-22 FIX 5: grant USAGE+SELECT on the PK sequence of every table each
     # role above was just given INSERT on -- see
@@ -347,6 +354,9 @@ def upgrade() -> None:
         # reason as clusters above.
         "storage_quotas",
         "storage_quota_requests",
+        "deployment_logs",
+        "resource_permissions",
+        "biome_groups",
     ]
     _grant_insert_table_sequences(bind, api_manager_insert_tables, "api-manager-rw")
 
@@ -389,13 +399,18 @@ def upgrade() -> None:
     # storage_quotas/storage_quota_requests are the PRIMARY enforcement here
     # (app.api.storage's handlers trust a caller-supplied/request-body
     # tenant_id with no cross-check of their own -- see
-    # app.models_m1.StorageQuota/StorageQuotaRequest docstrings).
+    # app.models_m1.StorageQuota/StorageQuotaRequest docstrings). biome_groups'
+    # tenant_id defaults to '__default__' (current handlers don't set it --
+    # see app.models_m1.BiomeGroup docstring), so every row is visible to the
+    # default tenant under this policy's IN (tenant_id, '__default__',
+    # '__all__') clause until a follow-up threads tenant through the handlers
+    # -- accepted interim behavior per the approved profile, not a bug here.
     rls_tables = ['nodes', 'disks', 'disk_plans', 'node_egg_assignments', 'biomes',
                   'storage_backends', 'migration_events',
                   'joiner_secrets', 'audit_events', 'dr_drills', 'slo_definitions',
                   'hardware_firmware', 'node_tags_operator', 'node_bmc',
                   'webhook_endpoints',
-                  'clusters', 'storage_quotas', 'storage_quota_requests']
+                  'clusters', 'storage_quotas', 'storage_quota_requests', 'biome_groups']
     for tbl in rls_tables:
         op.execute(f'ALTER TABLE {tbl} ENABLE ROW LEVEL SECURITY')
         op.execute(f"""
