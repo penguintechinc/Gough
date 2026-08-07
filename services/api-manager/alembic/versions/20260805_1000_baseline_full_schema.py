@@ -312,6 +312,8 @@ def upgrade() -> None:
     # see this migration's git history for the per-table commit boundaries.
     op.execute('GRANT SELECT, INSERT, UPDATE ON clusters TO "api-manager-rw"')
     op.execute('GRANT SELECT, INSERT, UPDATE ON cluster_config TO "api-manager-rw"')
+    op.execute('GRANT SELECT, INSERT, UPDATE ON storage_quotas TO "api-manager-rw"')
+    op.execute('GRANT SELECT, INSERT, UPDATE ON storage_quota_requests TO "api-manager-rw"')
 
     # gh-22 FIX 5: grant USAGE+SELECT on the PK sequence of every table each
     # role above was just given INSERT on -- see
@@ -339,6 +341,12 @@ def upgrade() -> None:
         # target that changes PK strategy gets covered automatically.
         "clusters",
         "cluster_config",
+        # storage_quotas/storage_quota_requests use a UUID-as-String PK
+        # (app-generated uuid4), so pg_get_serial_sequence returns NULL for
+        # both -- included for the same "future-proof, don't hand-pick"
+        # reason as clusters above.
+        "storage_quotas",
+        "storage_quota_requests",
     ]
     _grant_insert_table_sequences(bind, api_manager_insert_tables, "api-manager-rw")
 
@@ -378,12 +386,16 @@ def upgrade() -> None:
     # defense-in-depth layer behind app.api.clusters._require_cluster_tenant's
     # application-level check. cluster_config is intentionally NOT in this
     # list (no tenant_id column -- cluster-scoped like migration_policy).
+    # storage_quotas/storage_quota_requests are the PRIMARY enforcement here
+    # (app.api.storage's handlers trust a caller-supplied/request-body
+    # tenant_id with no cross-check of their own -- see
+    # app.models_m1.StorageQuota/StorageQuotaRequest docstrings).
     rls_tables = ['nodes', 'disks', 'disk_plans', 'node_egg_assignments', 'biomes',
                   'storage_backends', 'migration_events',
                   'joiner_secrets', 'audit_events', 'dr_drills', 'slo_definitions',
                   'hardware_firmware', 'node_tags_operator', 'node_bmc',
                   'webhook_endpoints',
-                  'clusters']
+                  'clusters', 'storage_quotas', 'storage_quota_requests']
     for tbl in rls_tables:
         op.execute(f'ALTER TABLE {tbl} ENABLE ROW LEVEL SECURITY')
         op.execute(f"""

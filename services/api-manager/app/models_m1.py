@@ -17,6 +17,7 @@ from sqlalchemy import (
     Integer,
     JSON,
     LargeBinary,
+    Numeric,
     String,
     Text,
     TypeDecorator,
@@ -942,6 +943,64 @@ class ClusterConfig(Base):
     __table_args__ = (
         UniqueConstraint("cluster_id", "key", name="uq_cluster_config_cluster_key"),
         Index("ix_cluster_config_cluster_id", "cluster_id"),
+        {"extend_existing": True},
+    )
+
+
+class StorageQuota(Base):
+    """Per-tenant storage resource quota (limit/used) -- RLS-enforced.
+
+    SECURITY (gh-21): ``app.api.storage.list_storage_quotas`` filters by a
+    USER-SUPPLIED ``tenant_id`` query parameter with no cross-check against
+    the caller's own tenant -- RLS on this table is the actual enforcement
+    boundary, not the app-level filter.
+    """
+
+    __tablename__ = "storage_quotas"
+
+    id = Column(UUID(), primary_key=True)
+    tenant_id = Column(String(255), nullable=False)
+    resource_type = Column(String(64), nullable=False)
+    limit_value = Column(Numeric, nullable=True)
+    used_value = Column(Numeric, nullable=True)
+    unit = Column(String(16), nullable=False)
+    created_at = Column(DateTime(timezone=True), nullable=False, server_default=func.now())
+    updated_at = Column(DateTime(timezone=True), nullable=False, server_default=func.now())
+
+    __table_args__ = (
+        UniqueConstraint("tenant_id", "resource_type", name="uq_storage_quotas_tenant_resource"),
+        Index("ix_storage_quotas_tenant_id", "tenant_id"),
+        Index("ix_storage_quotas_created_at", "created_at"),
+        {"extend_existing": True},
+    )
+
+
+class StorageQuotaRequest(Base):
+    """Tenant-submitted storage quota increase request (INSERT-only from the API).
+
+    SECURITY (gh-21): ``tenant_id`` comes directly from the request body --
+    RLS WITH CHECK (the generic ``tenant_isolation`` policy's USING clause
+    doubles as WITH CHECK when no separate WITH CHECK is specified) is the
+    actual enforcement that a caller can't write a request under a
+    tenant_id other than their own token's tenant; the app layer does not
+    cross-check it today.
+    """
+
+    __tablename__ = "storage_quota_requests"
+
+    id = Column(UUID(), primary_key=True)
+    tenant_id = Column(String(255), nullable=False)
+    resource_type = Column(String(64), nullable=False)
+    requested_value = Column(Numeric, nullable=False)
+    unit = Column(String(16), nullable=False)
+    justification = Column(Text, nullable=False)
+    status = Column(String(16), nullable=False, server_default="pending")
+    created_at = Column(DateTime(timezone=True), nullable=False, server_default=func.now())
+    updated_at = Column(DateTime(timezone=True), nullable=False, server_default=func.now())
+
+    __table_args__ = (
+        Index("ix_storage_quota_requests_tenant_id", "tenant_id"),
+        Index("ix_storage_quota_requests_status", "status"),
         {"extend_existing": True},
     )
 
