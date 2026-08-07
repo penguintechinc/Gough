@@ -9,7 +9,7 @@ quart-cors==0.7.0
 # Database - SQLAlchemy for schema, penguin-dal for runtime
 SQLAlchemy==2.0.36
 alembic==1.14.0
-penguin-dal==0.3.0
+penguin-dal==0.4.1
 psycopg2-binary==2.9.10
 PyMySQL==1.1.0
 

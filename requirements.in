@@ -4,7 +4,7 @@
 # Database Drivers
 psycopg2-binary==2.9.10
 redis==5.2.1
-penguin-dal==0.3.0
+penguin-dal==0.4.1
 
 # Web Server & WSGI
 gunicorn==23.0.0
