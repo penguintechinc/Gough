@@ -146,14 +146,20 @@ def _serialize_node(node: Any, *, include_hw: bool = True) -> dict[str, Any]:
 
 
 def _serialize_assignment(row: Any, *, biome: Any = None) -> dict[str, Any]:
+    """Serialise a ``node_egg_assignments`` row to the public API shape.
+
+    The physical table (gh-21) uses ``egg_id``/``depends_on_egg_instance_id``;
+    the public API contract exposes these under their pre-existing
+    ``biome_id``/``depends_on_biome_instance_id`` names.
+    """
     return {
         "id": _g(row, "id"),
         "node_id": _g(row, "node_id"),
-        "biome_id": _g(row, "biome_id"),
+        "biome_id": _g(row, "egg_id"),
         "tenant_id": _g(row, "tenant_id"),
         "phase": _g(row, "phase"),
         "status": _g(row, "status"),
-        "depends_on_biome_instance_id": _g(row, "depends_on_biome_instance_id"),
+        "depends_on_biome_instance_id": _g(row, "depends_on_egg_instance_id"),
         "readiness_probe_state": _g(row, "readiness_probe_state", "not_started"),
         "assigned_at": _iso(_g(row, "assigned_at")),
         "deployed_at": _iso(_g(row, "deployed_at")),
@@ -901,21 +907,24 @@ async def reject_node(node_id: int):
 
 
 # ---------------------------------------------------------------------------
-# Helper: backward-compat table name fallback
+# Helper: assignments table lookup
 # ---------------------------------------------------------------------------
 
 
 def _get_assignments_table(db: Any) -> tuple[Optional[Any], Optional[str]]:
-    """Return the biome assignments table and field name, trying both old and new names.
+    """Return the biome assignments table and its egg-id field name.
 
-    Returns: (table_object, field_name) where field_name is 'biome_id' for node_biome_assignments
-    or 'egg_id' for node_egg_assignments. Returns (None, None) if neither exists.
+    ``node_egg_assignments`` is the only real, baseline-created assignments
+    table (gh-21: ``node_biome_assignments`` was a phantom name that never
+    existed as a table — the two-name preference/fallback this helper used
+    to implement always resolved to ``node_egg_assignments`` in practice).
+    Still returns ``(None, None)`` — rather than letting the
+    ``TableNotFoundError`` propagate — for callers that degrade gracefully
+    when the table isn't reflected (e.g. a minimal test DB).
+
+    Returns: (table_object, field_name) where field_name is always 'egg_id'.
     """
     # penguin-dal raises TableNotFoundError on attribute access, so try-except instead
-    try:
-        return db.node_biome_assignments, "biome_id"
-    except Exception:  # noqa: BLE001 — TableNotFoundError
-        pass
     try:
         return db.node_egg_assignments, "egg_id"
     except Exception:  # noqa: BLE001 — TableNotFoundError
@@ -933,7 +942,7 @@ def _get_assignments_table(db: Any) -> tuple[Optional[Any], Optional[str]]:
 async def deploy_node(node_id: int):
     """Initiate a deployment plan for a node.
 
-    Creates ``node_biome_assignments`` rows in ``pending`` state for each
+    Creates ``node_egg_assignments`` rows in ``pending`` state for each
     supplied biome and delegates compile + execution to ``app.workers.plan_compiler``
     (if importable).  Returns 202 immediately.
 
@@ -988,10 +997,9 @@ async def deploy_node(node_id: int):
     now = datetime.now(timezone.utc)
     tenant_id = _g(node, "tenant_id", "__default__")
 
-    # Get the assignments table with fallback from node_biome_assignments → node_egg_assignments
     assign_tbl, biome_field = _get_assignments_table(db)
     if not assign_tbl:
-        return err_internal("node_biome_assignments (or node_egg_assignments) table not available")
+        return err_internal("node_egg_assignments table not available")
 
     try:
         for spec in body.biome_assignments:
@@ -1543,10 +1551,9 @@ async def assign_biome_to_node(node_id: int):
     if not biome:
         return err_not_found(f"Biome {body.biome_id} not found")
 
-    # Get the assignments table with fallback from node_biome_assignments → node_egg_assignments
     assign_tbl, biome_field = _get_assignments_table(db)
     if not assign_tbl:
-        return err_internal("node_biome_assignments (or node_egg_assignments) table not available")
+        return err_internal("node_egg_assignments table not available")
 
     existing = db(
         (assign_tbl.node_id == node_id)
@@ -1593,6 +1600,12 @@ async def assign_biome_to_node(node_id: int):
     try:
         # Map field names for backward-compat: egg_id → biome_id, depends_on_egg_instance_id → depends_on_biome_instance_id
         depends_field = "depends_on_egg_instance_id" if biome_field == "egg_id" else "depends_on_biome_instance_id"
+        # ``created_at``/``updated_at`` are NOT NULL on the real
+        # ``node_egg_assignments`` table with no server-side default (gh-21
+        # regression: this insert used to omit them entirely, which never
+        # surfaced against the phantom-table test fixtures' laxer
+        # constraints -- against real Postgres it's a NotNullViolation).
+        now = datetime.now(timezone.utc)
         insert_data = {
             "node_id": node_id,
             biome_field: body.biome_id,
@@ -1601,7 +1614,9 @@ async def assign_biome_to_node(node_id: int):
             "status": "pending",
             depends_field: body.depends_on_biome_instance_id,
             "readiness_probe_state": "not_started",
-            "assigned_at": datetime.now(timezone.utc),
+            "assigned_at": now,
+            "created_at": now,
+            "updated_at": now,
         }
         new_id = assign_tbl.insert(**insert_data)
         db.commit()
