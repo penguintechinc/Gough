@@ -270,6 +270,11 @@ async def create_app(config_class: type = Config) -> Quart:
         except Exception as e:
             readiness_state["checks"]["nats"] = f"error: {str(e)[:50]}"
 
+        # Check gRPC server (set by the _start_grpc before_serving hook; non-fatal
+        # to overall readiness -- same degrade-not-fail pattern as vault/spire/nats
+        # above -- see gh-22).
+        readiness_state["checks"]["grpc"] = app.config.get("GRPC_STATUS", "starting")
+
         status_code = 200 if readiness_state["status"] == "ready" else 503
         return readiness_state, status_code
 
@@ -349,6 +354,11 @@ async def create_app(config_class: type = Config) -> Quart:
         except Exception as e:
             readiness_state["checks"]["nats"] = f"error: {str(e)[:50]}"
 
+        # Check gRPC server (set by the _start_grpc before_serving hook; non-fatal
+        # to overall readiness -- same degrade-not-fail pattern as vault/spire/nats
+        # above -- see gh-22).
+        readiness_state["checks"]["grpc"] = app.config.get("GRPC_STATUS", "starting")
+
         status_code = 200 if readiness_state["status"] == "ready" else 503
         return readiness_state, status_code
 
@@ -358,17 +368,47 @@ async def create_app(config_class: type = Config) -> Quart:
         """Prometheus metrics endpoint."""
         return Response(generate_latest(), mimetype=CONTENT_TYPE_LATEST)
 
-    # Start gRPC server as background task alongside Quart/hypercorn (graceful degradation).
+    # Start gRPC server as background task alongside Quart/hypercorn.
+    #
+    # GRPC_ENABLED (default True) is a kill switch for environments that
+    # genuinely don't want the gRPC listener (e.g. a REST-only deployment).
+    # Failure is non-fatal to the HTTP app either way -- it's surfaced
+    # loudly (ERROR log + traceback, /ready and /readyz "grpc" check) rather
+    # than swallowed, since the previous silent-warning behavior is exactly
+    # what let a broken gRPC stack ship undetected. See gh-22.
     @app.before_serving
     async def _start_grpc() -> None:
-        """Start gRPC server (non-fatal if it fails to bind or initialize)."""
+        """Start gRPC server (non-fatal to HTTP/REST; failure degrades readiness)."""
         import asyncio
+
+        if not app.config.get("GRPC_ENABLED", True):
+            app.logger.info("gRPC server disabled via GRPC_ENABLED=false")
+            app.config["GRPC_STATUS"] = "disabled"
+            return
+
         try:
             from . import grpc_runner
-            asyncio.ensure_future(grpc_runner.serve())
-        except Exception as e:
-            app.logger.warning("gRPC server startup failed: %s", e)
-            app.logger.warning("Continuing without gRPC server (HTTP/REST only)")
+        except Exception:
+            app.logger.error(
+                "gRPC server import failed; continuing without gRPC (HTTP/REST only)",
+                exc_info=True,
+            )
+            app.config["GRPC_STATUS"] = "down: import failed"
+            return
+
+        task = asyncio.ensure_future(grpc_runner.serve())
+
+        def _on_grpc_task_done(t: "asyncio.Task[None]") -> None:
+            """Surface a background gRPC server crash instead of losing it silently."""
+            if t.cancelled():
+                return
+            exc = t.exception()
+            if exc is not None:
+                app.logger.error("gRPC server task failed", exc_info=exc)
+                app.config["GRPC_STATUS"] = f"down: {exc}"[:200]
+
+        task.add_done_callback(_on_grpc_task_done)
+        app.config["GRPC_STATUS"] = "up"
 
     # Wrap with audit middleware for request logging. Emitter requires at least one
     # sink; default to StdoutSink so the app always boots (production can configure
