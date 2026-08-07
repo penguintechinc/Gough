@@ -277,6 +277,55 @@ class TestFrontendSwitchPrimaryNodeLookup:
         assert resp.status_code == 200
         assert captured["node_ids"] == []
 
+    async def test_emits_gracious_arp_with_primary_node_ids(
+        self, pg_db: Any, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Regression: gh-22 -- the kube-vip branch of ``switch_frontend``
+        used to call ``_emit_gracious_arp(vip)`` with no ``node_ids``
+        argument at all, a guaranteed ``TypeError`` against the real
+        ``_emit_gracious_arp(vip: str, node_ids: list[int])`` signature
+        (former ``primary.py:797``).
+
+        Unlike the permissive ``async def fake_arp(*args, **kwargs)``
+        stand-ins used by the two tests above (which would silently accept
+        any call shape, including the buggy one-arg call, and never catch
+        this), this fake intentionally mirrors the real function's exact
+        two-positional-argument signature -- so a regression back to the
+        one-arg call raises the very same ``TypeError`` a real,
+        un-stubbed call would.
+        """
+        primary_a = _seed_node(pg_db, name="primary-a", state="primary")
+        primary_b = _seed_node(pg_db, name="primary-b", state="primary")
+        _seed_node(pg_db, name="worker-a", state="ready")
+
+        captured: dict[str, Any] = {}
+
+        async def fake_update_endpoint(
+            new_endpoint: str, node_ids: list[int]
+        ) -> dict[str, Any]:
+            return {"ok": True}
+
+        async def strict_fake_arp(vip: str, node_ids: list[int]) -> dict[str, Any]:
+            captured["vip"] = vip
+            captured["node_ids"] = node_ids
+            return {}
+
+        app, primary_mod = _build_app(dal_db=pg_db, monkeypatch=monkeypatch)
+        monkeypatch.setattr(
+            primary_mod, "_update_endpoint_on_nodes", fake_update_endpoint
+        )
+        monkeypatch.setattr(primary_mod, "_emit_gracious_arp", strict_fake_arp)
+
+        client = app.test_client()
+        resp = await client.post(
+            "/api/v1/primary/frontend-switch",
+            json={"target_mode": "kube-vip", "new_endpoint": "10.0.0.1:6443"},
+        )
+        body = await resp.get_data(as_text=True)
+        assert resp.status_code == 200, body
+        assert captured["vip"] == "10.0.0.1"
+        assert sorted(captured["node_ids"]) == sorted([primary_a, primary_b])
+
 
 # =============================================================================
 # _rotate_bootstrap_ca (former primary.py:916)

@@ -791,10 +791,14 @@ async def switch_frontend():
                 "message": str(e)},
         }), 500
 
-    # Emit gratuitous ARP if kube-vip
+    # Emit gratuitous ARP if kube-vip. Same primary-node set (`node_ids`,
+    # state="primary") the endpoint update just ran against above --
+    # regression: gh-22 (this used to call `_emit_gracious_arp(vip)` with no
+    # `node_ids` arg at all, a guaranteed TypeError against the real
+    # `_emit_gracious_arp(vip: str, node_ids: list[int])` signature).
     if target_mode == "kube-vip":
         vip = new_endpoint.split(":")[0] if new_endpoint else ""
-        await _emit_gracious_arp(vip)
+        await _emit_gracious_arp(vip, node_ids)
 
     # Emit audit event
     audit = current_app.extensions.get("audit")
