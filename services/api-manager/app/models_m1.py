@@ -1083,6 +1083,155 @@ class BiomeGroup(Base):
     )
 
 
+class IpxeMachine(Base):
+    """Legacy MAAS-style bare-metal machine inventory for iPXE provisioning.
+
+    Distinct from ``nodes`` (the canonical M1 inventory table) --
+    ``app.api.ipxe._find_node_or_machine_by_mac`` checks ``nodes`` first and
+    falls back to this table, so both must exist for MAC resolution to keep
+    working across the transition period. No code path inserts new rows
+    today (status/assignment updates only) -- INSERT is granted for
+    out-of-band/future writer parity, matching the approved profile.
+    """
+
+    __tablename__ = "ipxe_machines"
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    system_id = Column(String(255), nullable=False, unique=True)
+    mac_address = Column(String(32), nullable=False)
+    status = Column(String(32), nullable=False)
+    zone = Column(String(255), nullable=True)
+    pool = Column(String(255), nullable=True)
+    boot_config_id = Column(Integer, ForeignKey("ipxe_boot_configs.id", ondelete="SET NULL"), nullable=True)
+    assigned_biomes = Column(JSON, nullable=True)
+    dmi_uuid = Column(String(64), nullable=True)
+    last_seen_at = Column(DateTime(timezone=True), nullable=True)
+    deployed_at = Column(DateTime(timezone=True), nullable=True)
+    elder_synced_at = Column(DateTime(timezone=True), nullable=True)
+    created_at = Column(DateTime(timezone=True), nullable=False, server_default=func.now())
+    updated_at = Column(DateTime(timezone=True), nullable=False, server_default=func.now())
+
+    __table_args__ = (
+        Index("ix_ipxe_machines_mac_address", "mac_address"),
+        Index("ix_ipxe_machines_status", "status"),
+        Index("ix_ipxe_machines_boot_config_id", "boot_config_id"),
+        {"extend_existing": True},
+    )
+
+
+class IpxeImage(Base):
+    """Boot image catalog (kernel/initrd/squashfs) for iPXE deployment."""
+
+    __tablename__ = "ipxe_images"
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    name = Column(String(255), nullable=False, unique=True)
+    display_name = Column(String(255), nullable=False)
+    os_name = Column(String(64), nullable=False, server_default="ubuntu")
+    os_version = Column(String(64), nullable=False)
+    architecture = Column(String(32), nullable=False)
+    kernel_path = Column(String(1024), nullable=False)
+    initrd_path = Column(String(1024), nullable=False)
+    squashfs_path = Column(String(1024), nullable=True)
+    kernel_params = Column(Text, nullable=True)
+    image_type = Column(String(32), nullable=False, server_default="minimal")
+    minio_bucket = Column(String(255), nullable=True)
+    checksum = Column(String(255), nullable=True)
+    is_default = Column(Boolean, nullable=False, server_default='false')
+    is_active = Column(Boolean, nullable=False, server_default='true')
+    size_bytes = Column(BigInteger, nullable=False, server_default='0')
+    created_at = Column(DateTime(timezone=True), nullable=False, server_default=func.now())
+    updated_at = Column(DateTime(timezone=True), nullable=False, server_default=func.now())
+
+    __table_args__ = (
+        Index("ix_ipxe_images_architecture", "architecture"),
+        {"extend_existing": True},
+    )
+
+
+class IpxeBootConfig(Base):
+    """Named iPXE boot configuration (script, boot order, default image/biome-group)."""
+
+    __tablename__ = "ipxe_boot_configs"
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    name = Column(String(255), nullable=False, unique=True)
+    description = Column(Text, nullable=True)
+    ipxe_script = Column(Text, nullable=True)
+    kernel_params = Column(Text, nullable=True)
+    boot_order = Column(JSON, nullable=False)
+    timeout_seconds = Column(Integer, nullable=False, server_default='30')
+    default_image_id = Column(Integer, ForeignKey("ipxe_images.id", ondelete="SET NULL"), nullable=True)
+    assigned_biome_group_id = Column(
+        Integer, ForeignKey("biome_groups.id", ondelete="SET NULL"), nullable=True
+    )
+    is_default = Column(Boolean, nullable=False, server_default='false')
+    created_at = Column(DateTime(timezone=True), nullable=False, server_default=func.now())
+    updated_at = Column(DateTime(timezone=True), nullable=False, server_default=func.now())
+
+    __table_args__ = (
+        Index("ix_ipxe_boot_configs_default_image_id", "default_image_id"),
+        Index("ix_ipxe_boot_configs_assigned_biome_group_id", "assigned_biome_group_id"),
+        {"extend_existing": True},
+    )
+
+
+class IpxeConfig(Base):
+    """iPXE/DHCP/TFTP boot service configuration profile."""
+
+    __tablename__ = "ipxe_config"
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    name = Column(String(255), nullable=False, unique=True)
+    dhcp_mode = Column(String(32), nullable=False, server_default="proxy")
+    dhcp_interface = Column(String(255), nullable=True)
+    dhcp_subnet = Column(String(64), nullable=True)
+    dhcp_range_start = Column(String(64), nullable=True)
+    dhcp_range_end = Column(String(64), nullable=True)
+    dhcp_gateway = Column(String(64), nullable=True)
+    dns_servers = Column(JSON, nullable=True)
+    tftp_enabled = Column(Boolean, nullable=False, server_default='true')
+    http_boot_url = Column(String(1024), nullable=True)
+    minio_bucket = Column(String(255), nullable=True)
+    chain_url = Column(String(1024), nullable=True)
+    default_boot_script = Column(Text, nullable=True)
+    is_active = Column(Boolean, nullable=False, server_default='true')
+    created_at = Column(DateTime(timezone=True), nullable=False, server_default=func.now())
+    updated_at = Column(DateTime(timezone=True), nullable=False, server_default=func.now())
+
+    __table_args__ = (
+        Index("ix_ipxe_config_is_active", "is_active"),
+        {"extend_existing": True},
+    )
+
+
+class BootEvent(Base):
+    """Append-only iPXE/PXE boot event log (discovery, TFTP, boot-start, deploy-complete).
+
+    INSERT-only from ``app.api.ipxe._log_boot_event``. ``machine_id`` is
+    nullable -- discovery events fire before a machine is registered.
+    """
+
+    __tablename__ = "boot_events"
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    machine_id = Column(Integer, ForeignKey("ipxe_machines.id", ondelete="SET NULL"), nullable=True)
+    mac_address = Column(String(32), nullable=False)
+    ip_address = Column(String(64), nullable=True)
+    event_type = Column(String(32), nullable=False)
+    details = Column(JSON, nullable=False)
+    status = Column(String(64), nullable=True)
+    created_at = Column(DateTime(timezone=True), nullable=False, server_default=func.now())
+
+    __table_args__ = (
+        Index("ix_boot_events_machine_id", "machine_id"),
+        Index("ix_boot_events_mac_address", "mac_address"),
+        Index("ix_boot_events_event_type", "event_type"),
+        Index("ix_boot_events_created_at", "created_at"),
+        {"extend_existing": True},
+    )
+
+
 # =============================================================================
 # Backward-compat aliases
 # =============================================================================

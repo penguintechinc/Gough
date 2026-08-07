@@ -321,6 +321,15 @@ def upgrade() -> None:
     op.execute('GRANT SELECT, INSERT ON deployment_logs TO "api-manager-rw"')
     op.execute('GRANT SELECT, INSERT, UPDATE, DELETE ON resource_permissions TO "api-manager-rw"')
     op.execute('GRANT SELECT, INSERT, UPDATE, DELETE ON biome_groups TO "api-manager-rw"')
+    op.execute('GRANT SELECT, INSERT, UPDATE, DELETE ON ipxe_machines TO "api-manager-rw"')
+    op.execute('GRANT SELECT, INSERT, UPDATE, DELETE ON ipxe_images TO "api-manager-rw"')
+    op.execute('GRANT SELECT, INSERT, UPDATE, DELETE ON ipxe_boot_configs TO "api-manager-rw"')
+    op.execute('GRANT SELECT, INSERT, UPDATE ON ipxe_config TO "api-manager-rw"')
+    # boot_events is an append-only log written by app.api.ipxe._log_boot_event
+    # -- no UPDATE/DELETE anywhere in the codebase. Only api-manager-rw writes
+    # it today (no worker-ipxe code path touches boot_events), so unlike
+    # audit_events there is no matching worker-ipxe-rw INSERT grant here.
+    op.execute('GRANT SELECT, INSERT ON boot_events TO "api-manager-rw"')
 
     # gh-22 FIX 5: grant USAGE+SELECT on the PK sequence of every table each
     # role above was just given INSERT on -- see
@@ -357,6 +366,11 @@ def upgrade() -> None:
         "deployment_logs",
         "resource_permissions",
         "biome_groups",
+        "ipxe_machines",
+        "ipxe_images",
+        "ipxe_boot_configs",
+        "ipxe_config",
+        "boot_events",
     ]
     _grant_insert_table_sequences(bind, api_manager_insert_tables, "api-manager-rw")
 
