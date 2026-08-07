@@ -490,3 +490,130 @@ class TestInsertGenesisRow:
         assert (
             len(rows) == 1
         ), "genesis row must be visible under the cross-tenant sentinel"
+
+
+class TestAuditEventWriterCrossTenantForkPrevention:
+    """Regression: gh-22 -- ``AuditEventWriter.append()`` must always link a
+    new event to the TRUE global chain head, even when called while a
+    caller's own single-tenant RLS GUC is active (not the cross-tenant
+    sentinel) -- exactly the situation ``export_audit_log``'s self-audit
+    write and ``revoke_joiner_secret``'s hit in production, since neither
+    wraps its ``append()`` call in the sentinel itself.
+
+    Uses ``pg_db_scoped`` (the actual ``api-manager-rw`` role RLS is
+    enforced against), same as ``TestInsertGenesisRow`` above -- ``pg_db``
+    (table owner) is RLS-exempt, so the chain-head SELECT would see every
+    row regardless of GUC scope and the fork this test guards against could
+    never manifest under that fixture.
+    """
+
+    def test_append_under_different_tenant_guc_links_to_true_global_head(
+        self, pg_db_scoped: DB
+    ) -> None:
+        """Seed tenant A's event, then append as tenant B (tenant B's GUC
+        active at call time) -- the new event must link to tenant A's event
+        (the true global head), never fork to ``ZERO_HASH``.
+        """
+        install_rls_events(pg_db_scoped.engine)
+        writer = AuditEventWriter(pg_db_scoped, "test-cluster")
+
+        set_current_tenant("tenant-a")
+        try:
+            tenant_a_event = writer.append(
+                actor_sub="a@example.com",
+                action="create",
+                resource_kind="resource",
+                tenant_id="tenant-a",
+            )
+        finally:
+            set_current_tenant(None)
+
+        # Negative control -- proves this test is actually sensitive to the
+        # fix. Under tenant B's own GUC (no cross-tenant scope), a plain
+        # SELECT genuinely cannot see tenant A's row. Pre-fix, append()'s
+        # internal chain-head SELECT hit exactly this same fail-closed wall
+        # while running under the caller's own per-tenant GUC -- silently
+        # computing prev_hash=ZERO_HASH instead of linking to tenant A's
+        # event, forking the chain.
+        set_current_tenant("tenant-b")
+        try:
+            invisible = _rows(
+                pg_db_scoped.executesql(
+                    "SELECT id FROM audit_events WHERE id = %(id)s",
+                    {"id": str(tenant_a_event.id)},
+                )
+            )
+        finally:
+            set_current_tenant(None)
+        assert invisible == [], (
+            "test setup invalid: tenant A's row must be invisible under "
+            "tenant B's own GUC for this to be a meaningful regression test"
+        )
+
+        # The actual regression check: append() runs *while* tenant B's GUC
+        # is active -- mirroring export_audit_log/revoke_joiner_secret
+        # calling append() from inside their own request-scoped tenant GUC.
+        set_current_tenant("tenant-b")
+        try:
+            tenant_b_event = writer.append(
+                actor_sub="b@example.com",
+                action="create",
+                resource_kind="resource",
+                tenant_id="tenant-b",
+            )
+        finally:
+            set_current_tenant(None)
+
+        assert tenant_b_event.prev_hash == tenant_a_event.hash, (
+            "chain forked: tenant B's append() did not link to tenant A's "
+            "event as the true global chain head"
+        )
+        # The RLS *visibility* scope changing must never leak into the
+        # row's own tenant_id *column* -- it must still be the caller's
+        # real tenant.
+        assert tenant_b_event.tenant_id == "tenant-b"
+
+        # Confirm via a fresh cross-tenant read (not just the returned
+        # object) that both rows genuinely landed this way, scoped to just
+        # these two ids so leftover rows from other pg_db_scoped-based
+        # tests in this session (which never truncates) can't skew the
+        # assertion.
+        set_current_tenant(CROSS_TENANT_SENTINEL)
+        try:
+            rows = _rows(
+                pg_db_scoped.executesql(
+                    "SELECT id, tenant_id, prev_hash, hash FROM audit_events "
+                    "WHERE id IN (%(a)s, %(b)s) ORDER BY ts ASC, id ASC",
+                    {"a": str(tenant_a_event.id), "b": str(tenant_b_event.id)},
+                )
+            )
+        finally:
+            set_current_tenant(None)
+        assert len(rows) == 2
+        assert rows[0][1] == "tenant-a"
+        assert rows[1][1] == "tenant-b"
+        assert bytes(rows[1][2]) == bytes(
+            rows[0][3]
+        ), "tenant B's prev_hash must equal tenant A's hash"
+
+    def test_append_restores_previous_tenant_guc_after_returning(
+        self, pg_db_scoped: DB
+    ) -> None:
+        """The self-applied cross-tenant scope must not leak past the call
+        -- same try/finally restore contract as every other
+        ``_cross_tenant_scope()`` use in this codebase.
+        """
+        install_rls_events(pg_db_scoped.engine)
+        writer = AuditEventWriter(pg_db_scoped, "test-cluster")
+
+        set_current_tenant("tenant-a")
+        try:
+            writer.append(
+                actor_sub="a@example.com",
+                action="create",
+                resource_kind="resource",
+                tenant_id="tenant-a",
+            )
+            assert get_current_tenant() == "tenant-a"
+        finally:
+            set_current_tenant(None)

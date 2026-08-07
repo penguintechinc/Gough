@@ -45,6 +45,62 @@ branch_labels = None
 depends_on = None
 
 
+def _grant_insert_table_sequences(
+    bind: sa.engine.Connection, tables: list[str], role: str
+) -> None:
+    """Grant USAGE + SELECT on every SERIAL/IDENTITY sequence backing a
+    column of each table in ``tables``, for ``role`` (gh-22, FIX 5).
+
+    Postgres-only (see the ``dialect != 'postgresql'`` guard around this
+    function's only call site) -- MariaDB's ``AUTO_INCREMENT`` has no
+    sequence object to grant on at all, so this concept doesn't apply
+    there.
+
+    Why this exists: ``GRANT ... ON <table> TO <role>`` does NOT include
+    privileges on the sequence backing that table's autoincrement column.
+    Without ``USAGE`` on the sequence, every INSERT relying on the
+    column's ``nextval(...)`` DEFAULT fails with "permission denied for
+    sequence <name>" even when the table grant is otherwise perfectly
+    correct -- discovered via ``node_events`` (gh-22 FIX 4), then found to
+    apply identically to every other SERIAL-PK table this role can INSERT
+    into (``nodes`` reproduces the same failure). ``SELECT`` is additionally
+    required because penguin-dal's ``insert()`` compiles to SQLAlchemy's
+    ``INSERT ... RETURNING``, and Postgres requires SELECT privilege on any
+    column named in a RETURNING clause -- including the sequence-backed PK
+    column being returned.
+
+    Derived dynamically per table/column via ``pg_get_serial_sequence``
+    rather than a hand-maintained table-type list -- roughly half of this
+    role's INSERT-granted tables use a UUID or string PK with no sequence
+    at all (``joiner_secrets``, ``audit_events``, ``storage_backends``,
+    ``migration_events``, ``migration_policy``, ``dr_drills``) or a
+    composite/FK-derived PK with no *owned* sequence (``node_bmc``,
+    ``leader_leases``) -- ``pg_get_serial_sequence`` returns NULL for all
+    of those and they're silently skipped, exactly the "no sequence" case
+    this must handle gracefully. Least-privilege: only sequences backing
+    tables this specific role actually has INSERT on, nothing broader.
+    """
+    for tbl in tables:
+        columns = (
+            bind.execute(
+                sa.text(
+                    "SELECT column_name FROM information_schema.columns "
+                    "WHERE table_schema = 'public' AND table_name = :tbl"
+                ),
+                {"tbl": tbl},
+            )
+            .scalars()
+            .all()
+        )
+        for col in columns:
+            seq = bind.execute(
+                sa.text("SELECT pg_get_serial_sequence(:tbl, :col)"),
+                {"tbl": tbl, "col": col},
+            ).scalar()
+            if seq:
+                op.execute(f'GRANT USAGE, SELECT ON SEQUENCE {seq} TO "{role}"')
+
+
 def upgrade() -> None:
     """Build the full schema from ORM models, plus modelless tables/views/roles/RLS."""
     # Widen alembic_version.version_num up front. Alembic hardcodes this
@@ -231,12 +287,49 @@ def upgrade() -> None:
     # future writers will need, and there's no reason this role should be
     # missing the one DML verb the m1_tables loop grants everyone else.
     op.execute('GRANT SELECT, INSERT, UPDATE, DELETE ON webhook_endpoints TO "api-manager-rw"')
+    # node_events (app.models_m1.NodeEvent) -- same gap class as
+    # webhook_endpoints/audit_events above: left out of the m1_tables list
+    # entirely (gh-22), so "api-manager-rw" had no grant on it at all. The
+    # only writer today is app.api.nodes' POST /nodes/{id}/events handler
+    # (``db.node_events.insert(**row_data)``); no reader exists in app/ yet.
+    # SELECT is required in addition to INSERT even though nothing SELECTs
+    # the table directly: penguin-dal's insert() runs SQLAlchemy's
+    # ``INSERT ... RETURNING`` to get the new row's id back, and Postgres
+    # requires SELECT privilege on any column named in a RETURNING clause,
+    # not just INSERT. No UPDATE/DELETE grant -- neither is used anywhere.
+    op.execute('GRANT SELECT, INSERT ON node_events TO "api-manager-rw"')
+
+    # gh-22 FIX 5: grant USAGE+SELECT on the PK sequence of every table each
+    # role above was just given INSERT on -- see
+    # ``_grant_insert_table_sequences``'s docstring for the full rationale
+    # (this closes the class of bug node_events' own sequence grant,
+    # FIX 4, was a single instance of).
+    #
+    # Every role this migration creates was checked for INSERT grants, not
+    # just api-manager-rw: "webui-ro" and "audit-reader" are read-only
+    # (SELECT-only, see below) and "migration-runner" only has database-
+    # level ``GRANT ALL ON DATABASE`` (schema/DDL ownership, not a
+    # table-level INSERT grant) -- neither needs sequence grants. Only
+    # api-manager-rw and worker-ipxe-rw actually hold table-level INSERT
+    # grants; both are covered here.
+    api_manager_insert_tables = m1_tables + [
+        "audit_events",
+        "webhook_endpoints",
+        "node_events",
+    ]
+    _grant_insert_table_sequences(bind, api_manager_insert_tables, "api-manager-rw")
 
     op.execute('GRANT SELECT ON nodes TO "worker-ipxe-rw"')
     op.execute('GRANT SELECT ON node_egg_assignments TO "worker-ipxe-rw"')
     op.execute('GRANT SELECT ON biomes TO "worker-ipxe-rw"')
     op.execute('GRANT SELECT ON spiffe_trust_entries TO "worker-ipxe-rw"')
     op.execute('GRANT INSERT ON audit_events TO "worker-ipxe-rw"')
+    # worker-ipxe-rw's only INSERT grant is audit_events, whose PK is a
+    # UUID (app-generated UUIDv7, no sequence) -- pg_get_serial_sequence
+    # returns NULL and this is a deliberate no-op, not a gap. Called anyway
+    # (rather than hardcoding "skip this role") so a future INSERT grant
+    # added to this role for a SERIAL-PK table gets covered automatically.
+    _grant_insert_table_sequences(bind, ["audit_events"], "worker-ipxe-rw")
 
     op.execute('GRANT SELECT ON v_nodes_public TO "webui-ro"')
     op.execute('GRANT SELECT ON v_eggs_public TO "webui-ro"')
@@ -271,16 +364,27 @@ def upgrade() -> None:
         """)
 
     # node_events has its own bespoke RLS policy (distinct name and USING
-    # clause, allowing a '__super__' override), carried over from
-    # 20260429_0900_node_events -- it was intentionally never part of the
-    # generic rls_tables loop above.
+    # clause), carried over from 20260429_0900_node_events -- it was
+    # intentionally never part of the generic rls_tables loop above.
+    #
+    # FIX (gh-22): the cross-tenant override sentinel here now matches the
+    # app-wide one (app.db.rls.CROSS_TENANT_SENTINEL == '__all__'). The
+    # original carried-over policy checked for '__super__' instead, which
+    # nothing in the codebase ever sets -- app.db.rls.set_current_tenant()
+    # only ever pushes a real tenant id or CROSS_TENANT_SENTINEL
+    # ('__all__'), so a cross-tenant/super-admin caller got zero bypass on
+    # this table specifically while getting one on every other RLS-enabled
+    # table via the generic tenant_isolation policy above. Editing the
+    # baseline in place is correct here -- Gough has never gone to
+    # production, this migration has never applied against a real database
+    # (see module docstring).
     op.execute('ALTER TABLE node_events ENABLE ROW LEVEL SECURITY')
     op.execute("""
         CREATE POLICY node_events_tenant_isolation
           ON node_events
           USING (
             tenant_id = current_setting('app.current_tenant', true)
-            OR current_setting('app.current_tenant', true) = '__super__'
+            OR current_setting('app.current_tenant', true) = '__all__'
           )
     """)
 
