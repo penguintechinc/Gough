@@ -16,7 +16,19 @@ The table schema (``app.models_m1.LeaderLease``):
     version     INTEGER NOT NULL DEFAULT 0
 
 Atomic acquisition uses a CAS update guarded by ``version`` so two callers
-racing on an expired lease cannot both succeed.
+racing on an expired lease cannot both succeed. Every statement below is its
+own autocommitted ``db.executesql()`` call (no ``db.transaction()`` wrapping)
+-- unlike the advisory-lock + hash-chain units in ``audit_chain_writer.py`` /
+``audit_chain.py``, this primitive doesn't need a shared pinned connection
+across statements. The CAS is enforced by Postgres itself at the row level
+during each ``UPDATE ... WHERE version = :old_version`` (a lost race simply
+returns ``rowcount == 0``), and the INSERT race is caught via the
+``lease_name`` primary key uniqueness constraint -- both are safe to split
+across independent autocommitted round-trips.
+
+``leader_leases`` carries no RLS policy (it's cluster-wide coordination
+state, not tenant data -- confirmed absent from the baseline migration's
+``rls_tables`` list), so no tenant/RLS scoping is required here.
 
 This module is fully synchronous; callers running in async loops should call
 through ``asyncio.to_thread()`` (the audit_chain_writer worker does this).
@@ -31,9 +43,9 @@ import time
 import uuid
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
-from typing import Any, Optional
+from typing import Any, Callable, Optional, cast
 
-from sqlalchemy import text
+from penguin_dal import DB
 
 logger = logging.getLogger(__name__)
 
@@ -77,25 +89,8 @@ def _now() -> datetime:
     return datetime.now(timezone.utc)
 
 
-def _row_to_dict(row: Any) -> dict[str, Any]:
-    """Convert a SQLAlchemy Row to a plain dict (mapping access)."""
-
-    if row is None:
-        return {}
-    if hasattr(row, "_mapping"):
-        return dict(row._mapping)
-    # Fallback for tuples
-    return {
-        "lease_name": row[0],
-        "holder_id": row[1],
-        "acquired_at": row[2],
-        "expires_at": row[3],
-        "version": row[4],
-    }
-
-
 def acquire(
-    db_session: Any,
+    db: DB,
     lease_name: str,
     ttl_seconds: int = DEFAULT_TTL_SECONDS,
     holder_id: Optional[str] = None,
@@ -104,10 +99,8 @@ def acquire(
 
     Acquisition succeeds when the row is missing, the holder is null, the
     current holder is us, or the lease has expired. The update is guarded by
-    ``version`` (optimistic CAS).
-
-    The caller owns committing the transaction; we use ``flush`` so the row
-    is materialised before we read back ``version``.
+    ``version`` (optimistic CAS) -- see module docstring for why no explicit
+    transaction is needed to make this safe under concurrent callers.
     """
 
     if ttl_seconds <= 0:
@@ -117,27 +110,26 @@ def acquire(
     now = _now()
     new_expires = now + timedelta(seconds=ttl_seconds)
 
-    # Ensure row exists. UPSERT — Postgres dialect prefers ON CONFLICT, but
-    # SQLite (used in unit tests via mocks) does not need it. We do a simple
-    # INSERT-or-ignore via SELECT first so we work on both.
-    existing_row = db_session.execute(
-        text(
-            "SELECT lease_name, holder_id, acquired_at, expires_at, version "
-            "FROM leader_leases WHERE lease_name = :name"
-        ),
-        {"name": lease_name},
-    ).first()
+    select_sql = (
+        "SELECT lease_name, holder_id, acquired_at, expires_at, version "
+        "FROM leader_leases WHERE lease_name = %(name)s"
+    )
+
+    existing_rows = cast(
+        "list[dict[str, Any]]",
+        db.executesql(select_sql, {"name": lease_name}, as_dict=True),
+    )
+    existing_row: Optional[dict[str, Any]] = existing_rows[0] if existing_rows else None
 
     if existing_row is None:
         # Race-safe insert: another writer may insert between SELECT and INSERT,
-        # in which case the INSERT will fail — we catch and fall through to update.
+        # in which case the INSERT will fail (lease_name PRIMARY KEY) -- we
+        # catch and fall through to the CAS update below.
         try:
-            db_session.execute(
-                text(
-                    "INSERT INTO leader_leases "
-                    "(lease_name, holder_id, acquired_at, expires_at, version) "
-                    "VALUES (:name, :holder, :acquired, :expires, 1)"
-                ),
+            db.executesql(
+                "INSERT INTO leader_leases "
+                "(lease_name, holder_id, acquired_at, expires_at, version) "
+                "VALUES (%(name)s, %(holder)s, %(acquired)s, %(expires)s, 1)",
                 {
                     "name": lease_name,
                     "holder": holder,
@@ -153,22 +145,23 @@ def acquire(
                 expires_at=new_expires,
                 version=1,
             )
-        except Exception as exc:  # noqa: BLE001 — SQLAlchemy IntegrityError, etc.
-            logger.debug("Lease %s insert race lost: %s — falling through to UPDATE", lease_name, exc)
-            existing_row = db_session.execute(
-                text(
-                    "SELECT lease_name, holder_id, acquired_at, expires_at, version "
-                    "FROM leader_leases WHERE lease_name = :name"
-                ),
-                {"name": lease_name},
-            ).first()
+        except Exception as exc:  # noqa: BLE001 — IntegrityError on the PK, etc.
+            logger.debug(
+                "Lease %s insert race lost: %s — falling through to UPDATE",
+                lease_name,
+                exc,
+            )
+            fallback_rows = cast(
+                "list[dict[str, Any]]",
+                db.executesql(select_sql, {"name": lease_name}, as_dict=True),
+            )
+            existing_row = fallback_rows[0] if fallback_rows else None
             if existing_row is None:
                 return None
 
-    row = _row_to_dict(existing_row)
-    current_holder = row.get("holder_id")
-    expires_at = row.get("expires_at")
-    current_version = row.get("version") or 0
+    current_holder = existing_row.get("holder_id")
+    expires_at = existing_row.get("expires_at")
+    current_version = existing_row.get("version") or 0
 
     is_expired = expires_at is None or expires_at <= now
     is_unowned = not current_holder
@@ -179,24 +172,25 @@ def acquire(
 
     # CAS update — bump version; only succeed if version unchanged.
     new_version = current_version + 1
-    result = db_session.execute(
-        text(
-            "UPDATE leader_leases SET holder_id = :holder, acquired_at = :acquired, "
-            "expires_at = :expires, version = :new_version "
-            "WHERE lease_name = :name AND version = :old_version"
+    rowcount = cast(
+        int,
+        db.executesql(
+            "UPDATE leader_leases SET holder_id = %(holder)s, acquired_at = %(acquired)s, "
+            "expires_at = %(expires)s, version = %(new_version)s "
+            "WHERE lease_name = %(name)s AND version = %(old_version)s",
+            {
+                "holder": holder,
+                "acquired": now,
+                "expires": new_expires,
+                "new_version": new_version,
+                "name": lease_name,
+                "old_version": current_version,
+            },
+            return_rowcount=True,
         ),
-        {
-            "holder": holder,
-            "acquired": now,
-            "expires": new_expires,
-            "new_version": new_version,
-            "name": lease_name,
-            "old_version": current_version,
-        },
     )
 
-    rowcount = getattr(result, "rowcount", None)
-    if rowcount in (None, 0):
+    if not rowcount:
         # CAS lost — somebody else acquired between our SELECT and UPDATE.
         return None
 
@@ -210,7 +204,7 @@ def acquire(
     )
 
 
-def renew(db_session: Any, handle: LeaderLeaseHandle) -> LeaderLeaseHandle:
+def renew(db: DB, handle: LeaderLeaseHandle) -> LeaderLeaseHandle:
     """Extend the handle's expiry by ttl_seconds. Raises :class:`LeaseLostError`
     if we no longer hold the lease (another holder, or row deleted).
 
@@ -221,22 +215,23 @@ def renew(db_session: Any, handle: LeaderLeaseHandle) -> LeaderLeaseHandle:
     new_expires = now + timedelta(seconds=handle.ttl_seconds)
     new_version = handle.version + 1
 
-    result = db_session.execute(
-        text(
-            "UPDATE leader_leases SET expires_at = :expires, version = :new_version "
-            "WHERE lease_name = :name AND holder_id = :holder AND version = :old_version"
+    rowcount = cast(
+        int,
+        db.executesql(
+            "UPDATE leader_leases SET expires_at = %(expires)s, version = %(new_version)s "
+            "WHERE lease_name = %(name)s AND holder_id = %(holder)s AND version = %(old_version)s",
+            {
+                "expires": new_expires,
+                "new_version": new_version,
+                "name": handle.lease_name,
+                "holder": handle.holder_id,
+                "old_version": handle.version,
+            },
+            return_rowcount=True,
         ),
-        {
-            "expires": new_expires,
-            "new_version": new_version,
-            "name": handle.lease_name,
-            "holder": handle.holder_id,
-            "old_version": handle.version,
-        },
     )
 
-    rowcount = getattr(result, "rowcount", None)
-    if rowcount in (None, 0):
+    if not rowcount:
         raise LeaseLostError(
             f"Lease {handle.lease_name!r} renewal failed — held by another or version drifted"
         )
@@ -252,49 +247,48 @@ def renew(db_session: Any, handle: LeaderLeaseHandle) -> LeaderLeaseHandle:
     )
 
 
-def release(db_session: Any, handle: LeaderLeaseHandle) -> bool:
+def release(db: DB, handle: LeaderLeaseHandle) -> bool:
     """Release the lease by clearing the holder. Returns ``True`` on success,
     ``False`` if we no longer held it (already-stolen lease).
     """
 
-    result = db_session.execute(
-        text(
-            "UPDATE leader_leases SET holder_id = NULL, expires_at = :now, "
+    rowcount = cast(
+        int,
+        db.executesql(
+            "UPDATE leader_leases SET holder_id = NULL, expires_at = %(now)s, "
             "version = version + 1 "
-            "WHERE lease_name = :name AND holder_id = :holder AND version = :old_version"
+            "WHERE lease_name = %(name)s AND holder_id = %(holder)s AND version = %(old_version)s",
+            {
+                "now": _now(),
+                "name": handle.lease_name,
+                "holder": handle.holder_id,
+                "old_version": handle.version,
+            },
+            return_rowcount=True,
         ),
-        {
-            "now": _now(),
-            "name": handle.lease_name,
-            "holder": handle.holder_id,
-            "old_version": handle.version,
-        },
     )
 
-    rowcount = getattr(result, "rowcount", None)
     return bool(rowcount)
 
 
-def is_leader(db_session: Any, handle: LeaderLeaseHandle) -> bool:
+def is_leader(db: DB, handle: LeaderLeaseHandle) -> bool:
     """Return whether the handle still represents the live leader for the lease.
 
     Used by leader-only workers to short-circuit before touching shared state.
     """
 
-    row = db_session.execute(
-        text(
+    rows = cast(
+        "list[dict[str, Any]]",
+        db.executesql(
             "SELECT holder_id, expires_at, version FROM leader_leases "
-            "WHERE lease_name = :name"
+            "WHERE lease_name = %(name)s",
+            {"name": handle.lease_name},
+            as_dict=True,
         ),
-        {"name": handle.lease_name},
-    ).first()
-
-    if row is None:
+    )
+    if not rows:
         return False
-
-    data = _row_to_dict(row) if hasattr(row, "_mapping") else {
-        "holder_id": row[0], "expires_at": row[1], "version": row[2],
-    }
+    data = rows[0]
 
     if data.get("holder_id") != handle.holder_id:
         return False
@@ -304,11 +298,11 @@ def is_leader(db_session: Any, handle: LeaderLeaseHandle) -> bool:
     expires_at = data.get("expires_at")
     if expires_at is None:
         return False
-    return expires_at > _now()
+    return bool(expires_at > _now())
 
 
 def wait_for_leader(
-    db_session_factory: Any,
+    db_factory: Callable[[], DB],
     lease_name: str,
     ttl_seconds: int = DEFAULT_TTL_SECONDS,
     poll_interval_seconds: float = 15.0,
@@ -317,8 +311,10 @@ def wait_for_leader(
 ) -> LeaderLeaseHandle:
     """Block-and-poll until we successfully acquire the lease.
 
-    ``db_session_factory`` is a zero-arg callable returning a fresh session
-    (so the polling loop doesn't accumulate transaction state across attempts).
+    ``db_factory`` is a zero-arg callable returning a fresh penguin-dal
+    :class:`DB` (so the polling loop doesn't accumulate connection-pool state
+    across attempts). Each attempt's ``DB`` is closed in ``finally``,
+    including on the final successful attempt.
 
     Mostly used in tests / single-leader daemons. The audit_chain_writer
     background loop uses :func:`acquire` directly with its own backoff.
@@ -327,20 +323,13 @@ def wait_for_leader(
     attempts = 0
     holder = holder_id or _default_holder_id()
     while True:
-        session = db_session_factory()
+        db = db_factory()
         try:
-            handle = acquire(session, lease_name, ttl_seconds=ttl_seconds, holder_id=holder)
-            if hasattr(session, "commit"):
-                session.commit()
+            handle = acquire(db, lease_name, ttl_seconds=ttl_seconds, holder_id=holder)
             if handle is not None:
                 return handle
-        except Exception:
-            if hasattr(session, "rollback"):
-                session.rollback()
-            raise
         finally:
-            if hasattr(session, "close"):
-                session.close()
+            db.close()
 
         attempts += 1
         if max_attempts is not None and attempts >= max_attempts:

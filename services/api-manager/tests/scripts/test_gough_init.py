@@ -129,16 +129,35 @@ def test_alembic_failure_exits_5():
 
 
 def test_genesis_row_failure_exits_6(mock_db_session):
-    """Genesis audit row insert failure exits 6."""
+    """Genesis audit row insert failure exits 6.
+
+    Patches ``scripts.gough_init.insert_genesis_row`` (where it's called),
+    not ``app.security.audit_chain.insert_genesis_row`` (where it's
+    defined) -- ``scripts/gough_init.py`` does ``from
+    app.security.audit_chain import insert_genesis_row``, a name binding
+    local to ``scripts.gough_init``'s own module namespace that patching
+    the source module's attribute never touches (standard "patch where it's
+    used" mocking pitfall). The old patch target incidentally still made
+    this test pass, but only because it fell through to the REAL
+    ``insert_genesis_row`` running against a bare ``MagicMock`` session,
+    which raised a Pydantic validation error for an unrelated reason (a
+    ``MagicMock`` isn't valid ``bytes`` for ``AuditEvent.hash``) -- not
+    because of the ``side_effect`` this test sets up. Task 8a's
+    ``_as_bytes32`` normalization no longer raises there (it now
+    defensively falls back to ``ZERO_HASH`` for a non-bytes hash column,
+    correctly matching what real Postgres always returns), which is what
+    surfaced this pre-existing wrong-target patch.
+    """
     from unittest.mock import patch
     from scripts.gough_init import insert_genesis_audit_row
 
-    with patch("app.security.audit_chain.insert_genesis_row") as mock_insert:
+    with patch("scripts.gough_init.insert_genesis_row") as mock_insert:
         mock_insert.side_effect = Exception("DB error")
 
         with pytest.raises(SystemExit) as exc_info:
             insert_genesis_audit_row(mock_db_session, "test-cluster")
         assert exc_info.value.code == 6
+        mock_insert.assert_called_once_with(mock_db_session, "test-cluster")
 
 
 def test_vault_transit_failure_exits_7(mock_vault_client):
@@ -336,16 +355,35 @@ def test_main_returns_zero_on_success(tmp_path):
 
     with patch("scripts.gough_init.detect_host_context", return_value="bare-metal"):
         with patch("scripts.gough_init.check_preexisting_state", return_value=False):
-            with patch("scripts.gough_init.detect_or_generate_cluster_id", return_value="test"):
+            with patch(
+                "scripts.gough_init.detect_or_generate_cluster_id", return_value="test"
+            ):
                 with patch("scripts.gough_init.install_lxd_snap"):
                     with patch("scripts.gough_init.init_lxd_cluster"):
-                        with patch("scripts.gough_init.generate_lxd_password", return_value="p" * 128):
+                        with patch(
+                            "scripts.gough_init.generate_lxd_password",
+                            return_value="p" * 128,
+                        ):
                             with patch("scripts.gough_init.set_lxd_password"):
-                                with patch("scripts.gough_init.VaultClient", MagicMock()):
-                                    with patch("scripts.gough_init.bootstrap_vault", return_value=2):
-                                        with patch("scripts.gough_init.bootstrap_spire", return_value=5):
-                                            with patch("scripts.gough_init.persist_cluster_json"):
-                                                with patch("scripts.gough_init.print_summary"):
-                                                    with patch("sys.argv", ["gough_init.py"]):
+                                with patch(
+                                    "scripts.gough_init.VaultClient", MagicMock()
+                                ):
+                                    with patch(
+                                        "scripts.gough_init.bootstrap_vault",
+                                        return_value=2,
+                                    ):
+                                        with patch(
+                                            "scripts.gough_init.bootstrap_spire",
+                                            return_value=5,
+                                        ):
+                                            with patch(
+                                                "scripts.gough_init.persist_cluster_json"
+                                            ):
+                                                with patch(
+                                                    "scripts.gough_init.print_summary"
+                                                ):
+                                                    with patch(
+                                                        "sys.argv", ["gough_init.py"]
+                                                    ):
                                                         result = main()
                                                         assert result == 0

@@ -6,7 +6,7 @@ Focus on unit-testable functions without complex Quart context requirements.
 from __future__ import annotations
 
 import time
-from unittest.mock import MagicMock, patch
+from unittest.mock import patch
 
 import jwt as pyjwt
 import pytest
@@ -413,36 +413,6 @@ class TestTenantExtraction:
 
         with pytest.raises(TenantMismatchError):
             assert_tenant_match("tenant-1", "tenant-2")
-
-    def test_set_tenant_guc_parameterized(self):
-        """set_tenant_guc uses parameterized query."""
-        from app.security.tenant import set_tenant_guc
-
-        mock_conn = MagicMock()
-        set_tenant_guc(mock_conn, "tenant-acme")
-
-        # Verify execute was called
-        mock_conn.execute.assert_called_once()
-        call_args = mock_conn.execute.call_args
-
-        # Verify parameterized query (second arg is dict with tenant_id)
-        assert len(call_args[0]) == 2
-        params = call_args[0][1]
-        assert params["tenant_id"] == "tenant-acme"
-        assert "set_config" in str(call_args[0][0])
-
-    def test_set_tenant_guc_sql_injection_safe(self):
-        """set_tenant_guc prevents SQL injection via parameterization."""
-        from app.security.tenant import set_tenant_guc
-
-        mock_conn = MagicMock()
-        malicious_id = "'; DROP TABLE users;--"
-        set_tenant_guc(mock_conn, malicious_id)
-
-        call_args = mock_conn.execute.call_args
-        params = call_args[0][1]
-        # Malicious string is passed as parameter, not inline SQL
-        assert params["tenant_id"] == malicious_id
 
 
 # ============================================================================

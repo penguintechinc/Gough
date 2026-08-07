@@ -26,6 +26,7 @@ from typing import Any
 from unittest.mock import MagicMock, patch
 
 import pytest
+from penguin_dal import Row, Rows
 
 from app.workers.plan_compiler import (
     CompiledPlan,
@@ -75,113 +76,143 @@ def _make_node_row(data: dict[str, Any]) -> Any:
     return row
 
 
-def _make_db_session(fixture: dict[str, Any]) -> MagicMock:
-    """Build a mock db_session that responds to SELECT queries based on fixture data."""
-    session = MagicMock()
+class _FakePredicate:
+    """A composable in-memory stand-in for ``penguin_dal.query.Query``.
+
+    Carries the row list its ``_FakeField`` was built from (every real
+    query in ``plan_compiler.py`` touches exactly one table, so ``&``/``|``
+    combinators never need to reconcile two different row sources).
+    """
+
+    def __init__(self, rows: list[dict[str, Any]], fn: Any) -> None:
+        self._rows = rows
+        self._fn = fn
+
+    def matches(self, row: dict[str, Any]) -> bool:
+        return bool(self._fn(row))
+
+    def __and__(self, other: "_FakePredicate") -> "_FakePredicate":
+        return _FakePredicate(self._rows, lambda row: self.matches(row) and other.matches(row))
+
+    def __or__(self, other: "_FakePredicate") -> "_FakePredicate":
+        return _FakePredicate(self._rows, lambda row: self.matches(row) or other.matches(row))
+
+
+class _FakeField:
+    """In-memory stand-in for ``penguin_dal.field_proxy.FieldProxy``.
+
+    Builds ``_FakePredicate``s by evaluating comparisons against the
+    fixture's plain-dict rows directly, instead of building SQL.
+    """
+
+    def __init__(self, rows: list[dict[str, Any]], col: str) -> None:
+        self._rows = rows
+        self._col = col
+
+    def __eq__(self, other: Any) -> _FakePredicate:  # type: ignore[override]
+        return _FakePredicate(self._rows, lambda row: row.get(self._col) == other)
+
+    def __gt__(self, other: Any) -> _FakePredicate:
+        return _FakePredicate(
+            self._rows,
+            lambda row: row.get(self._col) is not None and row[self._col] > other,
+        )
+
+    def belongs(self, values: Any) -> _FakePredicate:
+        vals = list(values)
+        return _FakePredicate(self._rows, lambda row: row.get(self._col) in vals)
+
+    def __invert__(self) -> "_FakeField":
+        # Only used for orderby=~field (descending "latest wins"). No
+        # fixture in this suite has >1 joiner_secrets row matching the same
+        # (cluster_id, biome_kind, extractor_name, scope) key, so ordering
+        # is never load-bearing for these tests -- inert marker only.
+        return self
+
+
+class _FakeQuerySet:
+    def __init__(self, predicate: _FakePredicate) -> None:
+        self._predicate = predicate
+
+    def select(
+        self, *columns: Any, orderby: Any = None, limitby: tuple[int, int] | None = None
+    ) -> Rows:
+        matched = [Row(dict(r)) for r in self._predicate._rows if self._predicate.matches(r)]
+        if limitby is not None:
+            offset, limit = limitby
+            matched = matched[offset:offset + limit]
+        return Rows(matched)
+
+
+class _FakeTable:
+    def __init__(self, rows: list[dict[str, Any]]) -> None:
+        self._rows = rows
+
+    def __getattr__(self, name: str) -> _FakeField:
+        return _FakeField(self._rows, name)
+
+
+class _FakeDal:
+    """Fixture-backed stand-in for a penguin-dal ``DB`` instance.
+
+    Speaks the same ``db.<table>.<col>`` / ``db(query).select()`` interface
+    ``app.workers.plan_compiler`` uses post-conversion (task-7b runtime-DAL
+    migration) so this file's ~40 fixture-driven scenarios stay fast and
+    Docker-free. Evaluates queries against the fixture's plain-dict rows
+    in-memory rather than a real connection. The real-Postgres RLS/
+    tenant-scoping proof this fake structurally cannot provide (no actual
+    RLS policies here) lives in ``test_plan_compiler_dal_conversion.py``
+    (``pg_db``/``pg_db_scoped``).
+    """
+
+    def __init__(self, tables: dict[str, list[dict[str, Any]]]) -> None:
+        self._tables = tables
+
+    def __getattr__(self, name: str) -> _FakeTable:
+        return _FakeTable(self._tables.get(name, []))
+
+    def __call__(self, predicate: _FakePredicate) -> _FakeQuerySet:
+        return _FakeQuerySet(predicate)
+
+
+def _make_db_session(fixture: dict[str, Any]) -> _FakeDal:
+    """Build a fixture-backed fake penguin-dal DB for PlanCompiler tests.
+
+    Mirrors the previous SQLAlchemy-``Session``-shaped mock's fixture
+    parsing (same ``biomes``/``eggs``, ``joiner_secrets``, ``node``/
+    ``nodes`` fallbacks and defaults), but returns a ``_FakeDal`` that
+    speaks the query-builder interface ``plan_compiler.py`` now uses.
+    """
     biomes: dict[int, dict[str, Any]] = {e["id"]: e for e in fixture.get("biomes", fixture.get("eggs", []))}
     joiner_secrets: list[dict[str, Any]] = fixture.get("joiner_secrets", [])
     node_data: dict[str, Any] = fixture.get("node", fixture.get("nodes", [{}])[0])
 
-    node_fields = [
-        "id", "name", "primary_nic_mac", "hardware_tags", "hardware_json",
-        "tenant_id", "state",
-    ]
     node_defaults = {
         "tenant_id": "__default__",
         "state": "planned",
     }
     full_node = {**node_defaults, **node_data}
 
-    # Helper to build a Row-like object with ._fields
-    def _make_row(fields: list[str], values: list[Any]) -> Any:
-        RT = namedtuple("Row", fields)  # type: ignore[misc]
-        return RT(*values)
+    egg_defaults = {"egg_kind": "custom", "tenant_id": "__default__"}
+    biome_rows = [{**egg_defaults, **biome} for biome in biomes.values()]
 
-    def _execute_side_effect(stmt: Any, params: Any = None) -> MagicMock:
-        stmt_str = str(stmt) if not isinstance(stmt, str) else stmt
+    # Physical column is `biome_kind` (app.models_m1.JoinerSecret -- `egg_kind`
+    # is an ORM-only `synonym`, not a real reflected column; see task-7b
+    # report). Fixtures still key joiner_secrets entries by the legacy
+    # `egg_kind` name -- remap here so the fake models the same physical
+    # shape the converted `_resolve_joiner_secrets` query now reads.
+    joiner_secret_rows = [
+        {**js, "biome_kind": js.get("biome_kind", js.get("egg_kind", ""))}
+        for js in joiner_secrets
+    ]
 
-        # Node lookup
-        if "FROM nodes WHERE id" in stmt_str or "nodes" in stmt_str and "id = :id" in stmt_str:
-            node_id = (params or {}).get("id")
-            if node_id == full_node.get("id"):
-                fields = ["id", "name", "primary_nic_mac", "hardware_tags",
-                          "hardware_json", "tenant_id", "state"]
-                vals = [full_node.get(f) for f in fields]
-                mock_result = MagicMock()
-                mock_result.first.return_value = _make_row(fields, vals)
-                return mock_result
-
-        # Biomes lookup (IN clause)
-        if "FROM biomes WHERE id IN" in stmt_str:
-            found_eggs = []
-            egg_fields = [
-                "id", "name", "version", "phase", "workload_type", "lock_to_host",
-                "requires_hardware_tags", "prefers_hardware_tags", "forbids_hardware_tags",
-                "dependencies", "consumes_joiner_secrets_from", "emits_joiner_secrets",
-                "cloud_init", "storage_requirements_json", "egg_kind", "tenant_id",
-            ]
-            egg_defaults = {"egg_kind": "custom", "tenant_id": "__default__"}
-            for key, val in (params or {}).items():
-                if val in biomes:
-                    biome = {**egg_defaults, **biomes[val]}
-                    # Serialise list/dict fields to JSON strings as DB would
-                    row_vals = []
-                    for f in egg_fields:
-                        v = biome.get(f)
-                        if isinstance(v, (list, dict)) and f not in ("id",):
-                            row_vals.append(json.dumps(v))
-                        else:
-                            row_vals.append(v)
-                    found_eggs.append(_make_row(egg_fields, row_vals))
-
-            mock_result = MagicMock()
-            mock_result.fetchall.return_value = found_eggs
-            return mock_result
-
-        # Joiner secrets lookup
-        if "FROM joiner_secrets" in stmt_str:
-            p = params or {}
-            cluster_id = p.get("cluster_id", "")
-            # Support both biome_kind (new) and egg_kind (old/test-compat)
-            biome_kind = p.get("biome_kind", p.get("egg_kind", ""))
-            extractor = p.get("extractor", "")
-            scope = p.get("scope", "cluster")
-            now_dt = p.get("now")
-
-            for js in joiner_secrets:
-                if (
-                    js.get("cluster_id") == cluster_id
-                    and js.get("egg_kind") == biome_kind
-                    and js.get("extractor_name") == extractor
-                    and js.get("scope") == scope
-                ):
-                    # Check not revoked
-                    if js.get("revoked_at") is not None:
-                        break
-                    # Check not expired
-                    exp = js.get("expires_at")
-                    if exp and now_dt:
-                        exp_dt = datetime.fromisoformat(exp.replace("Z", "+00:00"))
-                        if exp_dt <= now_dt:
-                            break
-                    row = _make_row(["id"], [js["id"]])
-                    mock_result = MagicMock()
-                    mock_result.first.return_value = row
-                    return mock_result
-
-            # Not found
-            mock_result = MagicMock()
-            mock_result.first.return_value = None
-            return mock_result
-
-        # Default — return empty result
-        mock_result = MagicMock()
-        mock_result.first.return_value = None
-        mock_result.fetchall.return_value = []
-        return mock_result
-
-    session.execute.side_effect = _execute_side_effect
-    return session
+    return _FakeDal(
+        {
+            "nodes": [full_node],
+            "biomes": biome_rows,
+            "joiner_secrets": joiner_secret_rows,
+        }
+    )
 
 
 def _make_vault_client() -> MagicMock:
@@ -209,7 +240,7 @@ def _make_lxd_client(cluster_id: str = "default") -> MagicMock:
     return lxd
 
 
-def _make_compiler(fixture: dict[str, Any]) -> tuple[PlanCompiler, MagicMock]:
+def _make_compiler(fixture: dict[str, Any]) -> tuple[PlanCompiler, _FakeDal]:
     session = _make_db_session(fixture)
     vault = _make_vault_client()
     lxd = _make_lxd_client(fixture.get("plan_request", {}).get("cluster_id", "default"))
@@ -499,8 +530,7 @@ class TestJoinerSecretOptionalSoftDep:
             ],
         )
 
-        session = MagicMock()
-        session.execute.return_value.first.return_value = None
+        session = _FakeDal({"joiner_secrets": []})
 
         refs, errors = _resolve_joiner_secrets(
             session, egg_node, "test-cluster", datetime.now(timezone.utc)

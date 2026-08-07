@@ -19,13 +19,14 @@ from __future__ import annotations
 import json
 import logging
 import re
+from datetime import datetime, timezone
 from typing import Any
 from urllib.parse import urlparse
 
 from quart import Blueprint, current_app, g, jsonify, request
-from sqlalchemy import text
 
 from ..middleware import auth_required
+from ..models import get_db
 from ..security.scope_enforcement import require_scopes
 from ..security.tenant import (
     TenantClaimMissingError,
@@ -70,16 +71,17 @@ def _key_manager() -> WebhookKeyManager:
     return WebhookKeyManager(_vault_client())
 
 
-def _db_session() -> Any:
-    """Return the SQLAlchemy session/engine connection for webhook storage."""
-    factory = getattr(current_app, "webhook_db_factory", None)
-    if factory is not None:
-        return factory()
-    db = getattr(current_app, "db", None)
-    if db is None:
-        raise RuntimeError("application has no db handle")
-    # SQLAlchemy engine path.
-    return db.engine.connect()
+def _parse_webhook_id(webhook_id: str) -> int | None:
+    """Parse the ``<webhook_id>`` path segment into the table's integer PK.
+
+    The route accepts any string (no ``<int:...>`` converter, unlike
+    ``nodes.py``), so a non-numeric id is a normal "not found" rather than a
+    routing 404 -- callers return the same 404 either way.
+    """
+    try:
+        return int(webhook_id)
+    except (TypeError, ValueError):
+        return None
 
 
 def _current_tenant() -> str:
@@ -134,24 +136,31 @@ def _validate_retry_policy(value: Any) -> tuple[bool, str, dict]:
 
 
 def _row_to_dict(row: Any) -> dict:
-    ef = row[5]
+    """Serialize a ``webhook_endpoints`` row (penguin-dal ``Row``) to a JSON-safe dict.
+
+    ``event_filter``/``retry_policy`` are native JSONB columns -- penguin-dal
+    reflects them as already-deserialized Python list/dict, not JSON text --
+    but the ``isinstance(..., str)`` fallback is kept defensively in case a
+    caller ever feeds this a raw ``executesql(as_dict=True)`` row instead.
+    """
+    ef = row.event_filter
     if isinstance(ef, str):
         try:
             ef = json.loads(ef)
         except Exception:
             ef = []
-    rp = row[6]
+    rp = row.retry_policy
     if isinstance(rp, str):
         try:
             rp = json.loads(rp)
         except Exception:
             rp = {}
     return {
-        "id": str(row[0]),
-        "tenant_id": str(row[1]),
-        "url": str(row[2]),
-        "signing_mode": str(row[3]),
-        "active": bool(row[4]),
+        "id": str(row.id),
+        "tenant_id": str(row.tenant_id),
+        "url": str(row.url),
+        "signing_mode": str(row.signing_mode),
+        "active": bool(row.active),
         "event_filter": list(ef or []),
         "retry_policy": dict(rp or {}),
     }
@@ -166,18 +175,10 @@ def _row_to_dict(row: Any) -> dict:
 async def list_webhooks():
     """List webhook endpoints for the caller's tenant."""
     tenant_id = _current_tenant()
-    conn = _db_session()
-    try:
-        rows = conn.execute(
-            text(
-                "SELECT id, tenant_id, url, signing_mode, active, event_filter, "
-                "retry_policy FROM webhook_endpoints WHERE tenant_id = :t "
-                "ORDER BY id"
-            ),
-            {"t": tenant_id},
-        ).fetchall()
-    finally:
-        _close(conn)
+    db = get_db()
+    rows = db(db.webhook_endpoints.tenant_id == tenant_id).select(
+        orderby=db.webhook_endpoints.id
+    )
     return jsonify({"endpoints": [_row_to_dict(r) for r in rows]}), 200
 
 
@@ -223,29 +224,30 @@ async def create_webhook():
         log.exception("failed to provision webhook signing key")
         return jsonify({"error": f"key_provisioning_failed: {exc}"}), 500
 
-    conn = _db_session()
-    try:
-        result = conn.execute(
-            text(
-                "INSERT INTO webhook_endpoints "
-                "(tenant_id, url, signing_mode, active, event_filter, retry_policy) "
-                "VALUES (:t, :u, :m, TRUE, :ef, :rp) "
-                "RETURNING id, tenant_id, url, signing_mode, active, "
-                "event_filter, retry_policy"
-            ),
-            {
-                "t": tenant_id,
-                "u": url,
-                "m": signing_mode,
-                "ef": json.dumps(event_filter),
-                "rp": json.dumps(retry_policy),
-            },
-        )
-        row = result.fetchone()
-        if hasattr(conn, "commit"):
-            conn.commit()
-    finally:
-        _close(conn)
+    # created_at/updated_at have no server-side DEFAULT -- app.models_m1's
+    # WebhookEndpoint sets them via SQLAlchemy ORM-side `default=`, which
+    # only applies on ORM/Core inserts. penguin-dal inserts against the
+    # reflected (DDL-only) Table, which has no knowledge of that Python-side
+    # default, so it's supplied explicitly here -- same pattern as every
+    # other penguin-dal insert of a created_at/updated_at row in this
+    # service (see app/api/nodes.py, app/api/biomes.py). Pre-existing gap:
+    # the original raw-SQL INSERT never supplied these either, so
+    # create_webhook always violated the NOT NULL constraint against real
+    # Postgres before this conversion -- fixed here since it's an
+    # unambiguous, in-file, one-line correction, not a schema guess.
+    now = datetime.now(timezone.utc)
+    db = get_db()
+    new_id = db.webhook_endpoints.insert(
+        tenant_id=tenant_id,
+        url=url,
+        signing_mode=signing_mode,
+        active=True,
+        event_filter=event_filter,
+        retry_policy=retry_policy,
+        created_at=now,
+        updated_at=now,
+    )
+    row = db(db.webhook_endpoints.id == new_id).select().first()
 
     return jsonify(_row_to_dict(row)), 201
 
@@ -256,19 +258,13 @@ async def create_webhook():
 async def delete_webhook(webhook_id: str):
     """Delete a webhook endpoint owned by the caller's tenant."""
     tenant_id = _current_tenant()
-    conn = _db_session()
-    try:
-        result = conn.execute(
-            text(
-                "DELETE FROM webhook_endpoints WHERE id = :i AND tenant_id = :t"
-            ),
-            {"i": webhook_id, "t": tenant_id},
-        )
-        if hasattr(conn, "commit"):
-            conn.commit()
-        rowcount = getattr(result, "rowcount", 0) or 0
-    finally:
-        _close(conn)
+    wid = _parse_webhook_id(webhook_id)
+    if wid is None:
+        return jsonify({"error": "not_found"}), 404
+    db = get_db()
+    rowcount = db(
+        (db.webhook_endpoints.id == wid) & (db.webhook_endpoints.tenant_id == tenant_id)
+    ).delete()
     if not rowcount:
         return jsonify({"error": "not_found"}), 404
     return ("", 204)
@@ -280,18 +276,13 @@ async def delete_webhook(webhook_id: str):
 async def test_webhook(webhook_id: str):
     """Dispatch a synthetic ``gough.webhook.test`` event."""
     tenant_id = _current_tenant()
-    conn = _db_session()
-    try:
-        row = conn.execute(
-            text(
-                "SELECT id, tenant_id, url, signing_mode, active, event_filter, "
-                "retry_policy FROM webhook_endpoints "
-                "WHERE id = :i AND tenant_id = :t"
-            ),
-            {"i": webhook_id, "t": tenant_id},
-        ).fetchone()
-    finally:
-        _close(conn)
+    wid = _parse_webhook_id(webhook_id)
+    if wid is None:
+        return jsonify({"error": "not_found"}), 404
+    db = get_db()
+    row = db(
+        (db.webhook_endpoints.id == wid) & (db.webhook_endpoints.tenant_id == tenant_id)
+    ).select().first()
     if row is None:
         return jsonify({"error": "not_found"}), 404
     record = _row_to_dict(row)
@@ -353,15 +344,3 @@ async def webhook_jwks(tenant: str):
     resp = jsonify(jwks)
     resp.headers["Cache-Control"] = "public, max-age=300"
     return resp, 200
-
-
-# ---------------------------------------------------------------------------
-# Cleanup helper
-# ---------------------------------------------------------------------------
-def _close(conn: Any) -> None:
-    closer = getattr(conn, "close", None)
-    if callable(closer):
-        try:
-            closer()
-        except Exception:  # pragma: no cover
-            pass

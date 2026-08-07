@@ -7,7 +7,10 @@ Implements the spec sections "Audit & Compliance" + "Audit Log — Hash-Chain Fo
    one replica writes — even under HA, the chain hash advances monotonically.
    A Postgres advisory lock additionally prevents split-write within a single
    leader (e.g., two threads on the leader replica trying to append concurrently).
-   Every append runs in a SERIALIZABLE transaction.
+   Every append runs in one ``db.transaction()`` (SERIALIZABLE isolation +
+   ``pg_advisory_xact_lock`` + the hash-chain read+insert all share the same
+   pinned connection, so the lock is actually held for the read+insert's
+   duration and is auto-released at commit — see ``append_event`` docstring).
 
 2. **Offsite mirror** — a long-running async daemon that ships every committed
    row to an S3-compatible Object-Lock bucket using ``aioboto3``. The shipper
@@ -26,7 +29,45 @@ Public API:
     AuditChainWriter.start_offsite_mirror(...)    # async daemon
     AuditChainWriter.verify_chain_scheduled(...)  # cron entrypoint
 
-Tests in ``tests/workers/test_audit_chain_writer.py`` cover all four surfaces.
+Tests in ``tests/workers/test_audit_chain_writer.py`` (+ ``_extended.py``)
+cover all four surfaces.
+
+penguin-dal conversion notes (Task 8a):
+
+* ``db_session`` (constructor param + attribute) is now a penguin-dal ``DB``
+  instance, not a SQLAlchemy Session — name kept for continuity with
+  ``AuditEventWriter``'s constructor keyword (see that module's docstring).
+* ``append_event()``'s advisory-lock + SERIALIZABLE + hash-chain read+insert
+  now run inside one ``with self.db_session.transaction() as tx:`` block, so
+  they share a single pinned connection — a naive per-call ``executesql()``
+  would open a new autocommitted connection per statement, releasing the
+  advisory lock immediately and letting two concurrent leader-replica
+  threads read the same chain-head hash and fork the chain.
+* ``pg_advisory_xact_lock`` was already the transaction-scoped variant (no
+  session-scoped ``pg_advisory_lock``/``pg_advisory_unlock`` to migrate) —
+  it just needed to move inside the shared transaction to actually work.
+  MariaDB has no equivalent function; the call is wrapped in the same
+  broad try/except the original code used (now catching "function does not
+  exist" instead of "not supported on this dialect"), so a MariaDB target
+  degrades to "don't crash, no advisory lock" rather than failing the
+  append — see ``append_event`` docstring for the residual gap this leaves.
+* ``audit_events`` is RLS-protected and this worker runs with no
+  request/tenant context, so every DB unit that reads/writes it here
+  (``append_event``, the offsite mirror's ``_fetch_rows_after``/
+  ``_update_lag_gauge``, ``verify_chain_scheduled``) is wrapped in
+  ``app.db.rls``'s cross-tenant sentinel via the local ``_cross_tenant_scope()``
+  helper below (same pattern as ``app.grpc_server._cross_tenant_scope()``).
+  Omitting this would silently fail-closed to zero visible rows — a missing
+  chain head (fork risk), a "0 rows shipped" mirror, or a false "0 breaks"
+  compliance verify — not raise an error.
+* ``audit_events_mirror_state`` (offsite mirror watermark) carries no RLS
+  policy and isn't in the baseline migration's ``rls_tables`` list, so no
+  tenant scoping is needed for ``_read_watermark``/``_persist_watermark``.
+  It's also not a table the baseline migration actually creates (a
+  pre-existing schema gap, same class as the ~12 orphaned tables tracked
+  in GitHub issue #21) — the original code already handled that
+  defensively (broad try/except, "watermark table missing" fallback),
+  preserved as-is here.
 """
 
 from __future__ import annotations
@@ -35,15 +76,16 @@ import asyncio
 import logging
 import os
 import random
-import time
 import uuid
-from dataclasses import dataclass, field
+from collections.abc import Iterator
+from contextlib import contextmanager
+from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
-from typing import Any, Awaitable, Callable, Optional
+from typing import Any, Awaitable, Callable, Optional, cast
 
 from prometheus_client import Counter, Gauge
-from sqlalchemy import text
 
+from app.db.rls import CROSS_TENANT_SENTINEL, get_current_tenant, set_current_tenant
 from app.security.audit_chain import (
     AuditEvent,
     AuditEventWriter,
@@ -53,7 +95,6 @@ from app.security.audit_chain import (
 from app.workers import leader_lease as leader_lease_module
 from app.workers.leader_lease import LeaderLeaseHandle
 
-
 logger = logging.getLogger(__name__)
 
 
@@ -62,11 +103,35 @@ ADVISORY_LOCK_NAMESPACE = 0xA00D17  # arbitrary 24-bit constant; "AUDIT" mangled
 NATS_SUBJECT_AUDIT_BREAK = "gough.security.audit_chain_break"
 
 
+@contextmanager
+def _cross_tenant_scope() -> Iterator[None]:
+    """Push the RLS cross-tenant sentinel for one background DB unit.
+
+    This worker never runs inside Quart's HTTP request pipeline, so
+    ``app.db.rls``'s tenant ContextVar is never set by anything upstream —
+    without this, every RLS-protected read/write against ``audit_events``
+    here would fail-closed to zero rows (see module docstring). Mirrors
+    ``app.grpc_server._cross_tenant_scope()`` exactly; duplicated locally
+    rather than imported, matching this codebase's existing convention of
+    defining this helper per-module (``app.grpc_server``,
+    ``app.workers.joiner_secret_emitter``) instead of a shared import.
+    """
+    previous = get_current_tenant()
+    set_current_tenant(CROSS_TENANT_SENTINEL)
+    try:
+        yield
+    finally:
+        set_current_tenant(previous)
+
+
 # -----------------------------------------------------------------------------
 # Metrics — module-level singletons (Prometheus client de-duplicates by name).
 # -----------------------------------------------------------------------------
 
-def _metric(factory: Any, name: str, doc: str, labels: Optional[list[str]] = None) -> Any:
+
+def _metric(
+    factory: Any, name: str, doc: str, labels: Optional[list[str]] = None
+) -> Any:
     """Return existing collector if registered, else create a new one.
 
     Prometheus client raises ``ValueError`` on duplicate registration; our worker
@@ -82,8 +147,8 @@ def _metric(factory: Any, name: str, doc: str, labels: Optional[list[str]] = Non
         # Already registered — fish it out of the default registry.
         from prometheus_client import REGISTRY
 
-        for collector in REGISTRY._collector_to_names:  # type: ignore[attr-defined]
-            for n in REGISTRY._collector_to_names.get(collector, ()):  # type: ignore[attr-defined]
+        for collector in REGISTRY._collector_to_names:
+            for n in REGISTRY._collector_to_names.get(collector, ()):
                 if n == name:
                     return collector
         raise
@@ -174,9 +239,10 @@ class AuditChainWriter:
 
     The constructor takes three injected dependencies:
 
-    * ``db_session`` — a SQLAlchemy session (sync) used for advisory-lock + append
-      operations. Tests pass a ``MagicMock``; production wires the request-scoped
-      session.
+    * ``db_session`` — a penguin-dal ``DB`` instance used for advisory-lock +
+      append operations (see module docstring for why the parameter keeps
+      this legacy name). Tests pass a real ``pg_db``/``pg_db_scoped``
+      fixture instance.
     * ``vault_client`` — a ``VaultClient`` used to source SSE-KMS key IDs / signing
       callbacks. ``None`` is permitted for clusters that disable transit signing.
     * ``leader_lease_client`` — the module/object exposing ``acquire`` / ``release``
@@ -194,13 +260,19 @@ class AuditChainWriter:
         replica_id: Optional[str] = None,
         signer: Optional[Callable[[bytes], bytes]] = None,
         lease_ttl_seconds: int = leader_lease_module.DEFAULT_TTL_SECONDS,
-        nats_publisher: Optional[Callable[[str, dict[str, Any]], Awaitable[None]]] = None,
+        nats_publisher: Optional[
+            Callable[[str, dict[str, Any]], Awaitable[None]]
+        ] = None,
         s3_session_factory: Optional[Callable[..., Any]] = None,
     ) -> None:
         self.db_session = db_session
         self.vault_client = vault_client
         self.leader_lease_client = leader_lease_client or leader_lease_module
-        self.cluster_id = cluster_id or os.getenv("GOUGH_CLUSTER_ID", "gough-cluster")
+        self.cluster_id: str = (
+            cluster_id
+            if cluster_id is not None
+            else os.getenv("GOUGH_CLUSTER_ID", "gough-cluster")
+        )
         self.replica_id = replica_id or leader_lease_module._default_holder_id()
         self.signer = signer
         self.lease_ttl_seconds = lease_ttl_seconds
@@ -237,7 +309,7 @@ class AuditChainWriter:
             return False
         ok = self.leader_lease_client.release(self.db_session, self._lease_handle)
         self._lease_handle = None
-        return ok
+        return bool(ok)
 
     def is_leader(self) -> bool:
         """Whether this replica currently holds the lease (cheap, in-memory check)."""
@@ -267,8 +339,31 @@ class AuditChainWriter:
 
         Raises :class:`NotLeaderError` when this replica is not the leader, with
         the metric ``gough_audit_append_not_leader_total`` incremented for
-        observability. Callers must commit the transaction (we do not commit;
-        the wrapping request scope owns that).
+        observability.
+
+        The SERIALIZABLE-isolation SET, the ``pg_advisory_xact_lock`` call,
+        and the hash-chain read+insert (``AuditEventWriter.append``) all run
+        on the SAME pinned connection inside one ``db_session.transaction()``
+        block, committing together on clean exit. This is load-bearing: a
+        transaction-scoped advisory lock only serialises callers for as long
+        as it's held, and it auto-releases the instant its owning
+        transaction commits — if the lock were taken in one autocommitted
+        statement and the hash-chain read+insert ran as separate
+        autocommitted statements afterward (each opening its own
+        connection/transaction under the hood), the lock would already be
+        released before the read even ran, and two threads on this leader
+        replica could both read the same chain-head hash and fork the chain.
+
+        MariaDB has no ``pg_advisory_xact_lock`` equivalent; the call is
+        wrapped in a broad try/except (matching the pre-conversion
+        behavior) so a MariaDB target logs and continues rather than
+        failing the append. On MariaDB this leaves the "two threads on one
+        leader replica" split-write case unprotected (the leader-lease CAS
+        already guarantees only one REPLICA appends; this residual gap is
+        specifically about multiple threads within that one replica) — the
+        SERIALIZABLE isolation level SET is itself dialect-portable (ANSI
+        SQL, supported by MySQL/MariaDB too) and still applies. Primary
+        target is Postgres; see task report for the full analysis.
         """
 
         if not self.is_leader():
@@ -285,39 +380,41 @@ class AuditChainWriter:
                     "refusing append."
                 )
 
-        # SERIALIZABLE isolation for the append; ignore failures on dialects
-        # that don't expose this knob (sqlite in unit tests).
-        try:
-            self.db_session.execute(
-                text("SET TRANSACTION ISOLATION LEVEL SERIALIZABLE")
-            )
-        except Exception as exc:  # noqa: BLE001
-            logger.debug("could not set SERIALIZABLE isolation: %s (continuing)", exc)
+        with _cross_tenant_scope(), self.db_session.transaction() as tx:
+            # SERIALIZABLE isolation for the append; ignore failures on dialects
+            # that don't expose this knob.
+            try:
+                tx.executesql("SET TRANSACTION ISOLATION LEVEL SERIALIZABLE")
+            except Exception as exc:  # noqa: BLE001
+                logger.debug(
+                    "could not set SERIALIZABLE isolation: %s (continuing)", exc
+                )
 
-        # Postgres advisory lock — serialise across all connections holding
-        # the leader lease (single replica, but multiple goroutines/threads).
-        # Lock is released at transaction end.
-        try:
-            self.db_session.execute(
-                text("SELECT pg_advisory_xact_lock(:ns, :key)"),
-                {"ns": ADVISORY_LOCK_NAMESPACE, "key": 1},
-            )
-        except Exception as exc:  # noqa: BLE001 — non-postgres dialects
-            logger.debug("pg_advisory_xact_lock unavailable: %s", exc)
+            # Postgres advisory lock — serialises across all connections holding
+            # the leader lease (single replica, but multiple threads). Lock is
+            # released automatically at transaction end (pg_advisory_xact_lock).
+            try:
+                tx.executesql(
+                    "SELECT pg_advisory_xact_lock(%(ns)s, %(key)s)",
+                    {"ns": ADVISORY_LOCK_NAMESPACE, "key": 1},
+                )
+            except Exception as exc:  # noqa: BLE001 — non-postgres dialects
+                logger.debug("pg_advisory_xact_lock unavailable: %s", exc)
 
-        event = self._writer.append(
-            actor_sub=actor_sub,
-            action=action,
-            resource_kind=resource_kind,
-            resource_id=resource_id,
-            tenant_id=tenant_id,
-            actor_scope=actor_scope,
-            before=before,
-            after=after,
-            request_id=request_id,
-            source_ip=source_ip,
-            user_agent=user_agent,
-        )
+            event = self._writer.append(
+                tx=tx,
+                actor_sub=actor_sub,
+                action=action,
+                resource_kind=resource_kind,
+                resource_id=resource_id,
+                tenant_id=tenant_id,
+                actor_scope=actor_scope,
+                before=before,
+                after=after,
+                request_id=request_id,
+                source_ip=source_ip,
+                user_agent=user_agent,
+            )
         APPEND_COUNTER.inc()
         return event
 
@@ -374,9 +471,7 @@ class AuditChainWriter:
                     setattr(cfg, k, v)
 
         stop_event = stop_event or asyncio.Event()
-        watermark: Optional[uuid.UUID] = await asyncio.to_thread(
-            self._read_watermark
-        )
+        watermark: Optional[uuid.UUID] = await asyncio.to_thread(self._read_watermark)
         iterations = 0
         backoff = cfg.initial_backoff_seconds
         rows_shipped = 0
@@ -451,11 +546,17 @@ class AuditChainWriter:
         ``{cluster_id, first_break_id, last_break_id, breaks, rows_checked,
         window_since, window_to}``. Returns the verify_chain summary plus
         ``nats_event_emitted: bool``.
+
+        Runs under the cross-tenant RLS sentinel (see module docstring) —
+        without it this would fail-closed to zero visible rows and silently
+        report "0 rows_checked, 0 breaks" every day instead of actually
+        verifying the chain.
         """
 
         now = datetime.now(timezone.utc)
         window_since = now - since
-        summary = verify_chain(self.db_session, since=window_since, to=now)
+        with _cross_tenant_scope():
+            summary = verify_chain(self.db_session, since=window_since, to=now)
         breaks = int(summary.get("breaks") or 0)
 
         nats_emitted = False
@@ -463,12 +564,16 @@ class AuditChainWriter:
             CHAIN_BREAK_COUNTER.inc(breaks)
             payload = {
                 "cluster_id": self.cluster_id,
-                "first_break_id": str(summary.get("first_break_id"))
-                if summary.get("first_break_id")
-                else None,
-                "last_break_id": str(summary.get("last_break_id"))
-                if summary.get("last_break_id")
-                else None,
+                "first_break_id": (
+                    str(summary.get("first_break_id"))
+                    if summary.get("first_break_id")
+                    else None
+                ),
+                "last_break_id": (
+                    str(summary.get("last_break_id"))
+                    if summary.get("last_break_id")
+                    else None
+                ),
                 "breaks": breaks,
                 "rows_checked": int(summary.get("rows_checked") or 0),
                 "window_since": window_since.isoformat(),
@@ -494,18 +599,19 @@ class AuditChainWriter:
         We persist the watermark in ``audit_events_mirror_state`` if present;
         otherwise we fall back to ``ZERO`` — a fresh shipper will replay every
         row (Object Lock makes this idempotent: same key + content_md5 => same
-        object, write is a no-op).
+        object, write is a no-op). No RLS scoping needed — see module
+        docstring.
         """
 
         try:
-            row = self.db_session.execute(
-                text(
-                    "SELECT last_shipped_id FROM audit_events_mirror_state "
-                    "WHERE id = 1"
-                )
-            ).first()
-            if row and row[0]:
-                return uuid.UUID(str(row[0]))
+            rows = cast(
+                "list[tuple[Any, ...]]",
+                self.db_session.executesql(
+                    "SELECT last_shipped_id FROM audit_events_mirror_state WHERE id = 1"
+                ),
+            )
+            if rows and rows[0][0]:
+                return uuid.UUID(str(rows[0][0]))
         except Exception as exc:  # noqa: BLE001
             logger.debug("watermark table missing: %s (starting from genesis)", exc)
         return None
@@ -513,14 +619,18 @@ class AuditChainWriter:
     def _fetch_rows_after(
         self, watermark: Optional[uuid.UUID], batch_size: int
     ) -> list[dict[str, Any]]:
-        """Fetch rows with id > watermark, ordered by id ASC."""
+        """Fetch rows with id > watermark, ordered by id ASC.
+
+        Cross-tenant scoped (see module docstring) — the mirror ships every
+        tenant's rows, not just one.
+        """
 
         if watermark is None:
             query = (
                 "SELECT id, ts, cluster_id, tenant_id, actor_sub, actor_scope, "
                 "action, resource_kind, resource_id, before_json, after_json, "
                 "request_id, source_ip, user_agent, prev_hash, hash, signature "
-                "FROM audit_events ORDER BY id ASC LIMIT :limit"
+                "FROM audit_events ORDER BY id ASC LIMIT %(limit)s"
             )
             params: dict[str, Any] = {"limit": batch_size}
         else:
@@ -528,25 +638,15 @@ class AuditChainWriter:
                 "SELECT id, ts, cluster_id, tenant_id, actor_sub, actor_scope, "
                 "action, resource_kind, resource_id, before_json, after_json, "
                 "request_id, source_ip, user_agent, prev_hash, hash, signature "
-                "FROM audit_events WHERE id > :watermark ORDER BY id ASC LIMIT :limit"
+                "FROM audit_events WHERE id > %(watermark)s ORDER BY id ASC LIMIT %(limit)s"
             )
-            params = {"watermark": watermark, "limit": batch_size}
+            params = {"watermark": str(watermark), "limit": batch_size}
 
-        result = self.db_session.execute(text(query), params)
-        rows: list[dict[str, Any]] = []
-        for raw in result.fetchall():
-            mapping = raw._mapping if hasattr(raw, "_mapping") else None
-            if mapping is not None:
-                rows.append(dict(mapping))
-            else:
-                rows.append({
-                    "id": raw[0], "ts": raw[1], "cluster_id": raw[2],
-                    "tenant_id": raw[3], "actor_sub": raw[4], "actor_scope": raw[5],
-                    "action": raw[6], "resource_kind": raw[7], "resource_id": raw[8],
-                    "before_json": raw[9], "after_json": raw[10], "request_id": raw[11],
-                    "source_ip": raw[12], "user_agent": raw[13], "prev_hash": raw[14],
-                    "hash": raw[15], "signature": raw[16],
-                })
+        with _cross_tenant_scope():
+            rows = cast(
+                "list[dict[str, Any]]",
+                self.db_session.executesql(query, params, as_dict=True),
+            )
         return rows
 
     def _row_to_object_payload(self, row: dict[str, Any]) -> bytes:
@@ -596,64 +696,75 @@ class AuditChainWriter:
         await asyncio.to_thread(self._persist_watermark, row["id"])
 
     def _persist_watermark(self, row_id: uuid.UUID) -> None:
+        """No RLS scoping needed — ``audit_events_mirror_state`` carries no
+        tenant_id/RLS policy (see module docstring)."""
         try:
             # Postgres UPSERT
-            self.db_session.execute(
-                text(
-                    "INSERT INTO audit_events_mirror_state (id, last_shipped_id, "
-                    "updated_at) VALUES (1, :rid, :ts) "
-                    "ON CONFLICT (id) DO UPDATE SET "
-                    "last_shipped_id = EXCLUDED.last_shipped_id, "
-                    "updated_at = EXCLUDED.updated_at"
-                ),
-                {"rid": row_id, "ts": datetime.now(timezone.utc)},
+            self.db_session.executesql(
+                "INSERT INTO audit_events_mirror_state (id, last_shipped_id, "
+                "updated_at) VALUES (1, %(rid)s, %(ts)s) "
+                "ON CONFLICT (id) DO UPDATE SET "
+                "last_shipped_id = EXCLUDED.last_shipped_id, "
+                "updated_at = EXCLUDED.updated_at",
+                {"rid": str(row_id), "ts": datetime.now(timezone.utc)},
             )
         except Exception as exc:  # noqa: BLE001
-            # Fallback for tests / sqlite — best effort SET; an UPDATE that
-            # affects 0 rows is fine, the next iteration will retry.
+            # Fallback for dialects without ON CONFLICT / a missing table — an
+            # UPDATE that affects 0 rows is fine, the next iteration will retry.
             logger.debug("watermark UPSERT fallback: %s", exc)
             try:
-                self.db_session.execute(
-                    text(
-                        "UPDATE audit_events_mirror_state SET last_shipped_id = :rid, "
-                        "updated_at = :ts WHERE id = 1"
-                    ),
-                    {"rid": row_id, "ts": datetime.now(timezone.utc)},
+                self.db_session.executesql(
+                    "UPDATE audit_events_mirror_state SET last_shipped_id = %(rid)s, "
+                    "updated_at = %(ts)s WHERE id = 1",
+                    {"rid": str(row_id), "ts": datetime.now(timezone.utc)},
                 )
             except Exception as exc2:  # noqa: BLE001
                 logger.debug("watermark UPDATE fallback failed: %s", exc2)
 
     def _update_lag_gauge(self, watermark: Optional[uuid.UUID]) -> None:
-        """Update the lag gauge based on the most recent committed row's ts."""
+        """Update the lag gauge based on the most recent committed row's ts.
+
+        Cross-tenant scoped (see module docstring) — lag is measured against
+        the cluster-wide latest row, not one tenant's.
+        """
 
         try:
-            row = self.db_session.execute(
-                text("SELECT ts FROM audit_events ORDER BY ts DESC LIMIT 1")
-            ).first()
-            if not row:
-                MIRROR_LAG_GAUGE.set(0.0)
-                return
-            latest_ts: datetime = row[0]
-            if latest_ts.tzinfo is None:
-                latest_ts = latest_ts.replace(tzinfo=timezone.utc)
+            with _cross_tenant_scope():
+                latest_rows = cast(
+                    "list[tuple[Any, ...]]",
+                    self.db_session.executesql(
+                        "SELECT ts FROM audit_events ORDER BY ts DESC LIMIT 1"
+                    ),
+                )
+                if not latest_rows:
+                    MIRROR_LAG_GAUGE.set(0.0)
+                    return
+                latest_ts: datetime = latest_rows[0][0]
+                if latest_ts.tzinfo is None:
+                    latest_ts = latest_ts.replace(tzinfo=timezone.utc)
 
-            if watermark is None:
-                lag = (datetime.now(timezone.utc) - latest_ts).total_seconds()
+                if watermark is None:
+                    lag = (datetime.now(timezone.utc) - latest_ts).total_seconds()
+                    MIRROR_LAG_GAUGE.set(max(lag, 0.0))
+                    return
+
+                shipped_rows = cast(
+                    "list[tuple[Any, ...]]",
+                    self.db_session.executesql(
+                        "SELECT ts FROM audit_events WHERE id = %(id)s",
+                        {"id": str(watermark)},
+                    ),
+                )
+                if not shipped_rows:
+                    MIRROR_LAG_GAUGE.set(
+                        (datetime.now(timezone.utc) - latest_ts).total_seconds()
+                    )
+                    return
+                shipped_ts: datetime = shipped_rows[0][0]
+                if shipped_ts.tzinfo is None:
+                    shipped_ts = shipped_ts.replace(tzinfo=timezone.utc)
+                lag = (latest_ts - shipped_ts).total_seconds()
                 MIRROR_LAG_GAUGE.set(max(lag, 0.0))
-                return
-
-            shipped_row = self.db_session.execute(
-                text("SELECT ts FROM audit_events WHERE id = :id"),
-                {"id": watermark},
-            ).first()
-            if shipped_row is None:
-                MIRROR_LAG_GAUGE.set((datetime.now(timezone.utc) - latest_ts).total_seconds())
-                return
-            shipped_ts: datetime = shipped_row[0]
-            if shipped_ts.tzinfo is None:
-                shipped_ts = shipped_ts.replace(tzinfo=timezone.utc)
-            lag = (latest_ts - shipped_ts).total_seconds()
-            MIRROR_LAG_GAUGE.set(max(lag, 0.0))
         except Exception as exc:  # noqa: BLE001
             logger.debug("could not update lag gauge: %s", exc)
 
@@ -673,10 +784,10 @@ class AuditChainWriter:
         if self._s3_session_factory is not None:
             override = self._s3_session_factory
 
-            def _factory() -> Any:
+            def _override_factory() -> Any:
                 return override(cfg)
 
-            return _factory
+            return _override_factory
 
         # Lazy import — aioboto3 is only required when running the daemon
         try:
@@ -688,14 +799,15 @@ class AuditChainWriter:
 
         session = aioboto3.Session(
             aws_access_key_id=access_key_id or os.getenv("AWS_ACCESS_KEY_ID"),
-            aws_secret_access_key=secret_access_key or os.getenv("AWS_SECRET_ACCESS_KEY"),
+            aws_secret_access_key=secret_access_key
+            or os.getenv("AWS_SECRET_ACCESS_KEY"),
             region_name=cfg.region,
         )
 
-        def _factory() -> Any:
+        def _boto_factory() -> Any:
             return session.client("s3", endpoint_url=cfg.s3_endpoint)
 
-        return _factory
+        return _boto_factory
 
     def _publish_nats_break(self, payload: dict[str, Any]) -> bool:
         """Publish the audit_chain_break event. Returns True on emission."""
@@ -712,7 +824,7 @@ class AuditChainWriter:
             if asyncio.iscoroutine(coro):
                 # Use existing running loop if available, else create fresh one.
                 try:
-                    loop = asyncio.get_running_loop()
+                    asyncio.get_running_loop()
                     # Fire and forget — schedule on the running loop.
                     asyncio.ensure_future(coro)
                 except RuntimeError:

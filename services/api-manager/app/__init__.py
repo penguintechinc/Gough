@@ -17,7 +17,6 @@ from pathlib import Path
 from quart import Quart, Response
 from quart_cors import cors
 from prometheus_client import generate_latest, CONTENT_TYPE_LATEST
-from sqlalchemy import text
 from penguin_aaa.middleware.asgi import AuditMiddleware
 from penguin_aaa.audit.emitter import Emitter
 
@@ -228,8 +227,7 @@ async def create_app(config_class: type = Config) -> Quart:
             if db is None:
                 # Degraded mode: DB not available but app is still running
                 return {"status": "unhealthy", "database": "unavailable"}, 503
-            with db.engine.connect() as conn:
-                conn.execute(text("SELECT 1"))
+            db.executesql("SELECT 1")
             return {"status": "healthy", "database": "connected"}, 200
         except Exception as e:
             return {"status": "unhealthy", "error": str(e)}, 503
@@ -245,8 +243,7 @@ async def create_app(config_class: type = Config) -> Quart:
             if db is None:
                 readiness_state["checks"]["database"] = "unavailable (degraded mode)"
             else:
-                with db.engine.connect() as conn:
-                    conn.execute(text("SELECT 1"))
+                db.executesql("SELECT 1")
                 readiness_state["checks"]["database"] = "up"
         except Exception as e:
             readiness_state["status"] = "not_ready"
@@ -308,8 +305,7 @@ async def create_app(config_class: type = Config) -> Quart:
             if db is None:
                 # Degraded mode: DB not available but app is still running
                 return {"status": "unhealthy", "database": "unavailable"}, 503
-            with db.engine.connect() as conn:
-                conn.execute(text("SELECT 1"))
+            db.executesql("SELECT 1")
             return {"status": "healthy", "database": "connected"}, 200
         except Exception as e:
             return {"status": "unhealthy", "error": str(e)}, 503
@@ -326,8 +322,7 @@ async def create_app(config_class: type = Config) -> Quart:
             if db is None:
                 readiness_state["checks"]["database"] = "unavailable (degraded mode)"
             else:
-                with db.engine.connect() as conn:
-                    conn.execute(text("SELECT 1"))
+                db.executesql("SELECT 1")
                 readiness_state["checks"]["database"] = "up"
         except Exception as e:
             readiness_state["status"] = "not_ready"

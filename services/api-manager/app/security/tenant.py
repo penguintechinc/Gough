@@ -8,7 +8,6 @@ from __future__ import annotations
 
 from typing import Optional
 from pydantic import BaseModel, Field
-from sqlalchemy import text
 from quart import g
 
 
@@ -103,34 +102,6 @@ def assert_tenant_match(token_tenant: str, body_tenant: Optional[str]) -> None:
 
 
 # ==============================================================================
-# PostgreSQL GUC Management
-# ==============================================================================
-
-def set_tenant_guc(db_connection, tenant_id: str) -> None:
-    """Set PostgreSQL 'app.current_tenant' GUC for RLS policies.
-
-    Executes: SELECT set_config('app.current_tenant', :tenant_id, true)
-    - Third argument 'true' = local scope (transaction-scoped).
-    - Uses parameterized query to prevent SQL injection.
-
-    Sync function: penguin-dal is the runtime authority per backend-database.md
-    and is sync. The Quart middleware that calls this is `async def` but runs
-    this single statement directly because the operation is microseconds and
-    blocks the event loop only briefly — switching to an async SQLAlchemy
-    engine is M2 work tied to penguin-dal's async upgrade.
-
-    Args:
-        db_connection: SQLAlchemy connection object (sync).
-        tenant_id: Tenant ID to set in GUC.
-
-    Raises:
-        Exception: If set_config fails (database error).
-    """
-    query = text("SELECT set_config('app.current_tenant', :tenant_id, true)")
-    db_connection.execute(query, {"tenant_id": tenant_id})
-
-
-# ==============================================================================
 # Middleware Integration
 # ==============================================================================
 
@@ -150,12 +121,20 @@ async def tenant_middleware(
 
     Tenant GUC Enforcement (RLS Layer 4 — FIX #7a):
     ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
-    The tenant GUC ``app.current_tenant`` is set via a SQLAlchemy pool
-    ``connect`` event listener so it attaches to the SAME connection that
-    serves the request's queries (not a throwaway one). This ensures Postgres
-    RLS policies enforcing tenant isolation actually receive the GUC value
-    and enforce row filtering.  Application-level tenant guards (FIX #7b, #7c,
-    #17) provide defense-in-depth; RLS is the secondary layer.
+    The tenant GUC ``app.current_tenant`` is pushed via a
+    ``contextvars.ContextVar`` (``app.db.rls.set_current_tenant``) that a
+    SQLAlchemy connection-pool ``checkout`` event listener
+    (``app.db.rls.install_rls_events``) reads and applies to whichever
+    physical connection penguin-dal hands out next -- i.e. the SAME
+    connection that serves the request's queries, not a throwaway one set up
+    and torn down separately. A ContextVar (not ``threading.local``) is used
+    because blocking penguin-dal calls run via ``asyncio.to_thread()`` on a
+    worker thread; ``asyncio.to_thread()`` copies the current context onto
+    that thread, so the value set here is visible wherever the query
+    actually executes. This ensures Postgres RLS policies enforcing tenant
+    isolation actually receive the GUC value and enforce row filtering.
+    Application-level tenant guards (FIX #7b, #7c, #17) provide
+    defense-in-depth; RLS is the secondary layer.
 
     Args:
         app: Quart application instance.
@@ -168,7 +147,7 @@ async def tenant_middleware(
     from quart import request, jsonify
     from app.middleware import get_token_from_header, decode_token
     from app.security.scope_policy import ANONYMOUS_PATHS
-    from app.db.database import get_db
+    from app.db.rls import CROSS_TENANT_SENTINEL, set_current_tenant
 
     # Check if current request is anonymous
     method = request.method
@@ -195,6 +174,16 @@ async def tenant_middleware(
     # Store tenant context in request scope
     g.tenant_context = tenant_context
 
-    # Store tenant on g for pool event listener to read; the listener
-    # will attach the GUC to connections at checkout time (see app factory).
+    # FIX #7a: push the tenant onto the ContextVar the connection-pool
+    # checkout listener reads (app.db.rls.install_rls_events). Super-admin
+    # (cross_tenant=True) tokens push the CROSS_TENANT_SENTINEL instead of
+    # their own tenant_id -- the generic RLS `tenant_isolation` policy
+    # treats that sentinel as "match every row" (see app.db.rls docstring).
+    guc_tenant = (
+        CROSS_TENANT_SENTINEL if tenant_context.cross_tenant else tenant_context.tenant_id
+    )
+    set_current_tenant(guc_tenant)
+
+    # Retained on g for source compatibility with any code still reading it
+    # directly (the ContextVar above is the value the pool listener acts on).
     g._tenant_id_for_guc = tenant_context.tenant_id

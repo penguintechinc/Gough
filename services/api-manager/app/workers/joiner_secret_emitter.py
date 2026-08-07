@@ -21,6 +21,7 @@ infrastructure (Layer 3), and migrations (Layer 4).
 
 from __future__ import annotations
 
+import json
 import logging
 import uuid
 from dataclasses import dataclass
@@ -28,16 +29,17 @@ from datetime import datetime, timedelta, timezone
 from typing import Any, Iterable, Optional, Protocol
 
 from pydantic import BaseModel
-from sqlalchemy import text
-from sqlalchemy.orm import Session
+from penguin_dal import DB, Row
 
 from app.clients.vault import VaultClient
-from app.models_m1 import Biome, JoinerSecret, Node, NodeBiomeAssignment
-from app.security.audit_chain import AuditEventWriter
-from app.security.joiner_envelope import (
-    encrypt_envelope,
-    zero_bytes,
+from app.db.rls import CROSS_TENANT_SENTINEL, get_current_tenant, set_current_tenant
+from app.models_m1 import JoinerSecret
+from app.security.audit_chain import (
+    ZERO_HASH,
+    compute_chain_hash,
+    generate_uuidv7,
 )
+from app.security.joiner_envelope import encrypt_envelope, zero_bytes
 
 
 VAULT_KEK_NAME = "gough-joiner-dek-wrap"
@@ -160,6 +162,199 @@ class EmitResult:
     expires_at: object        # datetime
 
 
+def persist_extracted_material(
+    tx: Any,
+    *,
+    cluster_id: str,
+    tenant_id: str,
+    biome_kind: str,
+    emitter_biome_id: int,
+    emitter_node_id: Optional[int],
+    extractor_name: str,
+    scope: str,
+    vault_client: VaultClient,
+    material: ExtractedMaterial,
+    actor_sub: str,
+    actor_scope: list[str],
+    action: str,
+    resource_kind: str = "joiner_secret",
+    vault_kek_name: str = VAULT_KEK_NAME,
+    request_id: Optional[str] = None,
+    reason: Optional[str] = None,
+) -> tuple[str, str, Optional[datetime]]:
+    """Envelope-encrypt already-extracted material and persist it atomically.
+
+    Callers that already hold plaintext (e.g. ``app.api.joiner_secrets
+    .rotate_joiner_secret``, which gets it from
+    ``JOINER_ROTATE_MATERIAL_PROVIDER`` rather than a fresh control-tunnel
+    extraction) don't go through ``JoinerSecretEmitter.emit()`` -- that
+    method's whole first half (load biome_instance context, validate
+    joiner_emit_spec, run the extractor over the control tunnel) doesn't
+    apply, and it returns ``list[JoinerSecretMetadata]`` from a
+    ``biome_instance_id``, not a single result for an already-known secret.
+    This function is the second half only (encrypt + insert + audit),
+    extracted so both call sites share one persistence implementation.
+
+    Takes a penguin-dal ``Tx`` (``DB.transaction()``), not a SQLAlchemy
+    ``Session`` -- ``Tx`` only exposes raw driver-native-paramstyle
+    ``executesql()``, so the audit-chain row is appended here via the pure
+    hashing/id helpers from ``app.security.audit_chain`` (``generate_uuidv7``,
+    ``compute_chain_hash``, ``canonicalize_record``, ``ZERO_HASH`` -- none of
+    which need a ``db_session``) rather than ``AuditEventWriter``, which
+    does and is therefore incompatible with a ``Tx``. This mirrors
+    ``JoinerSecretEmitter._persist()``'s raw-SQL insert shape one-for-one,
+    just re-pointed at ``Tx.executesql`` instead of
+    ``Session.execute(text(...))``.
+
+    Args:
+        tx: Pinned-connection transaction handle from ``db.transaction()``.
+        cluster_id: Cluster UUID (string form -- see the VARCHAR(36) note in
+            ``app.api.joiner_secrets``).
+        tenant_id: Tenant id owning the new secret.
+        biome_kind: Biome kind label carried onto the audit record.
+        emitter_biome_id: FK to ``biomes.id``.
+        emitter_node_id: FK to ``nodes.id`` (nullable).
+        extractor_name: Extractor name carried onto the new row + audit record.
+        scope: One of ``VALID_SCOPES``.
+        vault_client: Vault client used to wrap the per-row DEK.
+        material: Already-extracted plaintext + rotation metadata.
+        actor_sub: Audit actor subject.
+        actor_scope: Audit actor scopes.
+        action: Audit action string (e.g. ``"joiner.secret.rotate"``).
+        resource_kind: Audit resource_kind (defaults to ``"joiner_secret"``).
+        vault_kek_name: Vault transit key name for DEK wrapping.
+        request_id: Optional request id carried onto the audit record.
+        reason: Optional operator-supplied reason (e.g. rotate's required
+            ``reason`` field), carried onto the audit record's after_json
+            when given.
+
+    Returns:
+        ``(joiner_secret_id, audit_event_id, expires_at)``, all as the same
+        types ``EmitResult`` carries (str ids, ``Optional[datetime]``).
+
+    Raises:
+        ExtractorSpecError: If ``scope`` is not in ``VALID_SCOPES``.
+    """
+    if scope not in VALID_SCOPES:
+        raise ExtractorSpecError(f"Invalid scope: {scope!r}")
+
+    envelope = encrypt_envelope(
+        plaintext=material.plaintext,
+        vault_client=vault_client,
+        vault_kek_name=vault_kek_name,
+    )
+
+    joiner_secret_id = uuid.uuid4()
+    now = datetime.now(timezone.utc)
+    expires_at: Optional[datetime] = None
+    if material.ttl_seconds and material.ttl_seconds > 0:
+        expires_at = now + timedelta(seconds=material.ttl_seconds)
+
+    prev_rows = tx.executesql(
+        "SELECT hash FROM audit_events ORDER BY ts DESC, id DESC LIMIT 1"
+    )
+    prev_hash_raw = prev_rows[0][0] if prev_rows else None
+    prev_hash: bytes = (
+        bytes(prev_hash_raw)
+        if isinstance(prev_hash_raw, (bytes, bytearray)) and len(prev_hash_raw) == 32
+        else ZERO_HASH
+    )
+
+    event_id = generate_uuidv7()
+    ts_utc = datetime.now(timezone.utc)
+    after_json: dict[str, Any] = {
+        "biome_kind": biome_kind,
+        "extractor_name": extractor_name,
+        "scope": scope,
+        "rotation_class": material.rotation_class,
+        "ttl_seconds": material.ttl_seconds if material.ttl_seconds else None,
+        "vault_kek_name": vault_kek_name,
+        "emitter_biome_id": emitter_biome_id,
+        "emitter_node_id": emitter_node_id,
+    }
+    if reason is not None:
+        after_json["reason"] = reason
+    record_fields = {
+        "id": str(event_id),
+        "ts": ts_utc.isoformat(),
+        "cluster_id": cluster_id,
+        "tenant_id": tenant_id,
+        "actor_sub": actor_sub,
+        "actor_scope": actor_scope,
+        "action": action,
+        "resource_kind": resource_kind,
+        "resource_id": str(joiner_secret_id),
+        "before_json": None,
+        "after_json": after_json,
+        "request_id": request_id,
+        "source_ip": None,
+        "user_agent": None,
+    }
+    chain_hash = compute_chain_hash(prev_hash, record_fields)
+
+    tx.executesql(
+        """
+        INSERT INTO audit_events
+        (id, ts, cluster_id, tenant_id, actor_sub, actor_scope, action,
+         resource_kind, resource_id, before_json, after_json, request_id,
+         source_ip, user_agent, prev_hash, hash, signature)
+        VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+        """,
+        (
+            str(event_id),
+            ts_utc,
+            cluster_id,
+            tenant_id,
+            actor_sub,
+            json.dumps(actor_scope),
+            action,
+            resource_kind,
+            str(joiner_secret_id),
+            None,
+            json.dumps(after_json),
+            request_id,
+            None,
+            None,
+            prev_hash,
+            chain_hash,
+            None,
+        ),
+    )
+
+    tx.executesql(
+        """
+        INSERT INTO joiner_secrets
+          (id, cluster_id, tenant_id, biome_kind, emitter_biome_id,
+           emitter_node_id, extractor_name, scope, ciphertext, iv,
+           auth_tag, dek_wrapped, vault_kek_name, ttl_seconds,
+           expires_at, rotation_class, created_at, audit_event_id)
+        VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+        """,
+        (
+            str(joiner_secret_id),
+            cluster_id,
+            tenant_id,
+            biome_kind,
+            emitter_biome_id,
+            emitter_node_id,
+            extractor_name,
+            scope,
+            envelope.ciphertext,
+            envelope.iv,
+            envelope.auth_tag,
+            envelope.dek_wrapped,
+            envelope.vault_kek_name,
+            material.ttl_seconds if material.ttl_seconds else None,
+            expires_at,
+            material.rotation_class,
+            now,
+            str(event_id),
+        ),
+    )
+
+    return str(joiner_secret_id), str(event_id), expires_at
+
+
 class _ExtractorSpec(BaseModel):
     """Validated extractor entry from joiner_emit_spec.extractors[]."""
 
@@ -194,7 +389,7 @@ class JoinerSecretEmitter:
 
     def __init__(
         self,
-        db_session: Session,
+        db: DB,
         vault_client: VaultClient,
         control_tunnel_client: ControlTunnelClient,
         nats_client: Optional[NatsPublisher] = None,
@@ -206,7 +401,11 @@ class JoinerSecretEmitter:
         """Initialize the emitter.
 
         Args:
-            db_session: SQLAlchemy session bound to the api-manager-rw role.
+            db: penguin-dal ``DB`` instance (the RLS-wired ``app.config["db"]``
+                pool -- see ``app.models.get_db``). ``emit()`` pushes the RLS
+                cross-tenant sentinel for its own duration (see ``emit()``
+                docstring), so callers do not need to set a tenant GUC
+                themselves before constructing this emitter.
             vault_client: Vault client used to wrap per-row DEKs.
             control_tunnel_client: mTLS control-tunnel client used to run
                 extractors inside the biome's LXD instance.
@@ -217,7 +416,7 @@ class JoinerSecretEmitter:
             vault_kek_name: Vault transit key name used to wrap each DEK.
             logger: Logger instance; defaults to module logger.
         """
-        self.db_session = db_session
+        self.db = db
         self.vault_client = vault_client
         self.control_tunnel = control_tunnel_client
         self.nats = nats_client
@@ -245,32 +444,56 @@ class JoinerSecretEmitter:
                 resolved, or the assignment is not in ``ready`` state.
             ExtractorSpecError: When ``joiner_emit_spec`` is malformed.
             ControlTunnelExtractionError: When a control-tunnel call fails.
+
+        RLS note: this runs outside Quart's HTTP request pipeline (invoked
+        by a background trigger on a ``biome_instance_id`` alone -- no
+        request, no ``tenant_middleware``, so ``app.db.rls``'s tenant
+        ContextVar is never set by anything upstream of this call). Worse,
+        resolving *which* tenant owns this row is the first thing this
+        method has to do (``_load_context`` looks up the assignment/biome/
+        node by PK, before any tenant is known), so there is no tenant to
+        scope to even if a caller wanted to. This pushes the RLS
+        cross-tenant sentinel (``app.db.rls.CROSS_TENANT_SENTINEL``) for
+        the duration of the whole call -- both the context-resolution reads
+        and the eventual write, restoring whatever was previously set (if
+        anything) on this task's context before returning. The write
+        itself still uses the row's own real ``tenant_id`` for every
+        inserted column; the sentinel only affects which existing rows are
+        *visible*, not what gets written -- the ``tenant_isolation`` RLS
+        policy in the baseline migration has no separate ``WITH CHECK``
+        clause, so it reuses ``USING`` for inserts too, and the sentinel
+        value satisfies that check for any tenant_id being written.
         """
-        assignment, biome, node = self._load_context(biome_instance_id)
-        cluster_id = self._resolve_cluster_id(node)
-        spec_extractors = self._validate_spec(biome)
+        previous_tenant = get_current_tenant()
+        set_current_tenant(CROSS_TENANT_SENTINEL)
+        try:
+            assignment, biome, node = self._load_context(biome_instance_id)
+            cluster_id = self._resolve_cluster_id(node)
+            spec_extractors = self._validate_spec(biome)
 
-        if not spec_extractors:
-            self.logger.info(
-                "Biome has emits_joiner_secrets=true but no extractors; skipping",
-                extra={"biome_id": biome.id, "biome_instance_id": biome_instance_id},
-            )
-            return []
+            if not spec_extractors:
+                self.logger.info(
+                    "Biome has emits_joiner_secrets=true but no extractors; skipping",
+                    extra={"biome_id": biome.id, "biome_instance_id": biome_instance_id},
+                )
+                return []
 
-        lxd_instance = self._derive_lxd_instance(node, biome, assignment)
+            lxd_instance = self._derive_lxd_instance(node, biome, assignment)
 
-        results: list[JoinerSecretMetadata] = []
-        for extractor in spec_extractors:
-            metadata = self._emit_one(
-                cluster_id=cluster_id,
-                biome=biome,
-                node=node,
-                lxd_instance=lxd_instance,
-                extractor=extractor,
-            )
-            results.append(metadata)
+            results: list[JoinerSecretMetadata] = []
+            for extractor in spec_extractors:
+                metadata = self._emit_one(
+                    cluster_id=cluster_id,
+                    biome=biome,
+                    node=node,
+                    lxd_instance=lxd_instance,
+                    extractor=extractor,
+                )
+                results.append(metadata)
 
-        return results
+            return results
+        finally:
+            set_current_tenant(previous_tenant)
 
     # ------------------------------------------------------------------ #
     # Per-extractor pipeline                                             #
@@ -280,8 +503,8 @@ class JoinerSecretEmitter:
         self,
         *,
         cluster_id: str,
-        biome: Biome,
-        node: Node,
+        biome: Row,
+        node: Row,
         lxd_instance: str,
         extractor: _ExtractorSpec,
     ) -> JoinerSecretMetadata:
@@ -484,103 +707,53 @@ class JoinerSecretEmitter:
         cluster_id: str,
         tenant_id: str,
     ) -> tuple[str, str, Optional[datetime]]:
-        """Encrypt + insert + audit inside a SERIALIZABLE transaction.
+        """Encrypt + insert + audit inside one penguin-dal transaction.
+
+        Thin wrapper over the module-level ``persist_extracted_material``
+        helper -- the same function ``app.api.joiner_secrets
+        .rotate_joiner_secret`` and the gRPC ``JoinerSecrets`` servicer use,
+        so there is one write path for "envelope-encrypt + insert
+        joiner_secrets + append a hash-chained audit_events row", not two.
+        Previously this method duplicated that whole sequence directly
+        against a SQLAlchemy ``Session``.
+
+        Isolation note: the former SQLAlchemy implementation opened its
+        connection with ``execution_options={"isolation_level":
+        "SERIALIZABLE"}``; penguin-dal's ``Tx`` (``DB.transaction()``) has
+        no isolation-level control, so that guarantee is not carried
+        forward here. This matches ``rotate_joiner_secret``'s existing
+        penguin-dal-transaction implementation (task 6a) exactly -- same
+        tradeoff, not a regression introduced by this conversion. Both
+        still get one pinned connection with commit-on-clean-exit /
+        rollback-on-exception, which is what makes the insert+audit pair
+        atomic.
 
         Returns:
             ``(joiner_secret_id, audit_event_id, expires_at)``.
         """
-        if scope not in VALID_SCOPES:
-            raise ExtractorSpecError(f"Invalid scope: {scope!r}")
-
-        # Envelope-encrypt: generates DEK internally, encrypts plaintext,
-        # wraps DEK via Vault transit, and zeros the DEK in memory.
-        envelope = encrypt_envelope(
+        material = ExtractedMaterial(
+            extractor_name=extractor_name,
             plaintext=raw_bytes,
-            vault_client=self.vault_client,
-            vault_kek_name=self.vault_kek_name,
+            ttl_seconds=ttl_seconds or 0,
+            rotation_class=rotation_class,
         )
-
-        joiner_secret_id = uuid.uuid4()
-        now = datetime.now(timezone.utc)
-        expires_at: Optional[datetime] = None
-        if ttl_seconds and ttl_seconds > 0:
-            expires_at = now + timedelta(seconds=ttl_seconds)
-
-        # SERIALIZABLE isolation for the entire emit (insert + audit).
-        # ``connection()`` with execution_options requests serializable
-        # isolation for the connection backing this session.
-        connection = self.db_session.connection(
-            execution_options={"isolation_level": "SERIALIZABLE"}
-        )
-
-        # Append audit-chain row first so resource_id links the joiner_secret
-        # row to its hash-chained event. Both writes share the same session
-        # and commit atomically.
-        audit_writer = AuditEventWriter(
-            db_session=self.db_session,
-            cluster_id=cluster_id,
-        )
-        audit_event = audit_writer.append(
-            actor_sub=self.actor_sub,
-            actor_scope=["system:api-manager"],
-            action="joiner.secret.emit",
-            resource_kind="joiner_secret",
-            resource_id=str(joiner_secret_id),
-            tenant_id=tenant_id,
-            # NEVER include secret bytes in before/after.
-            before=None,
-            after={
-                "biome_kind": biome_kind,
-                "extractor_name": extractor_name,
-                "scope": scope,
-                "rotation_class": rotation_class,
-                "ttl_seconds": ttl_seconds if ttl_seconds else None,
-                "vault_kek_name": self.vault_kek_name,
-                "emitter_biome_id": emitter_biome_id,
-                "emitter_node_id": emitter_node_id,
-            },
-        )
-
-        # Insert the joiner_secrets row using the SERIALIZABLE connection.
-        insert_stmt = text(
-            """
-            INSERT INTO joiner_secrets
-              (id, cluster_id, tenant_id, biome_kind, emitter_biome_id,
-               emitter_node_id, extractor_name, scope, ciphertext, iv,
-               auth_tag, dek_wrapped, vault_kek_name, ttl_seconds,
-               expires_at, rotation_class, created_at, audit_event_id)
-            VALUES
-              (:id, :cluster_id, :tenant_id, :biome_kind, :emitter_biome_id,
-               :emitter_node_id, :extractor_name, :scope, :ciphertext, :iv,
-               :auth_tag, :dek_wrapped, :vault_kek_name, :ttl_seconds,
-               :expires_at, :rotation_class, :created_at, :audit_event_id)
-            """
-        )
-        connection.execute(
-            insert_stmt,
-            {
-                "id": str(joiner_secret_id),
-                "cluster_id": str(cluster_id),
-                "tenant_id": tenant_id,
-                "biome_kind": biome_kind,
-                "emitter_biome_id": emitter_biome_id,
-                "emitter_node_id": emitter_node_id,
-                "extractor_name": extractor_name,
-                "scope": scope,
-                "ciphertext": envelope.ciphertext,
-                "iv": envelope.iv,
-                "auth_tag": envelope.auth_tag,
-                "dek_wrapped": envelope.dek_wrapped,
-                "vault_kek_name": envelope.vault_kek_name,
-                "ttl_seconds": ttl_seconds if ttl_seconds else None,
-                "expires_at": expires_at,
-                "rotation_class": rotation_class,
-                "created_at": now,
-                "audit_event_id": str(audit_event.id),
-            },
-        )
-
-        return str(joiner_secret_id), str(audit_event.id), expires_at
+        with self.db.transaction() as tx:
+            return persist_extracted_material(
+                tx,
+                cluster_id=str(cluster_id),
+                tenant_id=tenant_id,
+                biome_kind=biome_kind,
+                emitter_biome_id=emitter_biome_id,
+                emitter_node_id=emitter_node_id,
+                extractor_name=extractor_name,
+                scope=scope,
+                vault_client=self.vault_client,
+                material=material,
+                actor_sub=self.actor_sub,
+                actor_scope=["system:api-manager"],
+                action="joiner.secret.emit",
+                vault_kek_name=self.vault_kek_name,
+            )
 
     # ------------------------------------------------------------------ #
     # NATS                                                               #
@@ -625,12 +798,19 @@ class JoinerSecretEmitter:
 
     def _load_context(
         self, biome_instance_id: int
-    ) -> tuple[NodeBiomeAssignment, Biome, Node]:
-        """Load assignment + biome + node and validate ready state."""
+    ) -> tuple[Row, Row, Row]:
+        """Load assignment + biome + node and validate ready state.
+
+        Physical table is ``node_egg_assignments`` (``db.node_egg_assignments``)
+        with an ``egg_id`` column -- ``NodeBiomeAssignment.biome_id`` was only
+        ever a Python-side ORM ``synonym("egg_id")``, never a real column, so
+        penguin-dal's reflected access (raw DB columns only) uses ``egg_id``
+        directly, not ``biome_id``.
+        """
         assignment = (
-            self.db_session.query(NodeBiomeAssignment)
-            .filter(NodeBiomeAssignment.id == biome_instance_id)
-            .one_or_none()
+            self.db(self.db.node_egg_assignments.id == biome_instance_id)
+            .select()
+            .first()
         )
         if assignment is None:
             raise EmitterStateError(
@@ -642,25 +822,17 @@ class JoinerSecretEmitter:
                 f"{assignment.status!r}, expected 'ready'"
             )
 
-        biome = (
-            self.db_session.query(Biome)
-            .filter(Biome.id == assignment.biome_id)
-            .one_or_none()
-        )
+        biome = self.db(self.db.biomes.id == assignment.egg_id).select().first()
         if biome is None:
             raise EmitterStateError(
-                f"biome {assignment.biome_id} for biome_instance {biome_instance_id} not found"
+                f"biome {assignment.egg_id} for biome_instance {biome_instance_id} not found"
             )
         if not biome.emits_joiner_secrets:
             raise EmitterStateError(
                 f"biome {biome.id} (kind={biome.biome_kind!r}) has emits_joiner_secrets=false"
             )
 
-        node = (
-            self.db_session.query(Node)
-            .filter(Node.id == assignment.node_id)
-            .one_or_none()
-        )
+        node = self.db(self.db.nodes.id == assignment.node_id).select().first()
         if node is None:
             raise EmitterStateError(
                 f"node {assignment.node_id} for biome_instance {biome_instance_id} not found"
@@ -668,7 +840,7 @@ class JoinerSecretEmitter:
 
         return assignment, biome, node
 
-    def _resolve_cluster_id(self, node: Node) -> str:
+    def _resolve_cluster_id(self, node: Row) -> str:
         """Resolve cluster UUID (constructor override or per-node lookup).
 
         The Node model in M1 does not carry a direct cluster_id column;
@@ -679,27 +851,21 @@ class JoinerSecretEmitter:
         if self._cluster_id is not None:
             return self._cluster_id
 
-        row = self.db_session.execute(
-            text(
-                """
-                SELECT sb.cluster_id
-                  FROM storage_backends sb
-                 WHERE sb.tenant_id = :tenant_id
-                 LIMIT 1
-                """
-            ),
-            {"tenant_id": node.tenant_id},
-        ).first()
-        if row is None or row[0] is None:
+        row = (
+            self.db(self.db.storage_backends.tenant_id == node.tenant_id)
+            .select(self.db.storage_backends.cluster_id, limitby=(0, 1))
+            .first()
+        )
+        if row is None or row.cluster_id is None:
             raise EmitterStateError(
                 f"cluster_id not resolvable for node {node.id}; "
                 "construct JoinerSecretEmitter with cluster_id=..."
             )
-        return str(row[0])
+        return str(row.cluster_id)
 
     @staticmethod
     def _derive_lxd_instance(
-        node: Node, biome: Biome, assignment: NodeBiomeAssignment
+        node: Row, biome: Row, assignment: Row
     ) -> str:
         """Derive the LXD instance name for the biome's workload.
 
@@ -711,7 +877,7 @@ class JoinerSecretEmitter:
             return node.name
         return f"{biome.biome_kind}-{assignment.id}"
 
-    def _validate_spec(self, biome: Biome) -> list[_ExtractorSpec]:
+    def _validate_spec(self, biome: Row) -> list[_ExtractorSpec]:
         """Parse + validate ``joiner_emit_spec.extractors[]``."""
         spec = biome.joiner_emit_spec or {}
         if not isinstance(spec, dict):

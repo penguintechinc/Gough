@@ -1320,11 +1320,19 @@ def _resolve_joiner_secrets(
     """Query joiner_secrets table for each consumed secret reference.
 
     Returns (refs: list[str], errors: list[PlanValidationError]).
-    """
-    from sqlalchemy import text  # type: ignore[import-untyped]
 
+    ``db_session`` is a penguin-dal ``DB`` instance (see ``PlanCompiler``
+    docstring for the request-scoped RLS reasoning -- this reuses whatever
+    tenant is already ambient on the calling request/task, same as
+    ``_load_node``/``_load_eggs``; no explicit tenant filter or cross-tenant
+    sentinel here). ``joiner_secrets`` is one of the tables the baseline
+    migration enables RLS on, so an unset tenant context fails closed (zero
+    rows) here exactly as it would for ``nodes``/``biomes``.
+    """
     refs: list[str] = []
     errors: list[PlanValidationError] = []
+
+    tbl = db_session.joiner_secrets
 
     for consume_spec in egg_node.consumes_joiner_secrets_from:
         # Backward-compat: accept egg_kind or biome_kind
@@ -1333,28 +1341,22 @@ def _resolve_joiner_secrets(
         scope = consume_spec.get("scope", "cluster")
         optional = consume_spec.get("mode", "hard") == "soft"
 
-        row = db_session.execute(
-            text(
-                """
-                SELECT id FROM joiner_secrets
-                WHERE cluster_id = :cluster_id
-                  AND biome_kind = :biome_kind
-                  AND extractor_name = :extractor
-                  AND scope = :scope
-                  AND revoked_at IS NULL
-                  AND (expires_at IS NULL OR expires_at > :now)
-                ORDER BY created_at DESC
-                LIMIT 1
-                """
-            ),
-            {
-                "cluster_id": cluster_id,
-                "biome_kind": biome_kind,
-                "extractor": extractor,
-                "scope": scope,
-                "now": now,
-            },
-        ).first()
+        query = (
+            (tbl.cluster_id == cluster_id)
+            & (tbl.biome_kind == biome_kind)
+            & (tbl.extractor_name == extractor)
+            & (tbl.scope == scope)
+            & (tbl.revoked_at == None)  # noqa: E711 — DAL idiom
+            & (
+                (tbl.expires_at == None)  # noqa: E711 — DAL idiom
+                | (tbl.expires_at > now)
+            )
+        )
+        row = (
+            db_session(query)
+            .select(tbl.id, orderby=~tbl.created_at, limitby=(0, 1))
+            .first()
+        )
 
         if row is None:
             if optional:
@@ -1377,7 +1379,7 @@ def _resolve_joiner_secrets(
                     )
                 )
         else:
-            refs.append(str(row[0]))
+            refs.append(str(row.id))
 
     return refs, errors
 
@@ -1419,7 +1421,30 @@ class PlanCompiler:
     """Orchestrates Phase 1→2 plan compilation for a single node.
 
     Args:
-        db_session: SQLAlchemy session (sync) for DB reads.
+        db_session: penguin-dal ``DB`` instance (task-7b runtime-DAL
+            migration -- despite the name, this is no longer a SQLAlchemy
+            ``Session``; kept as ``db_session`` because the sole call site,
+            ``app.api.nodes.deploy_node``, constructs this class with
+            ``db_session=db`` as a keyword argument). Reads in
+            ``_load_node``/``_load_eggs``/``_resolve_joiner_secrets`` apply
+            NO explicit tenant filter -- they rely entirely on ambient
+            Postgres RLS. That is safe here specifically because
+            ``PlanCompiler`` is constructed exactly once in this codebase,
+            from inside a Quart request handler (``deploy_node``) *after*
+            it has already called ``app.models.get_db()``, i.e. after
+            ``tenant_middleware`` has set the request's tenant on
+            ``app.db.rls``'s ContextVar. Per ``app.db.rls``'s own module
+            docstring, that ContextVar propagates through
+            ``asyncio.to_thread()`` (the intended way to invoke the
+            synchronous ``compile()``/``validate()`` methods below without
+            blocking the event loop) because ``copy_context()`` carries it
+            onto the worker thread. Contrast with
+            ``app.workers.joiner_secret_emitter.JoinerSecretEmitter`` and
+            the gRPC servicers in ``app.grpc_server``, which run with no
+            request/tenant context at all and must explicitly push
+            ``app.db.rls.CROSS_TENANT_SENTINEL`` for the duration of their
+            reads -- unnecessary (and would be *wrong*, widening visibility
+            past the request's own tenant) here.
         vault_client: Configured VaultClient for transit encryption.
         lxd_client: Module reference exposing ``mint_join_token``.
         spire_client: SpireClient (currently unused in M1; reserved for M2).
@@ -1622,21 +1647,21 @@ class PlanCompiler:
     # ------------------------------------------------------------------
 
     def _load_node(self, node_id: int) -> Any | None:
-        """Load node from DB; return None if not found."""
-        from sqlalchemy import text  # type: ignore[import-untyped]
+        """Load node from DB; return None if not found.
 
-        row = self.db_session.execute(
-            text("SELECT * FROM nodes WHERE id = :id"),
-            {"id": node_id},
-        ).first()
-        return row
+        No app-level tenant filter -- relies on ambient RLS (see class
+        docstring: this only ever runs request-scoped).
+        """
+        return self.db_session(self.db_session.nodes.id == node_id).select().first()
 
     def _load_eggs(
         self, plan_request: PlanRequest
     ) -> tuple[dict[int, _BiomeNode], list[PlanValidationError]]:
-        """Load all requested biomes from DB and build _BiomeNode map."""
-        from sqlalchemy import text  # type: ignore[import-untyped]
+        """Load all requested biomes from DB and build _BiomeNode map.
 
+        No app-level tenant filter -- relies on ambient RLS (see class
+        docstring: this only ever runs request-scoped).
+        """
         errors: list[PlanValidationError] = []
         biome_nodes: dict[int, _BiomeNode] = {}
 
@@ -1644,17 +1669,11 @@ class PlanCompiler:
         if not biome_ids:
             return {}, []
 
-        placeholders = ", ".join(f":id_{i}" for i in range(len(biome_ids)))
-        params = {f"id_{i}": eid for i, eid in enumerate(biome_ids)}
-        rows = self.db_session.execute(
-            text(f"SELECT * FROM biomes WHERE id IN ({placeholders})"),
-            params,
-        ).fetchall()
+        rows = self.db_session(self.db_session.biomes.id.belongs(biome_ids)).select()
 
-        keys = list(rows[0]._fields) if rows else []
         found_ids = set()
         for row in rows:
-            row_dict = dict(zip(keys, row))
+            row_dict = row.as_dict()
             eid = row_dict["id"]
             found_ids.add(eid)
 

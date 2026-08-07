@@ -2,8 +2,9 @@
 
 Per Gough spec Sprint 4 (Biome Model -> Joiner Secrets). All endpoints are
 tenant-scoped; cluster-id from the URL is filtered against the JWT's tenant
-claim through Layer 4 RLS (the GUC ``app.current_tenant`` is set by
-``app.security.tenant.set_tenant_guc``).
+claim through Layer 4 RLS (the GUC ``app.current_tenant`` is pushed via the
+``contextvars.ContextVar`` in ``app.db.rls``, applied to every penguin-dal
+connection on pool checkout -- see ``app.security.tenant.tenant_middleware``).
 
 Response payloads NEVER expose any portion of the encrypted envelope. The
 fields ``ciphertext``, ``dek_wrapped``, ``iv``, and ``auth_tag`` are read
@@ -19,25 +20,27 @@ from __future__ import annotations
 import logging
 import uuid
 from datetime import datetime, timedelta, timezone
-from typing import Any, Optional
+from typing import Any, Optional, cast
 
+from penguin_dal import Row
 from quart import Blueprint, current_app, g, jsonify, request
 
 from app import metrics as _metrics
 
-from app.models_m1 import JoinerSecret
 from app.security.audit_chain import AuditEventWriter
 from app.security.credentials import (
     CredentialError,
     InvalidCredentialError,
     validate_user_jwt,
 )
+from app.security.joiner_envelope import zero_bytes
 from app.security.scope_enforcement import require_scopes
-from app.security.tenant import set_tenant_guc
 from app.workers.joiner_secret_emitter import (
     ExtractedMaterial,
-    JoinerSecretEmitter,
+    persist_extracted_material,
 )
+
+from ..models import get_db
 
 log = logging.getLogger(__name__)
 
@@ -54,24 +57,6 @@ DEFAULT_MFA_REQUIRED_LANES: frozenset[str] = frozenset({"fedramp", "hipaa", "pci
 # =============================================================================
 # Helpers
 # =============================================================================
-
-
-def _get_db_session() -> Any:
-    """Return the SQLAlchemy session attached to ``flask.g`` or the app.
-
-    The Quart factory binds either ``g.db_session`` (request scope) or
-    ``current_app.db_session_factory()`` for ad-hoc use. This wrapper is the
-    single point of indirection so tests can monkey-patch ``g.db_session``.
-    """
-    sess = g.get("db_session", None)
-    if sess is not None:
-        return sess
-    factory = current_app.config.get("DB_SESSION_FACTORY")
-    if factory is None:
-        raise RuntimeError("No DB session bound to request context")
-    sess = factory()
-    g.db_session = sess
-    return sess
 
 
 def _get_tenant_id() -> str:
@@ -109,7 +94,15 @@ def _get_actor_scope() -> list[str]:
 
 
 def _build_audit_writer(cluster_id: uuid.UUID) -> AuditEventWriter:
-    """Construct an AuditEventWriter bound to the cluster + Vault transit signer."""
+    """Construct an AuditEventWriter bound to the cluster + Vault transit signer.
+
+    ``AuditEventWriter`` (``app.security.audit_chain``, Task 8a) takes a
+    penguin-dal ``DB`` instance despite the constructor keyword still being
+    named ``db_session`` -- ``get_db()`` is the same connection-pool-backed
+    instance the ContextVar-wired RLS events (``app.db.rls``) apply the
+    tenant GUC to on checkout, so the writer's chain-head read + insert are
+    tenant-scoped exactly like every other penguin-dal call in this module.
+    """
     vault_client = current_app.config.get("VAULT_CLIENT")
     signer = None
     if vault_client is not None:
@@ -124,7 +117,7 @@ def _build_audit_writer(cluster_id: uuid.UUID) -> AuditEventWriter:
         signer = _signer
 
     return AuditEventWriter(
-        db_session=_get_db_session(),
+        db_session=get_db(),
         cluster_id=str(cluster_id),
         signer=signer,
     )
@@ -168,12 +161,14 @@ def _enforce_mfa_if_required(tenant_id: str) -> Optional[tuple[Any, int]]:
     return None
 
 
-def _serialize_joiner_secret(row: JoinerSecret) -> dict[str, Any]:
-    """Serialize a JoinerSecret row, omitting all envelope/secret material.
+def _serialize_joiner_secret(row: Any) -> dict[str, Any]:
+    """Serialize a joiner_secrets row, omitting all envelope/secret material.
 
-    Strict allow-list serialization. The fields ``ciphertext``, ``iv``,
-    ``auth_tag``, and ``dek_wrapped`` are loaded into the ORM but MUST NEVER
-    appear in API output. Tests assert this contract explicitly.
+    Strict allow-list serialization. ``row`` is a penguin-dal ``Row`` (dict
+    with attribute access) reflecting the ``joiner_secrets`` table. The
+    fields ``ciphertext``, ``iv``, ``auth_tag``, and ``dek_wrapped`` are
+    present on the row but MUST NEVER appear in API output. Tests assert
+    this contract explicitly.
     """
     now = datetime.now(timezone.utc)
     revoked = row.revoked_at is not None
@@ -229,26 +224,33 @@ async def list_joiner_secrets(cluster_id: uuid.UUID):
         biome_kind: optional filter
         scope: optional filter
         status: ``active|expiring-soon|revoked`` filter
+
+    Runtime read via the penguin-dal overlay (``get_db()``) -- tenant
+    isolation is both the explicit ``tenant_id ==`` filter below
+    (Layer 1/2 app-level scoping) and RLS via the ContextVar the tenant
+    middleware already set (``app.db.rls``), same as every other
+    penguin-dal-backed API module in this service.
     """
     tenant_id = _get_tenant_id()
-    db = _get_db_session()
-    set_tenant_guc(db, tenant_id)
+    db = get_db()
 
     args = request.args
     biome_kind_filter = args.get("biome_kind")
     scope_filter = args.get("scope")
     status_filter = args.get("status")
 
-    query = db.query(JoinerSecret).filter(
-        JoinerSecret.cluster_id == cluster_id,
-        JoinerSecret.tenant_id == tenant_id,
+    # cluster_id/id-like columns are physically VARCHAR(36) (see
+    # app.models_m1.UUID TypeDecorator) -- penguin-dal reflects the raw
+    # column type, so compare against the string form of the UUID.
+    query = (db.joiner_secrets.cluster_id == str(cluster_id)) & (
+        db.joiner_secrets.tenant_id == tenant_id
     )
     if biome_kind_filter:
-        query = query.filter(JoinerSecret.biome_kind == biome_kind_filter)
+        query = query & (db.joiner_secrets.biome_kind == biome_kind_filter)
     if scope_filter:
-        query = query.filter(JoinerSecret.scope == scope_filter)
+        query = query & (db.joiner_secrets.scope == scope_filter)
 
-    rows = query.order_by(JoinerSecret.created_at.desc()).all()
+    rows = db(query).select(orderby=db.joiner_secrets.created_at.desc())
     items = [_serialize_joiner_secret(r) for r in rows]
 
     if status_filter in {"active", "expiring-soon", "revoked"}:
@@ -273,7 +275,28 @@ async def list_joiner_secrets(cluster_id: uuid.UUID):
 )
 @require_scopes("gough.joiner.rotate")
 async def rotate_joiner_secret(cluster_id: uuid.UUID, js_id: uuid.UUID):
-    """Rotate a joiner secret: revoke old row + emit fresh secret."""
+    """Rotate a joiner secret: revoke old row + persist a fresh one, atomically.
+
+    Revoke-mark, new-secret insert, and its audit-chain row all happen
+    inside a single ``db.transaction()`` (one pinned Postgres connection,
+    commit-on-clean-exit / rollback-on-exception) -- if persisting the new
+    secret fails for any reason (Vault down, encryption error, etc.), the
+    revoke of the old secret rolls back with it. Splitting these into
+    separate auto-committing calls (the naive per-call penguin-dal
+    ``.update()``/``.insert()`` pattern used elsewhere in this file) would
+    leave the old secret permanently revoked with no replacement on a
+    mid-rotation failure -- exactly the failure mode this transaction
+    exists to prevent.
+
+    Does not go through ``JoinerSecretEmitter.emit()`` -- that method's
+    contract (``biome_instance_id`` -> run a fresh control-tunnel
+    extraction -> ``list[JoinerSecretMetadata]``) is a different flow than
+    "persist material this caller already extracted via
+    ``JOINER_ROTATE_MATERIAL_PROVIDER``". Uses
+    ``app.workers.joiner_secret_emitter.persist_extracted_material``
+    instead, which is exactly that persistence step, factored out to take a
+    penguin-dal ``Tx`` so it can run inside this transaction.
+    """
     tenant_id = _get_tenant_id()
     mfa_block = _enforce_mfa_if_required(tenant_id)
     if mfa_block is not None:
@@ -287,17 +310,15 @@ async def rotate_joiner_secret(cluster_id: uuid.UUID, js_id: uuid.UUID):
             400,
         )
 
-    db = _get_db_session()
-    set_tenant_guc(db, tenant_id)
-
-    row: Optional[JoinerSecret] = (
-        db.query(JoinerSecret)
-        .filter(
-            JoinerSecret.id == js_id,
-            JoinerSecret.cluster_id == cluster_id,
-            JoinerSecret.tenant_id == tenant_id,
+    db = get_db()
+    row: Any = (
+        db(
+            (db.joiner_secrets.id == str(js_id))
+            & (db.joiner_secrets.cluster_id == str(cluster_id))
+            & (db.joiner_secrets.tenant_id == tenant_id)
         )
-        .one_or_none()
+        .select()
+        .first()
     )
     if row is None:
         return jsonify({"error": "not_found"}), 404
@@ -331,66 +352,65 @@ async def rotate_joiner_secret(cluster_id: uuid.UUID, js_id: uuid.UUID):
 
     material: ExtractedMaterial = new_plaintext_provider(row)
 
-    now = datetime.now(timezone.utc)
-    row.revoked_at = now
-    row.rotated_at = now
-    db.flush()
-
-    audit_writer = _build_audit_writer(cluster_id)
     actor_sub = _get_actor_sub()
     actor_scope = _get_actor_scope()
     request_id = request.headers.get("X-Request-Id")
+    now = datetime.now(timezone.utc)
 
-    audit_writer.append(
-        actor_sub=actor_sub,
-        actor_scope=actor_scope,
-        action="joiner.secret.rotate",
-        resource_kind="joiner_secret",
-        resource_id=str(row.id),
-        tenant_id=tenant_id,
-        before={"joiner_secret_id": str(row.id), "revoked_at": None},
-        after={
-            "joiner_secret_id": str(row.id),
-            "revoked_at": now.isoformat(),
-            "reason": reason,
-        },
-        request_id=request_id,
-    )
-
-    emitter = JoinerSecretEmitter(
-        db_session=db,
-        vault_client=current_app.config["VAULT_CLIENT"],
-        audit_writer=audit_writer,
-    )
     try:
-        emit_result = emitter.emit(
-            cluster_id=cluster_id,
-            tenant_id=tenant_id,
-            biome_kind=row.biome_kind,
-            emitter_biome_id=row.emitter_biome_id,
-            emitter_node_id=row.emitter_node_id,
-            scope=row.scope,
-            material=material,
-            actor_sub=actor_sub,
-            actor_scope=actor_scope,
-            request_id=request_id,
-        )
+        with db.transaction() as tx:
+            tx.executesql(
+                "UPDATE joiner_secrets SET revoked_at = %s, rotated_at = %s "
+                "WHERE id = %s",
+                (now, now, str(js_id)),
+            )
+            new_id, audit_event_id, _expires_at = persist_extracted_material(
+                tx,
+                cluster_id=str(cluster_id),
+                tenant_id=tenant_id,
+                biome_kind=row.biome_kind,
+                emitter_biome_id=row.emitter_biome_id,
+                emitter_node_id=row.emitter_node_id,
+                extractor_name=row.extractor_name,
+                scope=row.scope,
+                vault_client=current_app.config["VAULT_CLIENT"],
+                material=material,
+                actor_sub=actor_sub,
+                actor_scope=actor_scope,
+                action="joiner.secret.rotate",
+                request_id=request_id,
+                reason=reason,
+            )
+            new_row_data = cast(
+                "list[dict[str, Any]]",
+                tx.executesql(
+                    "SELECT * FROM joiner_secrets WHERE id = %s",
+                    (new_id,),
+                    as_dict=True,
+                ),
+            )
     except Exception:
         _metrics.joiner_secret_decryption_failure.inc()
         raise
+    finally:
+        try:
+            zero_bytes(material.plaintext)
+        except Exception:  # pragma: no cover - best-effort
+            log.debug("zero_bytes(material.plaintext) failed; bytes will be GC'd")
 
-    new_row = (
-        db.query(JoinerSecret)
-        .filter(JoinerSecret.id == emit_result.joiner_secret_id)
-        .one()
-    )
+    # Reflect the now-committed revoke onto the in-memory row for the
+    # response (same validated row from above; the UPDATE ran inside the
+    # transaction that just committed).
+    row.revoked_at = now
+    row.rotated_at = now
+    new_row = Row(new_row_data[0]) if new_row_data else None
 
     return (
         jsonify(
             {
                 "rotated": _serialize_joiner_secret(row),
                 "new_secret": _serialize_joiner_secret(new_row),
-                "audit_event_id": str(emit_result.audit_event_id),
+                "audit_event_id": audit_event_id,
             }
         ),
         201,
@@ -402,7 +422,14 @@ async def rotate_joiner_secret(cluster_id: uuid.UUID, js_id: uuid.UUID):
 )
 @require_scopes("gough.cluster.admin")
 async def revoke_joiner_secret(cluster_id: uuid.UUID, js_id: uuid.UUID):
-    """Revoke a joiner secret (sets ``revoked_at``; never hard-deletes)."""
+    """Revoke a joiner secret (sets ``revoked_at``; never hard-deletes).
+
+    The revoke-mark and the self-audit-log write (via ``_build_audit_writer``
+    -> ``AuditEventWriter``) both go through the same penguin-dal overlay
+    (``get_db()``) now -- tenant scoping comes from RLS via the ContextVar
+    the tenant middleware already set (``app.db.rls``), same as every other
+    penguin-dal-backed handler in this module. No explicit GUC call needed.
+    """
     tenant_id = _get_tenant_id()
     body = await request.get_json(silent=True) or {}
     reason = body.get("reason")
@@ -412,17 +439,15 @@ async def revoke_joiner_secret(cluster_id: uuid.UUID, js_id: uuid.UUID):
             400,
         )
 
-    db = _get_db_session()
-    set_tenant_guc(db, tenant_id)
-
-    row: Optional[JoinerSecret] = (
-        db.query(JoinerSecret)
-        .filter(
-            JoinerSecret.id == js_id,
-            JoinerSecret.cluster_id == cluster_id,
-            JoinerSecret.tenant_id == tenant_id,
+    db = get_db()
+    row: Any = (
+        db(
+            (db.joiner_secrets.id == str(js_id))
+            & (db.joiner_secrets.cluster_id == str(cluster_id))
+            & (db.joiner_secrets.tenant_id == tenant_id)
         )
-        .one_or_none()
+        .select()
+        .first()
     )
     if row is None:
         return jsonify({"error": "not_found"}), 404
@@ -430,8 +455,8 @@ async def revoke_joiner_secret(cluster_id: uuid.UUID, js_id: uuid.UUID):
         return jsonify({"error": "already_revoked"}), 409
 
     now = datetime.now(timezone.utc)
+    db(db.joiner_secrets.id == str(js_id)).update(revoked_at=now)
     row.revoked_at = now
-    db.flush()
 
     audit_writer = _build_audit_writer(cluster_id)
     audit_writer.append(

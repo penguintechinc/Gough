@@ -22,7 +22,9 @@ from sqlalchemy import (
     TypeDecorator,
     UniqueConstraint,
     Uuid,
+    text,
 )
+from sqlalchemy.dialects import postgresql
 from sqlalchemy.orm import relationship, synonym
 
 from .models_sqlalchemy import Base
@@ -68,7 +70,7 @@ class Node(Base):
     ipv6 = Column(String(45), nullable=True)
     boot_config_id = Column(Integer, nullable=True)
     hardware_json = Column(JSON, nullable=True)
-    hardware_tags = Column(JSON, nullable=True)
+    hardware_tags = Column(JSON().with_variant(postgresql.JSONB(), "postgresql"), nullable=True)
     posture = Column(String(32), nullable=False, server_default="compliant")
     preferred_addr_family = Column(String(16), nullable=False, server_default="auto")
     attestation_method = Column(String(32), nullable=False, server_default="discovery_agent")
@@ -91,7 +93,10 @@ class Node(Base):
         Index("ix_nodes_state", "state"),
         Index("ix_nodes_tenant_id", "tenant_id"),
         Index("ix_nodes_primary_nic_mac", "primary_nic_mac"),
-        Index("ix_nodes_hardware_tags", "hardware_tags"),
+        # postgresql_using is a dialect-specific kwarg: honored (GIN) when
+        # compiled for Postgres, ignored (falls back to a standard index) on
+        # every other dialect -- matches the migration's Postgres-only guard.
+        Index("ix_nodes_hardware_tags", "hardware_tags", postgresql_using="gin"),
         {"extend_existing": True},
     )
 
@@ -561,8 +566,19 @@ class JoinerSecret(Base):
     audit_event_id = Column(UUID(), ForeignKey("audit_events.id", ondelete="SET NULL"), nullable=True)
 
     __table_args__ = (
-        Index("ix_joiner_secrets_cluster_egg_extractor", "cluster_id", "biome_kind", "extractor_name"),
-        Index("ix_joiner_secrets_expires_at", "expires_at"),
+        # postgresql_where is honored (partial index) on Postgres and ignored
+        # (falls back to a full index) on every other dialect -- matches the
+        # migration this table was originally created by.
+        Index(
+            "ix_joiner_secrets_cluster_egg_extractor",
+            "cluster_id", "biome_kind", "extractor_name",
+            postgresql_where=text("revoked_at IS NULL"),
+        ),
+        Index(
+            "ix_joiner_secrets_expires_at",
+            "expires_at",
+            postgresql_where=text("revoked_at IS NULL"),
+        ),
         Index("ix_joiner_secrets_tenant_id", "tenant_id"),
         {"extend_existing": True},
     )
@@ -800,6 +816,48 @@ class NodeEvent(Base):
         Index("ix_node_events_tenant_id", "tenant_id"),
         Index("ix_node_events_ts", "ts"),
         Index("ix_node_events_stage", "stage"),
+        {"extend_existing": True},
+    )
+
+
+# =============================================================================
+# Webhook Endpoints Table
+# =============================================================================
+
+
+class WebhookEndpoint(Base):
+    """Tenant-registered webhook subscriber endpoint.
+
+    Read/written via raw SQL in ``app/api/webhooks.py`` and
+    ``app/workers/webhook_dispatcher.py``; this class registers the table on
+    ``Base.metadata`` for Alembic autogenerate/``create_all`` parity, matching
+    every other M1 table. HMAC/asymmetric signing material is never stored
+    here -- it lives in Vault only (``WebhookKeyManager``).
+    """
+
+    __tablename__ = "webhook_endpoints"
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    tenant_id = Column(String(255), nullable=False, server_default="__default__")
+    url = Column(String(2048), nullable=False)
+    signing_mode = Column(String(32), nullable=False, server_default="ed25519")
+    active = Column(Boolean, nullable=False, server_default="true")
+    event_filter = Column(JSON().with_variant(postgresql.JSONB(), "postgresql"), nullable=True)
+    retry_policy = Column(JSON().with_variant(postgresql.JSONB(), "postgresql"), nullable=True)
+    created_at = Column(
+        DateTime(timezone=True),
+        nullable=False,
+        default=lambda: datetime.now(timezone.utc),
+    )
+    updated_at = Column(
+        DateTime(timezone=True),
+        nullable=False,
+        default=lambda: datetime.now(timezone.utc),
+    )
+
+    __table_args__ = (
+        Index("ix_webhook_endpoints_tenant_id", "tenant_id"),
+        Index("ix_webhook_endpoints_active", "active"),
         {"extend_existing": True},
     )
 

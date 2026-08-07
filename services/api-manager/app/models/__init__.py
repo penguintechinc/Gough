@@ -65,15 +65,28 @@ def validate_database_schema(db_uri: str) -> bool:
         print(f"Missing columns in auth_user: {missing}")
         return False
 
-    # Check if default admin exists
-    from sqlalchemy import text
-    with engine.connect() as conn:
-        result = conn.execute(text("SELECT COUNT(*) FROM auth_user WHERE email = 'admin@gough.local'"))
-        admin_count = result.scalar()
+    # Check if default admin exists (penguin-dal runtime query). This runs at
+    # app-startup, before app.config["db"] exists and with no request/tenant
+    # context -- app.db.rls's RLS GUC wiring would fail-closed (0 rows) on a
+    # table it protects. `auth_user` is deliberately NOT in the baseline
+    # migration's `rls_tables` list (see
+    # alembic/versions/20260805_1000_baseline_full_schema.py) -- it carries
+    # no RLS policy at all, so no tenant scoping is needed here (verified:
+    # grepped every migration for an `auth_user` RLS policy, found none).
+    # Short-lived, pool_size=1 connection, closed immediately after this one
+    # check -- app.config["db"]'s real pool is constructed separately, right
+    # after this function returns (see init_db below).
+    from ..models_sqlalchemy import convert_pydal_to_sqlalchemy_uri
 
-        if admin_count == 0:
-            print("Default admin user not found")
-            return False
+    check_db = DB(convert_pydal_to_sqlalchemy_uri(db_uri), pool_size=1, reflect=True)
+    try:
+        admin_count = check_db(check_db.auth_user.email == "admin@gough.local").count()
+    finally:
+        check_db.close()
+
+    if admin_count == 0:
+        print("Default admin user not found")
+        return False
 
     print("Database schema validation passed")
     return True
@@ -121,6 +134,16 @@ def init_db(app: Quart) -> DB:
         # Return a None-like object that won't crash the app
         # The health endpoint will handle this gracefully
         db = None
+
+    # Step 3: Wire RLS tenant GUC enforcement (FIX #7a) onto the connection
+    # pool backing this DB instance, so every penguin-dal query -- on the
+    # event loop thread or an asyncio.to_thread() worker -- carries the
+    # request's tenant on the connection Postgres RLS policies inspect. See
+    # app.db.rls for the full mechanism; no-op for non-Postgres backends.
+    if db is not None:
+        from ..db.rls import install_rls_events
+
+        install_rls_events(db.engine)
 
     # Store db instance in app (may be None if connection failed)
     app.config["db"] = db

@@ -37,6 +37,7 @@ from typing import Any, Awaitable, Callable, Iterable, Optional
 
 import httpx
 
+from ..db.rls import get_current_tenant, set_current_tenant
 from ..security.webhook_keys import (
     ECDSA_P256_SHA256,
     ED25519,
@@ -216,24 +217,40 @@ class WebhookDispatcher:
     def _load_endpoints(self, tenant_id: str) -> Iterable[WebhookEndpoint]:
         if self._endpoint_loader is not None:
             return self._endpoint_loader(tenant_id)
-        # Default: SQL session pulling from ``webhook_endpoints``.
+        # Default: penguin-dal read from ``webhook_endpoints``.
         if self._db is None:
             return ()
+        # webhook_endpoints is RLS-protected (baseline migration
+        # `rls_tables` -- see
+        # alembic/versions/20260805_1000_baseline_full_schema.py). This
+        # dispatcher is a background worker invoked outside Quart's HTTP
+        # request pipeline, so `app.db.rls`'s tenant ContextVar is never set
+        # by anything upstream -- an unset GUC fails RLS closed to zero rows
+        # (see that module's docstring), which would make every dispatch()
+        # silently deliver to nobody rather than raise. Unlike a worker that
+        # genuinely spans tenants within one DB unit (see
+        # app.workers.audit_chain_writer._cross_tenant_scope()),
+        # dispatch()/`_load_endpoints` always resolve exactly one tenant_id
+        # per call (validated in dispatch()), so the least-privilege fix is
+        # to scope the GUC to that one tenant for the read, not grant the
+        # cross-tenant sentinel.
+        previous_tenant = get_current_tenant()
+        set_current_tenant(tenant_id)
         try:
-            from sqlalchemy import text
-            rows = self._db.execute(
-                text(
-                    "SELECT id, tenant_id, url, signing_mode, event_filter, active "
-                    "FROM webhook_endpoints WHERE tenant_id = :t AND active = TRUE"
-                ),
+            rows = self._db.executesql(
+                "SELECT id, tenant_id, url, signing_mode, event_filter, active "
+                "FROM webhook_endpoints WHERE tenant_id = %(t)s AND active = TRUE",
                 {"t": tenant_id},
-            ).fetchall()
+                as_dict=True,
+            )
         except Exception:  # pragma: no cover - schema/runtime concerns
             log.exception("failed to load webhook endpoints")
             return ()
+        finally:
+            set_current_tenant(previous_tenant)
         out: list[WebhookEndpoint] = []
         for r in rows:
-            ef = r[4]
+            ef = r["event_filter"]
             if isinstance(ef, str):
                 try:
                     ef = json.loads(ef)
@@ -241,12 +258,12 @@ class WebhookDispatcher:
                     ef = []
             out.append(
                 WebhookEndpoint(
-                    id=str(r[0]),
-                    tenant_id=str(r[1]),
-                    url=str(r[2]),
-                    signing_mode=str(r[3]),
+                    id=str(r["id"]),
+                    tenant_id=str(r["tenant_id"]),
+                    url=str(r["url"]),
+                    signing_mode=str(r["signing_mode"]),
                     event_filter=tuple(ef or ()),
-                    active=bool(r[5]),
+                    active=bool(r["active"]),
                 )
             )
         return out

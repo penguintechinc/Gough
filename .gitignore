@@ -229,3 +229,4 @@ coverage-*.out
 
 # Git worktrees (parallel development)
 .worktrees/
+.superpowers/

@@ -9,6 +9,7 @@ import json
 from typing import Any
 
 import pytest
+from penguin_dal.query import Row
 
 from app.api.webhooks import (
     MAX_EVENT_FILTER_PATTERNS,
@@ -303,20 +304,37 @@ def test_validate_retry_policy_combined():
 
 
 # =============================================================================
-# Tests: _row_to_dict JSON parsing (lines 141-157)
+# Tests: _row_to_dict (lines 141-157)
+#
+# ``_row_to_dict`` now reads a penguin-dal ``Row`` (attribute access), not a
+# positional SQLAlchemy Core tuple -- built here via the real ``Row`` class
+# rather than a stand-in, since it's the exact object ``db(...).select()``
+# returns. event_filter/retry_policy are native JSONB columns, so penguin-dal
+# reflects them as already-deserialized Python list/dict in the normal case
+# (test_row_to_dict_all_fields); the isinstance(str) fallback is exercised
+# separately since it's a defensive path, not the common one.
 # =============================================================================
 
 
-def test_row_to_dict_valid_json():
-    """_row_to_dict parses valid JSON in event_filter and retry_policy."""
-    row = (
-        "webhook-id",
-        "acme",
-        "https://example.com/webhook",
-        "ed25519",
-        True,
-        json.dumps(["gough.event"]),
-        json.dumps({"mode": "standard", "max_attempts": 3}),
+def _make_row(**overrides):
+    base = dict(
+        id="webhook-id",
+        tenant_id="acme",
+        url="https://example.com/webhook",
+        signing_mode="ed25519",
+        active=True,
+        event_filter=["gough.event"],
+        retry_policy={"mode": "standard", "max_attempts": 3},
+    )
+    base.update(overrides)
+    return Row(base)
+
+
+def test_row_to_dict_valid_json_string_fallback():
+    """_row_to_dict parses valid JSON strings (defensive fallback path)."""
+    row = _make_row(
+        event_filter=json.dumps(["gough.event"]),
+        retry_policy=json.dumps({"mode": "standard", "max_attempts": 3}),
     )
     result = _row_to_dict(row)
     assert result["event_filter"] == ["gough.event"]
@@ -326,74 +344,43 @@ def test_row_to_dict_valid_json():
 
 def test_row_to_dict_invalid_event_filter_json():
     """_row_to_dict handles invalid JSON in event_filter."""
-    row = (
-        "webhook-id",
-        "acme",
-        "https://example.com/webhook",
-        "ed25519",
-        True,
-        "{invalid json",
-        json.dumps({"mode": "standard"}),
-    )
+    row = _make_row(event_filter="{invalid json", retry_policy={"mode": "standard"})
     result = _row_to_dict(row)
     assert result["event_filter"] == []
 
 
 def test_row_to_dict_invalid_retry_policy_json():
     """_row_to_dict handles invalid JSON in retry_policy."""
-    row = (
-        "webhook-id",
-        "acme",
-        "https://example.com/webhook",
-        "ed25519",
-        True,
-        json.dumps([]),
-        "{bad json}",
-    )
+    row = _make_row(event_filter=[], retry_policy="{bad json}")
     result = _row_to_dict(row)
     assert result["retry_policy"] == {}
 
 
 def test_row_to_dict_null_event_filter():
     """_row_to_dict handles None event_filter."""
-    row = (
-        "webhook-id",
-        "acme",
-        "https://example.com/webhook",
-        "ed25519",
-        True,
-        None,
-        json.dumps({}),
-    )
+    row = _make_row(event_filter=None, retry_policy={})
     result = _row_to_dict(row)
     assert result["event_filter"] == []
 
 
 def test_row_to_dict_null_retry_policy():
     """_row_to_dict handles None retry_policy."""
-    row = (
-        "webhook-id",
-        "acme",
-        "https://example.com/webhook",
-        "ed25519",
-        True,
-        json.dumps([]),
-        None,
-    )
+    row = _make_row(event_filter=[], retry_policy=None)
     result = _row_to_dict(row)
     assert result["retry_policy"] == {}
 
 
 def test_row_to_dict_all_fields():
-    """_row_to_dict converts all row fields correctly."""
-    row = (
-        "webhook-id-123",
-        "tenant-acme",
-        "https://webhook.example.com/hook",
-        "ecdsa_p256_sha256",
-        False,
-        json.dumps(["pattern1", "pattern2"]),
-        json.dumps({"mode": "none", "max_attempts": 1}),
+    """_row_to_dict converts all row fields correctly -- native JSONB shape
+    (already-deserialized list/dict), the normal penguin-dal case."""
+    row = _make_row(
+        id="webhook-id-123",
+        tenant_id="tenant-acme",
+        url="https://webhook.example.com/hook",
+        signing_mode="ecdsa_p256_sha256",
+        active=False,
+        event_filter=["pattern1", "pattern2"],
+        retry_policy={"mode": "none", "max_attempts": 1},
     )
     result = _row_to_dict(row)
     assert result["id"] == "webhook-id-123"

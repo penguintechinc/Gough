@@ -313,6 +313,20 @@ async def install_security_middleware(app) -> None:
         async def _tenant_before_request():
             return await _tenant_mw(app, _noop_setter)
 
+        # FIX #7a: clear the RLS tenant ContextVar at the end of every
+        # request (success or exception), not just when a new request sets
+        # a fresh value. Quart/hypercorn request handling can run several
+        # requests through the same asyncio context in some paths (notably
+        # the test client, issuing sequential requests within one test's
+        # task), so without an explicit clear a tenant set by one request
+        # could still be visible -- and used by the pool checkout listener
+        # -- on the next one that never went through tenant extraction.
+        @app.teardown_request
+        async def _tenant_teardown_request(exc: BaseException | None = None) -> None:  # noqa: ARG001
+            from app.db.rls import set_current_tenant
+
+            set_current_tenant(None)
+
     # Step 3: scope enforcement (FAIL-CLOSED, FIX #16).
     # If scope enforcement middleware fails to initialize, the service MUST
     # refuse to start. This is non-negotiable: serving without scope enforcement
