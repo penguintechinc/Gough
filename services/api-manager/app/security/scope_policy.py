@@ -165,6 +165,12 @@ SCOPE_POLICY: dict[tuple[str, str], frozenset[str] | None] = {
     ("POST", "/api/v1/webhooks"): frozenset({"gough.cluster.admin"}),
     ("DELETE", "/api/v1/webhooks/<string:webhook_id>"): frozenset({"gough.cluster.admin"}),
     ("POST", "/api/v1/webhooks/<string:webhook_id>/test"): frozenset({"gough.cluster.admin"}),
+
+    # Authentication endpoints (regression: gh-31 Bug 3)
+    # These require authentication but no specific scopes (any valid user can call them)
+    ("GET", "/api/v1/auth/me"): frozenset(),
+    ("POST", "/api/v1/auth/logout"): frozenset(),
+    ("POST", "/api/v1/auth/change-password"): frozenset(),
 }
 
 
@@ -186,10 +192,13 @@ ANONYMOUS_PATHS: frozenset[tuple[str, str]] = frozenset({
     ("GET", "/api/v1/ipxe/kernel/<string:name>"),
     ("GET", "/api/v1/ipxe/initrd/<string:name>"),
     ("GET", "/api/v1/ipxe/helper-efi/<string:mac>"),
-    # Authentication endpoints (regression: gh-31)
-    # Only login and refresh endpoints are public per requirement.
+    # Authentication endpoints (regression: gh-31 and gh-31 Bug 3)
+    # login, refresh: entry points (no JWT required)
     ("POST", "/api/v1/auth/login"),
     ("POST", "/api/v1/auth/refresh"),
+    # Password reset: public (forgot-password flow has no JWT; reset_token in body)
+    ("POST", "/api/v1/auth/request-password-reset"),
+    ("POST", "/api/v1/auth/reset-password"),
 })
 
 
