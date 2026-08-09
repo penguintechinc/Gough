@@ -186,6 +186,10 @@ ANONYMOUS_PATHS: frozenset[tuple[str, str]] = frozenset({
     ("GET", "/api/v1/ipxe/kernel/<string:name>"),
     ("GET", "/api/v1/ipxe/initrd/<string:name>"),
     ("GET", "/api/v1/ipxe/helper-efi/<string:mac>"),
+    # Authentication endpoints (regression: gh-31)
+    # Only login and refresh endpoints are public per requirement.
+    ("POST", "/api/v1/auth/login"),
+    ("POST", "/api/v1/auth/refresh"),
 })
 
 

@@ -66,9 +66,9 @@ def create_refresh_token(user_id: int) -> tuple[str, datetime]:
 
 
 @auth_bp.route("/login", methods=["POST"])
-def login():
+async def login():
     """Login endpoint - returns access and refresh tokens."""
-    data = request.get_json()
+    data = await request.get_json()
 
     if not data:
         return jsonify({"error": "Request body required"}), 400
@@ -111,9 +111,9 @@ def login():
 
 
 @auth_bp.route("/refresh", methods=["POST"])
-def refresh():
+async def refresh():
     """Refresh access token using refresh token."""
-    data = request.get_json()
+    data = await request.get_json()
 
     if not data:
         return jsonify({"error": "Request body required"}), 400
@@ -167,7 +167,7 @@ def refresh():
 
 @auth_bp.route("/logout", methods=["POST"])
 @auth_required
-def logout():
+async def logout():
     """Logout endpoint - revokes all refresh tokens for user."""
     user = get_current_user()
 
@@ -182,7 +182,7 @@ def logout():
 
 @auth_bp.route("/me", methods=["GET"])
 @auth_required
-def get_me():
+async def get_me():
     """Get current user profile."""
     user = get_current_user()
 
@@ -197,9 +197,9 @@ def get_me():
 
 
 @auth_bp.route("/register", methods=["POST"])
-def register():
+async def register():
     """Register new user (creates viewer role by default)."""
-    data = request.get_json()
+    data = await request.get_json()
 
     if not data:
         return jsonify({"error": "Request body required"}), 400
