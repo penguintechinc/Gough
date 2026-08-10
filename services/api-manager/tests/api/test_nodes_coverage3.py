@@ -59,7 +59,6 @@ def dal(tmp_path, monkeypatch):
         Field("ipv4", "string"),
         Field("ipv6", "string"),
         Field("ipv4_static", "string"),
-        Field("firmware_type", "string"),
         Field("boot_config_id", "integer"),
         Field("hardware_json", "json"),
         Field("hardware_tags", "json"),
@@ -405,65 +404,6 @@ async def test_discover_db_error_on_existing_lookup(app_nodes, dal, monkeypatch)
         )
         # Should return 500 due to DB error (line 490)
         assert resp.status_code in (400, 401, 500)
-
-
-@pytest.mark.asyncio
-async def test_discover_db_error_on_update_minimal_fields(app_nodes, dal, monkeypatch):
-    """Test discover update with minimal fields when firmware_type column fails (line 444-446)."""
-    from app.api.nodes import _DbNonceStore
-
-    # Create a node first
-    node_id = dal.nodes.insert(
-        tenant_id="__default__",
-        name="test-node",
-        state="new",
-        dmi_uuid="existing-dmi-uuid",
-        primary_nic_mac="aa:bb:cc:dd:ee:11",
-    )
-    dal.commit()
-
-    # Mock DB.nodes.update() to fail on firmware_type, succeed on fallback
-    original_update = dal.__call__
-
-    call_count = [0]
-
-    def mock_call(query):
-        result = original_update(query)
-        original_update_method = result.update
-
-        def fallback_update(**kwargs):
-            call_count[0] += 1
-            if call_count[0] == 1 and "firmware_type" in kwargs:
-                raise RuntimeError("firmware_type column missing")
-            return original_update_method(**kwargs)
-
-        result.update = fallback_update
-        return result
-
-    monkeypatch.setattr(dal, "__call__", mock_call)
-
-    # Prepare discover request
-    body = {
-        "dmi_uuid": "existing-dmi-uuid",
-        "primary_nic_mac": "aa:bb:cc:dd:ee:11",
-        "firmware_type": "uefi",
-        "lshw_json": {},
-        "lsblk_json": {},
-        "nics": [],
-        "numa_topology": None,
-        "accelerators": [],
-        "smart_attributes": [],
-        "hardware_tags": [],
-    }
-
-    async with app_nodes.test_client() as client:
-        resp = await client.post(
-            "/api/v1/nodes/discover",
-            json=body,
-            headers={"Authorization": "Bearer test-token"},
-        )
-        # Should handle gracefully
-        assert resp.status_code in (200, 201, 400, 401, 500)
 
 
 # ---------------------------------------------------------------------------

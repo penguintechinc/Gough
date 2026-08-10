@@ -242,6 +242,7 @@ lint: ## Code Quality - Run linting for all languages
 	@if command -v golangci-lint >/dev/null 2>&1; then echo "$(YELLOW)-- golangci-lint --$(RESET)"; golangci-lint run || true; fi
 	@if command -v hadolint >/dev/null 2>&1; then echo "$(YELLOW)-- hadolint --$(RESET)"; find . -name "Dockerfile*" -not -path "*/.git/*" | xargs hadolint || true; fi
 	@if command -v shellcheck >/dev/null 2>&1; then echo "$(YELLOW)-- shellcheck --$(RESET)"; find . -name "*.sh" -not -path "*/.git/*" | xargs shellcheck || true; fi
+	@if command -v spectral >/dev/null 2>&1; then echo "$(YELLOW)-- spectral (OpenAPI) --$(RESET)"; $(MAKE) lint-openapi || true; fi
 	@npm run lint 2>/dev/null || true
 	@cd services/webui && npm run lint 2>/dev/null || true
 
@@ -258,6 +259,10 @@ lint-node: ## Code Quality - Run Node.js linting
 	@echo "$(BLUE)Linting Node.js code...$(RESET)"
 	@npm run lint
 	@cd services/webui && npm run lint
+
+lint-openapi: ## Code Quality - Lint OpenAPI specifications
+	@echo "$(BLUE)Linting OpenAPI specifications...$(RESET)"
+	@spectral lint --ruleset .spectralrc.yaml services/api-manager/openapi/v1.yaml
 
 format: ## Code Quality - Format code for all languages
 	@echo "$(BLUE)Formatting code...$(RESET)"

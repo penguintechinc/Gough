@@ -118,6 +118,22 @@ def _g(row: Any, attr: str, default: Any = None) -> Any:
             return default
 
 
+def _get_firmware_type_from_hardware_json(node: Any) -> Any:
+    """Extract firmware_type from hardware_json blob, handling both dict and string formats."""
+    hw_json = _g(node, "hardware_json")
+    if hw_json is None:
+        return None
+    if isinstance(hw_json, str):
+        try:
+            import json
+            hw_json = json.loads(hw_json)
+        except (ValueError, TypeError):
+            return None
+    if isinstance(hw_json, dict):
+        return hw_json.get("firmware_type")
+    return None
+
+
 def _serialize_node(node: Any, *, include_hw: bool = True) -> dict[str, Any]:
     """Serialise a node ORM row / dict to a JSON-safe payload."""
     out: dict[str, Any] = {
@@ -131,7 +147,7 @@ def _serialize_node(node: Any, *, include_hw: bool = True) -> dict[str, Any]:
         "ipv4": _g(node, "ipv4"),
         "ipv6": _g(node, "ipv6"),
         "ipv4_static": _g(node, "ipv4_static"),
-        "firmware_type": _g(node, "firmware_type"),
+        "firmware_type": _get_firmware_type_from_hardware_json(node),
         "boot_config_id": _g(node, "boot_config_id"),
         "preferred_addr_family": _g(node, "preferred_addr_family", "auto"),
         "attestation_method": _g(node, "attestation_method", "discovery_agent"),
@@ -468,12 +484,8 @@ async def discover_node():
                     "discovered_at": now,
                     "updated_at": now,
                 }
-                # Preserve firmware_type in node row if column exists
-                try:
-                    db(db.nodes.id == node_id).update(**update_kwargs)
-                except Exception:  # noqa: BLE001 — firmware_type column might not exist yet
-                    minimal = {k: v for k, v in update_kwargs.items() if k != "firmware_type"}
-                    db(db.nodes.id == node_id).update(**minimal)
+                # firmware_type is stored in hardware_json, not as a column
+                db(db.nodes.id == node_id).update(**update_kwargs)
             else:
                 # New node — generate a sanitised name from the MAC
                 name = f"node-{body.primary_nic_mac.replace(':', '')[-6:].lower()}"

@@ -51,7 +51,6 @@ def dal(tmp_path, monkeypatch):
         Field("ipv4", "string"),
         Field("ipv6", "string"),
         Field("ipv4_static", "string"),
-        Field("firmware_type", "string"),
         Field("boot_config_id", "integer"),
         Field("hardware_json", "json"),
         Field("hardware_tags", "json"),
@@ -1720,3 +1719,115 @@ class TestListNodesBiomesFiltered:
         assert resp.status_code == 200
         data = (await _json(resp))["data"]
         assert data["total"] == 0
+
+
+# ---------------------------------------------------------------------------
+# Regression Tests: GH-31 data-serialization bugs
+# ---------------------------------------------------------------------------
+
+
+class TestRegressionGH31FirmwareType:
+    """Regression: gh-31. firmware_type serialization fixes."""
+
+    @pytest.mark.asyncio
+    async def test_firmware_type_serialized_from_hardware_json_in_list_response(
+        self, nodes_app, dal
+    ):
+        """Regression: gh-31. firmware_type must be serialized from hardware_json in list responses."""
+        # Seed a node with firmware_type in hardware_json
+        now = datetime.now(timezone.utc)
+        node_id = dal.nodes.insert(
+            tenant_id="acme",
+            name="uefi-node",
+            state="probed",
+            dmi_uuid="dmi-with-uefi",
+            primary_nic_mac="aa:bb:cc:dd:ee:ff",
+            hardware_json={
+                "firmware_type": "uefi",
+                "lshw": {},
+                "lsblk": {},
+                "nics": [],
+            },
+            discovered_at=now,
+            created_at=now,
+            updated_at=now,
+        )
+        dal.commit()
+
+        async with nodes_app.test_client() as client:
+            resp = await client.get("/api/v1/nodes/")
+        assert resp.status_code == 200
+        data = await _json(resp)
+        nodes = data.get("data", {}).get("nodes", [])
+        assert len(nodes) >= 1
+        node = next((n for n in nodes if n["id"] == node_id), None)
+        assert node is not None, f"Node {node_id} not found in list response"
+        # firmware_type must be non-null and equal to the hardware_json value
+        assert node["firmware_type"] == "uefi", (
+            f"firmware_type should be 'uefi' from hardware_json, got {node['firmware_type']}"
+        )
+
+    @pytest.mark.asyncio
+    async def test_firmware_type_serialized_from_hardware_json_in_detail_response(
+        self, nodes_app, dal
+    ):
+        """Regression: gh-31. firmware_type must be serialized from hardware_json in detail responses."""
+        # Seed a node with firmware_type in hardware_json
+        now = datetime.now(timezone.utc)
+        node_id = dal.nodes.insert(
+            tenant_id="acme",
+            name="legacy-node",
+            state="probed",
+            dmi_uuid="dmi-with-legacy",
+            primary_nic_mac="aa:bb:cc:dd:ee:01",
+            hardware_json={
+                "firmware_type": "legacy",
+                "lshw": {},
+                "lsblk": {},
+                "nics": [],
+            },
+            discovered_at=now,
+            created_at=now,
+            updated_at=now,
+        )
+        dal.commit()
+
+        async with nodes_app.test_client() as client:
+            resp = await client.get(f"/api/v1/nodes/{node_id}")
+        assert resp.status_code == 200
+        data = await _json(resp)
+        node = data.get("data", {}).get("node", {})
+        assert node.get("id") == node_id
+        # firmware_type must be non-null and equal to the hardware_json value
+        assert node["firmware_type"] == "legacy", (
+            f"firmware_type should be 'legacy' from hardware_json, got {node['firmware_type']}"
+        )
+        # hardware_json should be included in detail response
+        assert "hardware_json" in node
+        assert node["hardware_json"]["firmware_type"] == "legacy"
+
+    @pytest.mark.asyncio
+    async def test_firmware_type_null_when_hardware_json_absent(self, nodes_app, dal):
+        """Regression: gh-31. firmware_type must be null when hardware_json is not set."""
+        now = datetime.now(timezone.utc)
+        node_id = dal.nodes.insert(
+            tenant_id="acme",
+            name="no-hw-node",
+            state="new",
+            dmi_uuid="dmi-no-hardware",
+            primary_nic_mac="aa:bb:cc:dd:ee:02",
+            hardware_json=None,
+            discovered_at=None,
+            created_at=now,
+            updated_at=now,
+        )
+        dal.commit()
+
+        async with nodes_app.test_client() as client:
+            resp = await client.get(f"/api/v1/nodes/{node_id}")
+        assert resp.status_code == 200
+        data = await _json(resp)
+        node = data.get("data", {}).get("node", {})
+        assert node.get("firmware_type") is None, (
+            "firmware_type should be null when hardware_json is not set"
+        )

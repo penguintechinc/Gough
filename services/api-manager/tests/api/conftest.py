@@ -1,12 +1,27 @@
 """Pytest fixtures for API endpoint tests.
 
 Provides a Quart test client with blueprints registered and auth stubbed.
+
+Also provides ``real_auth_env`` (regression: gh-31): a NON-injecting client
+that drives the genuine authentication middleware chain. Unlike ``client`` /
+``app_with_auth`` (which pin ``g.current_user`` in a ``before_request`` hook and
+never install the real middleware), ``real_auth_env`` installs the production
+``wire_middleware`` chain and populates ``g.current_user`` ONLY via a real
+``Authorization: Bearer`` token flowing through ``_credential_validation``.
 """
 
-import importlib
-import uuid
-from types import SimpleNamespace
+from __future__ import annotations
 
+import asyncio
+import importlib
+import os
+import uuid
+from dataclasses import dataclass
+from datetime import datetime, timedelta, timezone
+from types import SimpleNamespace
+from typing import Any
+
+import jwt
 import pytest
 from quart import Quart, g
 from sqlalchemy import Column, String, Table
@@ -430,3 +445,238 @@ def dal_with_eggs(dal):
     )
 
     return dal
+
+
+# ============================================================================
+# Real auth-chain fixture (regression: gh-31)
+# ============================================================================
+#
+# The ``client`` / ``app_with_auth`` fixtures above deliberately pin
+# ``g.current_user`` in a ``before_request`` hook and never call the real
+# ``wire_middleware``. That is fine for exercising handler bodies, but it makes
+# it impossible to test the authentication middleware itself: every request
+# already has a principal, and the fail-closed scope layer that turns a missing
+# principal into a 401 is not even installed. Any test that asserts "valid token
+# is accepted" or "missing token is rejected" against that fixture is
+# self-confirming -- the assertion is satisfied by the injector, not by the code
+# under test.
+#
+# ``real_auth_env`` closes that gap. It installs the production middleware chain
+# (``_credential_validation`` -> tenant -> ``_enforce_scopes``, in that order)
+# and injects NOTHING. The one and only way ``g.current_user`` becomes non-None
+# is a valid ``Authorization: Bearer <jwt>`` decoding to a seeded, ACTIVE user
+# row -- exactly the production path.
+
+SECRET_KEY: str = "gh31-real-auth-chain-secret-key-32b+"
+
+
+@dataclass(slots=True)
+class RealAuthEnv:
+    """Non-injecting test client + a real HS256 token minter (regression: gh-31).
+
+    ``mint()`` produces tokens with the same secret + algorithm that
+    ``app.middleware.decode_token`` verifies, so a token issued here drives the
+    genuine credential-validation -> scope-enforcement path.
+    """
+
+    client: Any
+    user_id: int
+    secret: str
+
+    def mint(
+        self,
+        scope: str = "gough.nodes.read",
+        *,
+        sub: str | int | None = None,
+        tenant: str | None = "default",
+        user_id: int | None = None,
+        expired: bool = False,
+    ) -> str:
+        """Mint an HS256 access token that ``decode_token`` will accept.
+
+        ``sub`` defaults to the seeded user's id so ``get_user_by_id(int(sub))``
+        resolves an ACTIVE row. ``tenant``/``scope`` feed the tenant + scope
+        middleware. ``user_id`` (when set) additionally satisfies the auth
+        blueprint's own ``require_auth`` decorator (which keys on ``user_id``).
+        """
+        issued = datetime.utcnow()
+        exp = issued - timedelta(hours=1) if expired else issued + timedelta(hours=1)
+        payload: dict[str, Any] = {
+            "sub": str(self.user_id if sub is None else sub),
+            "scope": scope,
+            "type": "access",
+            "iat": issued,
+            "exp": exp,
+        }
+        if tenant is not None:
+            payload["tenant"] = tenant
+        if user_id is not None:
+            payload["user_id"] = user_id
+        return jwt.encode(payload, self.secret, algorithm="HS256")
+
+
+@pytest.fixture()
+def real_auth_env(tmp_path, monkeypatch):
+    """Client that drives the REAL auth middleware chain (regression: gh-31).
+
+    Registers the real ``nodes`` and ``auth`` blueprints, seeds an ACTIVE user +
+    a node into a fresh sqlite DAL, and installs the production
+    ``wire_middleware`` chain. Route decorators are reduced to passthroughs so
+    the sole authenticator is ``_credential_validation`` -- ``g.current_user``
+    is never pre-injected.
+    """
+    import app.auth as auth_mod
+    import app.middleware as mw_mod
+    import app.models as models_mod
+    import app.security.scope_enforcement as scope_mod
+    from app.security_datastore import PyDALUserDatastore
+    from penguin_dal import DB, Field
+
+    now = datetime.now(timezone.utc)
+    db = DB(
+        f"sqlite:///{tmp_path}/gh31-{os.getpid()}.db",
+        pool_size=1,
+        reflect=False,
+        migrate=True,
+    )
+
+    # ``nodes`` -- note created_at/updated_at: list_nodes orders by them.
+    db.define_table(
+        "nodes",
+        Field("tenant_id", "string", default="__default__"),
+        Field("name", "string"),
+        Field("state", "string", default="new"),
+        Field("dmi_uuid", "string"),
+        Field("primary_nic_mac", "string"),
+        Field("hardware_tags", "json"),
+        Field("hardware_json", "json"),
+        Field("created_at", "datetime"),
+        Field("updated_at", "datetime"),
+        migrate=True,
+    )
+    # Identity tables (mirror app/models_sqlalchemy.py) so the REAL
+    # get_user_by_id() / require_auth resolve a genuine row.
+    db.define_table(
+        "auth_role",
+        Field("name", "string"),
+        Field("description", "string"),
+        Field("permissions", "text"),
+        Field("created_at", "datetime"),
+        migrate=True,
+    )
+    db.define_table(
+        "auth_user",
+        Field("email", "string"),
+        Field("password", "string"),
+        Field("active", "boolean", default=True),
+        Field("fs_uniquifier", "string"),
+        Field("confirmed_at", "datetime"),
+        Field("last_login_at", "datetime"),
+        Field("current_login_at", "datetime"),
+        Field("last_login_ip", "string"),
+        Field("current_login_ip", "string"),
+        Field("login_count", "integer", default=0),
+        Field("tf_totp_secret", "string"),
+        Field("tf_primary_method", "string"),
+        Field("full_name", "string"),
+        Field("created_at", "datetime"),
+        Field("updated_at", "datetime"),
+        migrate=True,
+    )
+    db.define_table(
+        "auth_user_roles",
+        Field("user_id", "integer"),
+        Field("role_id", "integer"),
+        migrate=True,
+    )
+    db.define_table(
+        "auth_refresh_tokens",
+        Field("user_id", "integer"),
+        Field("token_hash", "string"),
+        Field("expires_at", "datetime"),
+        Field("revoked", "boolean", default=False),
+        Field("created_at", "datetime"),
+        migrate=True,
+    )
+    db.define_table(
+        "auth_password_resets",
+        Field("user_id", "integer"),
+        Field("token_hash", "string"),
+        Field("expires_at", "datetime"),
+        Field("used", "boolean", default=False),
+        Field("created_at", "datetime"),
+        migrate=True,
+    )
+
+    role_id = db.auth_role.insert(
+        name="admin", description="", permissions="", created_at=now
+    )
+    user_id = int(
+        db.auth_user.insert(
+            email="operator@gough.test",
+            password="not-used-by-these-tests",
+            active=True,
+            fs_uniquifier="gh31-uniquifier",
+            full_name="GH31 Operator",
+            login_count=0,
+            created_at=now,
+            updated_at=now,
+        )
+    )
+    db.auth_user_roles.insert(user_id=user_id, role_id=int(role_id))
+    db.nodes.insert(
+        tenant_id="default",
+        name="gh31-node",
+        state="ready",
+        dmi_uuid="00000000-0000-0000-0000-0000000000aa",
+        primary_nic_mac="aa:bb:cc:dd:ee:aa",
+        created_at=now,
+        updated_at=now,
+    )
+    db.commit()
+
+    # Route decorators -> passthrough so the ONLY code that can populate
+    # g.current_user is the real _credential_validation before_request hook.
+    monkeypatch.setattr(mw_mod, "auth_required", _passthrough_decorator)
+    monkeypatch.setattr(scope_mod, "require_scopes", _passthrough_decorator)
+    # Point every get_db() at the seeded DB.
+    monkeypatch.setattr(models_mod, "get_db", lambda: db)
+    monkeypatch.setattr(auth_mod, "get_db", lambda: db)
+    # The auth blueprint's require_auth loads roles via user_datastore, whose
+    # _get_user_roles uses pyDAL's ``.ALL`` selector -- unimplemented in
+    # penguin_dal and unrelated to gh-31 (see task report). Stub ONLY that role
+    # query so require_auth can build request.user; the auth decision itself
+    # (token valid, user exists + active) stays entirely real.
+    monkeypatch.setattr(PyDALUserDatastore, "_get_user_roles", lambda self, uid: [])
+
+    import app.api.nodes as nodes_mod
+
+    nodes_mod = importlib.reload(nodes_mod)
+    monkeypatch.setattr(nodes_mod, "get_db", lambda: db)
+
+    app = Quart(__name__)
+    app.config["TESTING"] = True
+    app.config["CLUSTER_ID"] = "default"
+    app.config["JWT_SECRET_KEY"] = SECRET_KEY
+    app.config["JWT_REFRESH_TOKEN_EXPIRES"] = timedelta(days=7)
+    app.config["db"] = db
+    app.url_map.strict_slashes = False
+    app.user_datastore = PyDALUserDatastore(db)
+
+    app.register_blueprint(nodes_mod.nodes_bp)
+    app.register_blueprint(auth_mod.auth_bp, url_prefix="/api/v1/auth")
+
+    # Install the production middleware chain (credential validation -> tenant
+    # -> scope enforcement), exactly as app/__init__.py's wire_middleware does.
+    from app.middleware import wire_middleware
+
+    asyncio.run(wire_middleware(app))
+
+    env = RealAuthEnv(client=app.test_client(), user_id=user_id, secret=SECRET_KEY)
+    try:
+        yield env
+    finally:
+        try:
+            db.close()
+        except Exception:
+            pass
