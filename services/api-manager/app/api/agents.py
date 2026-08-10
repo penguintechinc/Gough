@@ -507,6 +507,7 @@ async def list_agents():
             "ip_address": agent["ip_address"],
             "status": agent["status"],
             "capabilities": agent["capabilities"],
+            "enrollment_completed": agent["enrollment_completed"],
             "last_heartbeat": agent["last_heartbeat"].isoformat()
             if agent["last_heartbeat"] else None,
             "enrolled_at": agent["enrolled_at"].isoformat()

@@ -62,7 +62,6 @@ def dal(tmp_path, monkeypatch):
         Field("ipv4", "string"),
         Field("ipv6", "string"),
         Field("ipv4_static", "string"),
-        Field("firmware_type", "string"),
         Field("boot_config_id", "integer"),
         Field("hardware_json", "json"),
         Field("hardware_tags", "json"),

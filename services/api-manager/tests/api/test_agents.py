@@ -1009,3 +1009,140 @@ async def test_resume_agent_not_found_dal(agents_client):
     """Test POST /api/v1/agents/<agent_id>/resume returns 404 if not found."""
     response = await agents_client.post("/api/v1/agents/nonexistent/resume")
     assert response.status_code == 404
+
+
+# ---------------------------------------------------------------------------
+# Regression Tests: GH-31 data-serialization bugs
+# ---------------------------------------------------------------------------
+
+
+class TestRegressionGH31EnrollmentCompleted:
+    """Regression: gh-31. enrollment_completed serialization fixes."""
+
+    @pytest.mark.asyncio
+    async def test_enrollment_completed_present_in_list_response(
+        self, dal, agents_client
+    ):
+        """Regression: gh-31. enrollment_completed must be present in list agent responses."""
+        # Seed agents with mixed enrollment_completed values
+        enrolled_agent_id = "enrolled-agent-1"
+        dal.access_agents.insert(
+            agent_id=enrolled_agent_id,
+            hostname="enrolled-host",
+            ip_address="192.168.1.1",
+            status="active",
+            capabilities="['ssh','telnet']",
+            enrollment_completed=True,
+            enrolled_at=datetime.utcnow(),
+        )
+
+        pending_agent_id = "pending-agent-1"
+        dal.access_agents.insert(
+            agent_id=pending_agent_id,
+            hostname="pending-host",
+            ip_address="192.168.1.2",
+            status="pending",
+            capabilities="[]",
+            enrollment_completed=False,
+        )
+        dal.commit()
+
+        # GET /api/v1/agents (list)
+        response = await agents_client.get("/api/v1/agents")
+        assert response.status_code == 200
+        data = await response.get_json()
+        agents = data.get("agents", [])
+        assert len(agents) >= 2
+
+        # Verify enrolled agent has enrollment_completed=True
+        enrolled = next(
+            (a for a in agents if a["agent_id"] == enrolled_agent_id), None
+        )
+        assert enrolled is not None, f"Enrolled agent {enrolled_agent_id} not found in list"
+        assert (
+            "enrollment_completed" in enrolled
+        ), "enrollment_completed missing from list response"
+        assert enrolled["enrollment_completed"] is True, (
+            "enrollment_completed should be True for enrolled agent in list response"
+        )
+
+        # Verify pending agent has enrollment_completed=False
+        pending = next(
+            (a for a in agents if a["agent_id"] == pending_agent_id), None
+        )
+        assert pending is not None, f"Pending agent {pending_agent_id} not found in list"
+        assert (
+            "enrollment_completed" in pending
+        ), "enrollment_completed missing from list response"
+        assert pending["enrollment_completed"] is False, (
+            "enrollment_completed should be False for pending agent in list response"
+        )
+
+    @pytest.mark.asyncio
+    async def test_enrollment_completed_present_in_detail_response(
+        self, dal, agents_client
+    ):
+        """Regression: gh-31. enrollment_completed must be present in detail agent responses."""
+        agent_id = "detail-agent-1"
+        dal.access_agents.insert(
+            agent_id=agent_id,
+            hostname="detail-host",
+            ip_address="192.168.1.10",
+            status="active",
+            capabilities="['ssh']",
+            enrollment_completed=True,
+            enrolled_at=datetime.utcnow(),
+        )
+        dal.commit()
+
+        # GET /api/v1/agents/{agent_id} (detail)
+        response = await agents_client.get(f"/api/v1/agents/{agent_id}")
+        assert response.status_code == 200
+        data = await response.get_json()
+        agent = data.get("agent", {})
+        assert agent.get("agent_id") == agent_id
+        assert (
+            "enrollment_completed" in agent
+        ), "enrollment_completed missing from detail response"
+        assert agent["enrollment_completed"] is True, (
+            "enrollment_completed should be True in detail response"
+        )
+
+    @pytest.mark.asyncio
+    async def test_enrollment_completed_consistency_between_list_and_detail(
+        self, dal, agents_client
+    ):
+        """Regression: gh-31. enrollment_completed values must match in list and detail responses."""
+        agent_id = "consistency-agent-1"
+        dal.access_agents.insert(
+            agent_id=agent_id,
+            hostname="consistency-host",
+            ip_address="192.168.1.20",
+            status="active",
+            capabilities="[]",
+            enrollment_completed=False,
+        )
+        dal.commit()
+
+        # Get from list response
+        list_response = await agents_client.get("/api/v1/agents")
+        assert list_response.status_code == 200
+        list_data = await list_response.get_json()
+        list_agent = next(
+            (a for a in list_data.get("agents", []) if a["agent_id"] == agent_id), None
+        )
+        assert list_agent is not None
+
+        # Get from detail response
+        detail_response = await agents_client.get(f"/api/v1/agents/{agent_id}")
+        assert detail_response.status_code == 200
+        detail_data = await detail_response.get_json()
+        detail_agent = detail_data.get("agent", {})
+
+        # Verify enrollment_completed matches between list and detail
+        assert (
+            list_agent["enrollment_completed"]
+            == detail_agent["enrollment_completed"]
+        ), (
+            "enrollment_completed must match between list and detail responses"
+        )
