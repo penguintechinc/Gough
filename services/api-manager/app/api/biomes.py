@@ -28,6 +28,12 @@ from ..middleware import admin_required, auth_required, get_current_user, mainta
 from ..models import get_db
 from .. import metrics as _metrics
 from ._biome_schema import BiomeCreate, BiomeSignRequest, BiomeUpgradeRequest
+from ._schemas.biomes import (
+    BiomeGroupCreateRequest,
+    BiomeGroupResponse,
+    BiomeGroupUpdateRequest,
+    BiomeGroupListResponse,
+)
 from ._helpers import (
     EligibilityResult,
     check_tag_eligibility,
@@ -1521,6 +1527,10 @@ async def list_biome_groups():
     }), 200
 
 
+# Attach response model for OpenAPI documentation
+list_biome_groups._response_model = BiomeGroupListResponse
+
+
 @biomes_bp.route("/groups", methods=["POST"])
 @maintainer_or_admin_required
 async def create_biome_group():
@@ -1611,6 +1621,11 @@ async def create_biome_group():
     }), 201
 
 
+# Attach models for OpenAPI documentation
+create_biome_group._request_model = BiomeGroupCreateRequest
+create_biome_group._response_model = BiomeGroupResponse
+
+
 @biomes_bp.route("/groups/<int:group_id>", methods=["GET"])
 @auth_required
 async def get_biome_group(group_id: int):
@@ -1650,6 +1665,10 @@ async def get_biome_group(group_id: int):
     group_data["resolved_biomes"] = resolved_biomes
 
     return jsonify({"group": group_data}), 200
+
+
+# Attach response model for OpenAPI documentation
+get_biome_group._response_model = BiomeGroupResponse
 
 
 @biomes_bp.route("/groups/<int:group_id>", methods=["PUT"])
@@ -1750,6 +1769,11 @@ async def update_biome_group(group_id: int):
         return jsonify({"error": str(e)}), 500
 
 
+# Attach models for OpenAPI documentation
+update_biome_group._request_model = BiomeGroupUpdateRequest
+update_biome_group._response_model = BiomeGroupResponse
+
+
 @biomes_bp.route("/groups/<int:group_id>", methods=["DELETE"])
 @admin_required
 async def delete_biome_group(group_id: int):
@@ -1801,6 +1825,8 @@ async def delete_biome_group(group_id: int):
     return jsonify({"message": "Biome group deleted successfully"}), 200
 
 
+# Attach response model for OpenAPI documentation
+delete_biome_group._response_model = BiomeGroupResponse
 
 
 # ============================================================================

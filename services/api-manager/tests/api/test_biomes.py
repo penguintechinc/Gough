@@ -1039,6 +1039,47 @@ class TestBiomeGroups:
         )
         assert response.status_code == 400
 
+    async def test_biome_group_membership_field_contract(self, extended_client, sample_group_id, sample_biome_id):
+        """Regression: gh-31, gh-32 — biome group membership must be 'biomes', not 'biome_ids'.
+
+        The PenguinCloud portal was guessing the wrong field name when Gough returns
+        biome-group membership. This test locks the contract: the field MUST be named
+        'biomes' and MUST be an array of objects with 'biome_id' and 'order'.
+        """
+        # Create a group with seeded biome membership
+        create_response = await extended_client.post(
+            "/api/v1/biomes/groups",
+            json={
+                "name": "membership-test-group",
+                "display_name": "Membership Test",
+                "biomes": [
+                    {"biome_id": sample_biome_id, "order": 1},
+                ],
+            },
+        )
+        assert create_response.status_code == 201
+        group_id = (await create_response.get_json())["group"]["id"]
+
+        # GET the group and verify membership field shape
+        get_response = await extended_client.get(f"/api/v1/biomes/groups/{group_id}")
+        assert get_response.status_code == 200
+        body = await get_response.get_json()
+        group = body["group"]
+
+        # CRITICAL: field must be named 'biomes', not 'biome_ids'
+        assert "biomes" in group, "Field 'biomes' not found in response (expected membership array)"
+        assert "biome_ids" not in group, "Field 'biome_ids' should not exist (use 'biomes' instead)"
+
+        # CRITICAL: 'biomes' must be an array of objects with biome_id and order
+        assert isinstance(group["biomes"], list), "biomes must be an array"
+        assert len(group["biomes"]) == 1, "Expected 1 biome in membership"
+        member = group["biomes"][0]
+        assert isinstance(member, dict), "Each member must be an object"
+        assert "biome_id" in member, "Each member must have 'biome_id'"
+        assert "order" in member, "Each member must have 'order'"
+        assert member["biome_id"] == sample_biome_id, "biome_id must match seeded value"
+        assert member["order"] == 1, "order must match seeded value"
+
     async def test_delete_biome_group_success(self, extended_client, sample_group_id):
         response = await extended_client.delete(f"/api/v1/biomes/groups/{sample_group_id}")
         assert response.status_code == 200
