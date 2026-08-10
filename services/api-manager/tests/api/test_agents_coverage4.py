@@ -712,6 +712,7 @@ async def test_list_agents_with_status_filter(agents_client):
         "ip_address": "192.168.1.1",
         "status": "active",
         "capabilities": '["ssh"]',
+        "enrollment_completed": True,
         "last_heartbeat": datetime.utcnow(),
         "enrolled_at": datetime.utcnow(),
     }
@@ -740,6 +741,7 @@ async def test_list_agents_no_filter(agents_client):
         "ip_address": "192.168.1.1",
         "status": "active",
         "capabilities": '["ssh"]',
+        "enrollment_completed": False,
         "last_heartbeat": datetime.utcnow(),
         "enrolled_at": datetime.utcnow(),
     }
@@ -767,6 +769,7 @@ async def test_list_agents_null_dates(agents_client):
         "ip_address": "192.168.1.1",
         "status": "active",
         "capabilities": '["ssh"]',
+        "enrollment_completed": True,
         "last_heartbeat": None,
         "enrolled_at": None,
     }
