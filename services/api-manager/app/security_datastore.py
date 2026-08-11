@@ -251,13 +251,21 @@ class PyDALUserDatastore:
         self.role_model = PyDALRole
 
     def _get_user_roles(self, user_id: int) -> list[PyDALRole]:
-        """Get all roles for a user."""
+        """Get all roles for a user.
+
+        Split-query (link rows, then each role by id) rather than a joined
+        ``.select(db.auth_role.ALL)`` -- penguin-dal does not implement pyDAL's
+        ``Table.ALL`` sentinel, so the joined form raised at runtime (gh-31
+        Finding B). Mirrors ``app.models._get_user_role``.
+        """
         db = self.db
-        rows = db(
-            (db.auth_user_roles.user_id == user_id)
-            & (db.auth_user_roles.role_id == db.auth_role.id)
-        ).select(db.auth_role.ALL)
-        return [PyDALRole(row) for row in rows]
+        links = db(db.auth_user_roles.user_id == user_id).select()
+        roles: list[PyDALRole] = []
+        for link in links:
+            role_row = db(db.auth_role.id == link.role_id).select().first()
+            if role_row:
+                roles.append(PyDALRole(role_row))
+        return roles
 
     def find_user(self, **kwargs: Any) -> PyDALUser | None:
         """Find a user by any attribute."""
