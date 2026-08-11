@@ -8,6 +8,13 @@ env:
     value: "DEBUG"
   - name: RELEASE_MODE
     value: "false"
+  # penguin-aaa ES256 OIDC — see values.yaml for the shared-keystore rationale.
+  - name: OIDC_ISSUER
+    value: "https://gough.localhost.local"
+  - name: OIDC_AUDIENCE
+    value: "gough-api"
+  - name: GOUGH_KEY_STORE_PATH
+    value: "/var/gough/keys/oidc_keys.json"
 ingress:
   enabled: true
   className: "nginx"
