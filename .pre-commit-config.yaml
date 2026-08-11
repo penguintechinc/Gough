@@ -165,7 +165,14 @@ repos:
 
       - id: trivy-config
         name: trivy config (K8s/Helm IaC misconfiguration)
-        entry: trivy config --exit-code 1 --severity CRITICAL,HIGH k8s/
+        # Scoped to k8s/helm/ only. k8s/kustomize/ and k8s/manifests/ are
+        # stale project-template scaffolding (project-template namespace,
+        # project-template/*:latest images that don't match any real gough
+        # service) predating this hook, and both directory types are
+        # forbidden outright by devops-kubernetes.md (Helm v4 only, no
+        # Kustomize, no raw kubectl apply -f manifests). They should be
+        # deleted, not gated on — see PR description.
+        entry: trivy config --exit-code 1 --severity CRITICAL,HIGH k8s/helm/
         language: system
         pass_filenames: false
         always_run: true
