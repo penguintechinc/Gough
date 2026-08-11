@@ -68,46 +68,15 @@ _FAKE_VIEWER = {
 
 
 # ---------------------------------------------------------------------------
-# decode_token (pure function, uses app.config so needs app context)
+# NOTE (regression: gh-31): the HS256 ``decode_token`` helper and the
+# ``safe_import_tenant_middleware`` / ``safe_import_scope_enforcement`` defensive
+# shims were deleted in the penguin-aaa ES256 migration. Bearer validation now
+# happens in the ASGI ``OIDCAuthMiddleware`` (StaticKeyVerifier), and its
+# accept/reject behaviour for valid / garbage / expired / wrong-signature tokens
+# is exercised end-to-end in tests/api/test_auth_e2e_gh31.py against the real
+# gate. The former unit tests for those deleted symbols are removed here rather
+# than kept as dead assertions.
 # ---------------------------------------------------------------------------
-
-class TestDecodeToken:
-    @pytest.mark.anyio
-    async def test_valid_token(self):
-        app = _make_app()
-        async with app.app_context():
-            from app.middleware import decode_token
-            token = _make_token(app)
-            payload = decode_token(token)
-            assert payload is not None
-            assert payload["sub"] == "1"
-
-    @pytest.mark.anyio
-    async def test_expired_token_returns_none(self):
-        app = _make_app()
-        async with app.app_context():
-            from app.middleware import decode_token
-            token = _make_expired_token(app)
-            assert decode_token(token) is None
-
-    @pytest.mark.anyio
-    async def test_invalid_token_returns_none(self):
-        app = _make_app()
-        async with app.app_context():
-            from app.middleware import decode_token
-            assert decode_token("not.a.token") is None
-
-    @pytest.mark.anyio
-    async def test_wrong_secret_returns_none(self):
-        app = _make_app()
-        token = pyjwt.encode(
-            {"sub": "1", "exp": int(time.time()) + 3600},
-            "wrong-secret",
-            algorithm="HS256",
-        )
-        async with app.app_context():
-            from app.middleware import decode_token
-            assert decode_token(token) is None
 
 
 # ---------------------------------------------------------------------------
@@ -196,156 +165,41 @@ class TestGetTokenFromHeader:
 # ---------------------------------------------------------------------------
 
 class TestAuthRequired:
-    @pytest.mark.anyio
-    async def test_missing_token_returns_401(self):
-        app = _make_app()
-        with patch("app.middleware.get_user_by_id", return_value=_FAKE_USER):
-            from app.middleware import auth_required
+    """``auth_required`` now only asserts a principal is present (regression: gh-31).
 
-            @auth_required
-            async def protected():
-                return jsonify({"ok": True}), 200
-
-            async with app.test_request_context("/"):
-                response, status = await protected()
-                assert status == 401
+    Bearer validation + principal population moved to the ASGI gate + the
+    ``_populate_current_user`` before_request shim; the decorator no longer
+    decodes tokens or loads users. So these tests set (or omit) ``g.current_user``
+    directly to exercise the decorator's remaining contract. The real
+    token->principal path is covered end-to-end in test_auth_e2e_gh31.py.
+    """
 
     @pytest.mark.anyio
-    async def test_valid_token_calls_handler(self):
+    async def test_missing_principal_returns_401(self):
         app = _make_app()
-        token = _make_token(app)
+        from app.middleware import auth_required
 
-        with patch("app.middleware.get_user_by_id", return_value=_FAKE_USER):
-            from app.middleware import auth_required
+        @auth_required
+        async def protected():
+            return jsonify({"ok": True}), 200
 
-            @auth_required
-            async def protected():
-                return jsonify({"ok": True}), 200
-
-            async with app.test_request_context(
-                "/", headers={"Authorization": f"Bearer {token}"}
-            ):
-                response, status = await protected()
-                assert status == 200
+        async with app.test_request_context("/"):
+            response, status = await protected()
+            assert status == 401
 
     @pytest.mark.anyio
-    async def test_expired_token_returns_401(self):
+    async def test_present_principal_calls_handler(self):
         app = _make_app()
-        token = _make_expired_token(app)
+        from app.middleware import auth_required
 
-        with patch("app.middleware.get_user_by_id", return_value=_FAKE_USER):
-            from app.middleware import auth_required
+        @auth_required
+        async def protected():
+            return jsonify({"ok": True}), 200
 
-            @auth_required
-            async def protected():
-                return jsonify({"ok": True}), 200
-
-            async with app.test_request_context(
-                "/", headers={"Authorization": f"Bearer {token}"}
-            ):
-                response, status = await protected()
-                assert status == 401
-
-    @pytest.mark.anyio
-    async def test_wrong_token_type_returns_401(self):
-        app = _make_app()
-        token = _make_token(app, token_type="refresh")
-
-        with patch("app.middleware.get_user_by_id", return_value=_FAKE_USER):
-            from app.middleware import auth_required
-
-            @auth_required
-            async def protected():
-                return jsonify({"ok": True}), 200
-
-            async with app.test_request_context(
-                "/", headers={"Authorization": f"Bearer {token}"}
-            ):
-                response, status = await protected()
-                assert status == 401
-
-    @pytest.mark.anyio
-    async def test_user_not_found_returns_401(self):
-        app = _make_app()
-        token = _make_token(app)
-
-        with patch("app.middleware.get_user_by_id", return_value=None):
-            from app.middleware import auth_required
-
-            @auth_required
-            async def protected():
-                return jsonify({"ok": True}), 200
-
-            async with app.test_request_context(
-                "/", headers={"Authorization": f"Bearer {token}"}
-            ):
-                response, status = await protected()
-                assert status == 401
-
-    @pytest.mark.anyio
-    async def test_inactive_user_returns_401(self):
-        app = _make_app()
-        token = _make_token(app)
-        inactive_user = {**_FAKE_USER, "is_active": False}
-
-        with patch("app.middleware.get_user_by_id", return_value=inactive_user):
-            from app.middleware import auth_required
-
-            @auth_required
-            async def protected():
-                return jsonify({"ok": True}), 200
-
-            async with app.test_request_context(
-                "/", headers={"Authorization": f"Bearer {token}"}
-            ):
-                response, status = await protected()
-                assert status == 401
-
-    @pytest.mark.anyio
-    async def test_sets_g_current_user(self):
-        app = _make_app()
-        token = _make_token(app)
-        captured = {}
-
-        with patch("app.middleware.get_user_by_id", return_value=_FAKE_USER):
-            from app.middleware import auth_required
-
-            @auth_required
-            async def protected():
-                captured["user"] = g.current_user
-                return jsonify({}), 200
-
-            async with app.test_request_context(
-                "/", headers={"Authorization": f"Bearer {token}"}
-            ):
-                await protected()
-                assert captured["user"]["id"] == 1
-                assert "_jwt_payload" in captured["user"]
-
-    @pytest.mark.anyio
-    async def test_missing_sub_in_payload_returns_401(self):
-        """Token without 'sub' claim."""
-        app = _make_app()
-        # Create token without sub
-        payload = {
-            "type": "access",
-            "scope": "gough.cluster.admin",
-            "exp": int(time.time()) + 3600,
-        }
-        token = pyjwt.encode(payload, app.config["JWT_SECRET_KEY"], algorithm="HS256")
-
-        with patch("app.middleware.get_user_by_id", return_value=_FAKE_USER):
-            from app.middleware import auth_required
-
-            @auth_required
-            async def protected():
-                return jsonify({"ok": True}), 200
-
-            async with app.test_request_context(
-                "/", headers={"Authorization": f"Bearer {token}"}
-            ):
-                response, status = await protected()
-                assert status == 401
+        async with app.test_request_context("/"):
+            g.current_user = _FAKE_USER
+            response, status = await protected()
+            assert status == 200
 
 
 # ---------------------------------------------------------------------------
@@ -502,20 +356,11 @@ class TestMaintainerOrAdminRequired:
 
 
 # ---------------------------------------------------------------------------
-# safe_import helpers
+# NOTE (regression: gh-31): ``safe_import_tenant_middleware`` /
+# ``safe_import_scope_enforcement`` were defensive shims for the Wave-1 rollout
+# and were deleted once middleware wiring became a hard dependency. Their tests
+# are removed rather than kept against non-existent symbols.
 # ---------------------------------------------------------------------------
-
-class TestSafeImports:
-    def test_safe_import_tenant_does_not_raise(self):
-        from app.middleware import safe_import_tenant_middleware
-        result = safe_import_tenant_middleware()
-        # May return None or callable depending on environment
-        assert result is None or callable(result)
-
-    def test_safe_import_scope_does_not_raise(self):
-        from app.middleware import safe_import_scope_enforcement
-        result = safe_import_scope_enforcement()
-        assert result is None or (isinstance(result, tuple) and len(result) == 3)
 
 
 # ---------------------------------------------------------------------------

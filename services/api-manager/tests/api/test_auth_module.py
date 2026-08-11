@@ -1,8 +1,14 @@
 """Tests for app/auth/__init__.py.
 
-Covers helper functions (hash_password, verify_password, generate_jwt_token,
-generate_refresh_token, verify_jwt_token) and all route handlers via the
-real auth_bp registered on a minimal Quart app.
+Covers helper functions (hash_password, verify_password, _mint_token_set,
+generate_refresh_token) and route handlers via the real auth_bp.
+
+regression: gh-31 -- the HS256 ``generate_jwt_token``/``verify_jwt_token`` helpers
+were replaced by ES256 minting through the OIDCProvider (``_mint_token_set``).
+Auth-protected route flows that require a validated bearer are exercised against
+the REAL ASGI gate via the ``real_auth_env`` fixture (see tests/api/conftest.py)
+and in tests/api/test_auth_e2e_gh31.py, since the minimal in-file app has no
+OIDC gate to validate a token.
 """
 
 from __future__ import annotations
@@ -120,73 +126,62 @@ class TestVerifyPassword:
 
 
 # =============================================================================
-# Unit tests: generate_jwt_token / verify_jwt_token
+# Unit tests: _mint_token_set (ES256 via OIDCProvider) -- regression: gh-31
 # =============================================================================
 
-class TestGenerateJwtToken:
-    @pytest.mark.asyncio
-    async def test_encodes_user_id(self, app):
-        from app.auth import generate_jwt_token
-        async with app.app_context():
-            token = generate_jwt_token(42, expires_in_minutes=30)
-        payload = jwt.decode(token, JWT_SECRET, algorithms=["HS256"])
-        assert payload["user_id"] == 42
+class TestMintTokenSet:
+    """``_mint_token_set`` mints a REAL ES256 access/id token set.
+
+    Replaces the deleted HS256 ``generate_jwt_token``/``verify_jwt_token`` unit
+    tests: minting is now ES256 through the ``OIDCProvider`` and validated by the
+    app's own ``StaticKeyVerifier``. The minted access token verifies; the id
+    token is rejected as an access token (token_use gate).
+    """
+
+    @staticmethod
+    def _build_provider_app():
+        from app.security.oidc import OIDCSettings, build_oidc
+
+        qapp = Quart(__name__)
+        qapp.config["TESTING"] = True  # in-memory ES256 keystore
+        settings = OIDCSettings.from_config(qapp.config)
+        provider, verifier = build_oidc(settings)
+        qapp.config["OIDC_SETTINGS"] = settings
+        qapp.config["OIDC_PROVIDER"] = provider
+        return qapp, provider, verifier, settings
 
     @pytest.mark.asyncio
-    async def test_expiry_respected(self, app):
-        from app.auth import generate_jwt_token
-        async with app.app_context():
-            token = generate_jwt_token(1, expires_in_minutes=60)
-        payload = jwt.decode(token, JWT_SECRET, algorithms=["HS256"])
-        delta = payload["exp"] - payload["iat"]
-        assert 3590 <= delta <= 3610  # ~60 min in seconds
+    async def test_mints_valid_es256_access_token(self):
+        from app.auth import _mint_token_set
+
+        qapp, _provider, verifier, _settings = self._build_provider_app()
+        user_row = SimpleNamespace(id=7)
+        role = SimpleNamespace(name="admin")
+
+        async with qapp.app_context():
+            token_set = _mint_token_set(user_row, [role])
+
+        assert token_set.access_token
+        assert token_set.id_token
+        # The app's own verifier accepts the access token and returns real claims.
+        claims = await verifier.verify_token(token_set.access_token)
+        assert claims["sub"] == "7"
+        assert claims["tenant"] == "__default__"
+        assert "gough.cluster.admin" in claims["scope"]
 
     @pytest.mark.asyncio
-    async def test_returns_string(self, app):
-        from app.auth import generate_jwt_token
-        async with app.app_context():
-            token = generate_jwt_token(1)
-        assert isinstance(token, str)
-        assert token.count(".") == 2  # JWT format
+    async def test_id_token_rejected_as_access_token(self):
+        from app.auth import _mint_token_set
 
+        qapp, _provider, verifier, _settings = self._build_provider_app()
+        user_row = SimpleNamespace(id=7)
+        role = SimpleNamespace(name="admin")
 
-class TestVerifyJwtToken:
-    @pytest.mark.asyncio
-    async def test_valid_token_returns_payload(self, app):
-        from app.auth import generate_jwt_token, verify_jwt_token
-        async with app.app_context():
-            token = generate_jwt_token(7)
-            payload = verify_jwt_token(token)
-        assert payload is not None
-        assert payload["user_id"] == 7
+        async with qapp.app_context():
+            token_set = _mint_token_set(user_row, [role])
 
-    @pytest.mark.asyncio
-    async def test_expired_token_returns_none(self, app):
-        from app.auth import verify_jwt_token
-        # Manually craft an expired token
-        expired = jwt.encode(
-            {"user_id": 1, "iat": 0, "exp": 1},  # exp in the past
-            JWT_SECRET,
-            algorithm="HS256",
-        )
-        async with app.app_context():
-            result = verify_jwt_token(expired)
-        assert result is None
-
-    @pytest.mark.asyncio
-    async def test_invalid_token_returns_none(self, app):
-        from app.auth import verify_jwt_token
-        async with app.app_context():
-            result = verify_jwt_token("not.a.token")
-        assert result is None
-
-    @pytest.mark.asyncio
-    async def test_wrong_secret_returns_none(self, app):
-        from app.auth import verify_jwt_token
-        bad_token = jwt.encode({"user_id": 1, "exp": 9999999999}, "wrong-secret", algorithm="HS256")
-        async with app.app_context():
-            result = verify_jwt_token(bad_token)
-        assert result is None
+        with pytest.raises(Exception):
+            await verifier.verify_token(token_set.id_token)
 
 
 # =============================================================================
@@ -451,58 +446,21 @@ class TestRefreshRoute:
 # =============================================================================
 
 class TestLogoutRoute:
-    def _auth_header(self, app):
-        """Generate a valid JWT header."""
-        from app.auth import generate_jwt_token
-        import asyncio
-        loop = asyncio.get_event_loop()
-
-        async def _gen():
-            async with app.app_context():
-                return generate_jwt_token(1)
-
-        token = loop.run_until_complete(_gen())
-        return {"Authorization": f"Bearer {token}"}
-
     @pytest.mark.asyncio
     async def test_no_auth_header_returns_401(self, client):
         resp = await client.post("/api/v1/auth/logout", json={})
         assert resp.status_code == 401
 
     @pytest.mark.asyncio
-    async def test_logout_with_valid_auth_returns_200(self, client, app):
-        from app.auth import hash_password
-        user_row = _make_user_row()
-        fake_db = MagicMock()
-        fake_db.auth_user = MagicMock()
-        fake_db.auth_refresh_tokens = MagicMock()
-        fake_db.return_value.select.return_value.first.return_value = user_row
-        fake_db.return_value.update.return_value = 1
-        fake_db.commit = MagicMock()
-
-        from app.security_datastore import PyDALUser
-        user_obj = PyDALUser(user_row, roles=[])
-
-        async with app.app_context():
-            from app.auth import generate_jwt_token
-            token = generate_jwt_token(1)
-
-        with patch("app.auth.get_db", return_value=fake_db), \
-             patch("app.auth.verify_jwt_token", return_value={"user_id": 1}), \
-             patch("app.auth.get_db", return_value=fake_db):
-            # Patch require_auth to inject user directly
-            async def fake_require_auth_logout():
-                from quart import request
-                request.user = user_obj
-                return await __import__("app.auth", fromlist=["logout"]).logout.__wrapped__()
-
-            resp = await client.post(
-                "/api/v1/auth/logout",
-                json={"refresh_token": "some-token"},
-                headers={"Authorization": f"Bearer {token}"},
-            )
-        # 200 or 401 acceptable (depends on real auth flow)
-        assert resp.status_code in (200, 401)
+    async def test_logout_with_valid_token_returns_200(self, real_auth_env):
+        """A REAL ES256 token reaches the logout handler -> 200 (regression: gh-31)."""
+        token = real_auth_env.mint(scope="")
+        resp = await real_auth_env.client.post(
+            "/api/v1/auth/logout",
+            json={},
+            headers={"Authorization": f"Bearer {token}"},
+        )
+        assert resp.status_code == 200
 
 
 # =============================================================================
@@ -643,49 +601,26 @@ class TestChangePassword:
         assert resp.status_code == 401
 
     @pytest.mark.asyncio
-    async def test_no_body_with_auth_returns_400(self, client, app):
-        from app.auth import hash_password
-        user_row = _make_user_row(password=hash_password("oldpw"))
-
-        async with app.app_context():
-            from app.auth import generate_jwt_token
-            token = generate_jwt_token(1)
-
-        fake_db = MagicMock()
-        fake_db.auth_user = MagicMock()
-        fake_db.return_value.select.return_value.first.return_value = user_row
-        with patch("app.auth.get_db", return_value=fake_db):
-            resp = await client.post(
-                "/api/v1/auth/change-password",
-                json=None,
-                headers={"Authorization": f"Bearer {token}"},
-            )
-        assert resp.status_code in (400, 401)
+    async def test_no_body_with_valid_token_returns_400(self, real_auth_env):
+        """A REAL token reaches the handler; a null body -> 400 (regression: gh-31)."""
+        token = real_auth_env.mint(scope="")
+        resp = await real_auth_env.client.post(
+            "/api/v1/auth/change-password",
+            json=None,
+            headers={"Authorization": f"Bearer {token}"},
+        )
+        assert resp.status_code == 400
 
     @pytest.mark.asyncio
-    async def test_short_new_password_rejected(self, client, app):
-        from app.auth import hash_password
-        from app.security_datastore import PyDALUser
-
-        user_row = _make_user_row(password=hash_password("oldpw"))
-        user_obj = PyDALUser(user_row, roles=[])
-
-        async with app.app_context():
-            from app.auth import generate_jwt_token
-            token = generate_jwt_token(1)
-
-        fake_db = MagicMock()
-        fake_db.auth_user = MagicMock()
-        fake_db.return_value.select.return_value.first.return_value = user_row
-
-        with patch("app.auth.get_db", return_value=fake_db), \
-             patch("app.auth.verify_jwt_token", return_value={"user_id": 1}):
-            resp = await client.post(
-                "/api/v1/auth/change-password",
-                json={"current_password": "oldpw", "new_password": "short"},
-                headers={"Authorization": f"Bearer {token}"},
-            )
-        assert resp.status_code in (400, 401)
+    async def test_short_new_password_rejected(self, real_auth_env):
+        """A REAL token reaches the handler; a too-short new password -> 400."""
+        token = real_auth_env.mint(scope="")
+        resp = await real_auth_env.client.post(
+            "/api/v1/auth/change-password",
+            json={"current_password": "oldpw", "new_password": "short"},
+            headers={"Authorization": f"Bearer {token}"},
+        )
+        assert resp.status_code == 400
 
 
 # =============================================================================
@@ -699,23 +634,13 @@ class TestGetCurrentUser:
         assert resp.status_code == 401
 
     @pytest.mark.asyncio
-    async def test_with_valid_token_returns_user(self, client, app):
-        from app.security_datastore import PyDALUser
-
-        user_row = _make_user_row()
-        user_obj = PyDALUser(user_row, roles=[])
-
-        async with app.app_context():
-            from app.auth import generate_jwt_token
-            token = generate_jwt_token(1)
-
-        fake_db = MagicMock()
-        fake_db.auth_user = MagicMock()
-        fake_db.return_value.select.return_value.first.return_value = user_row
-
-        with patch("app.auth.get_db", return_value=fake_db):
-            resp = await client.get(
-                "/api/v1/auth/me",
-                headers={"Authorization": f"Bearer {token}"},
-            )
-        assert resp.status_code in (200, 401)
+    async def test_with_valid_token_returns_user(self, real_auth_env):
+        """A REAL ES256 token reaches GET /me -> 200 with the user (regression: gh-31)."""
+        token = real_auth_env.mint(scope="")
+        resp = await real_auth_env.client.get(
+            "/api/v1/auth/me",
+            headers={"Authorization": f"Bearer {token}"},
+        )
+        assert resp.status_code == 200
+        data = await resp.get_json()
+        assert data["email"] == "operator@gough.test"

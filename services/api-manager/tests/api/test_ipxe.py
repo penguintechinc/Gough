@@ -732,10 +732,15 @@ def auth_quart_app(fake_redis: MagicMock):
 
 @pytest.fixture
 def auth_client(auth_quart_app):
-    """Test client with full auth stack bypassed."""
-    with patch("app.middleware.get_token_from_header", return_value="fake.jwt.token"), \
-         patch("app.middleware.decode_token", return_value=_FAKE_JWT_PAYLOAD), \
-         patch("app.middleware.get_user_by_id", return_value=_FAKE_USER):
+    """Test client with auth satisfied via the ``g.current_user`` injection.
+
+    regression: gh-31 -- the legacy ``app.middleware.decode_token`` /
+    ``get_user_by_id`` patches were removed (both symbols were deleted in the
+    ES256 migration). The decorators read ``g.current_user`` directly, which the
+    ``auth_quart_app`` ``before_request`` hook populates, so no token patching is
+    needed for these ipxe handler tests.
+    """
+    with patch("app.middleware.get_token_from_header", return_value="fake.jwt.token"):
         yield auth_quart_app.test_client()
 
 
