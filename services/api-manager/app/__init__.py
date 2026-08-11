@@ -17,7 +17,7 @@ from pathlib import Path
 from quart import Quart, Response
 from quart_cors import cors
 from prometheus_client import generate_latest, CONTENT_TYPE_LATEST
-from penguin_aaa.middleware.asgi import AuditMiddleware
+from penguin_aaa.middleware.asgi import AuditMiddleware, OIDCAuthMiddleware
 from penguin_aaa.audit.emitter import Emitter
 
 from .config import Config
@@ -419,9 +419,32 @@ async def create_app(config_class: type = Config) -> Quart:
         task.add_done_callback(_on_grpc_task_done)
         app.config["GRPC_STATUS"] = "up"
 
+    # Wire the penguin-aaa ASGI OIDC auth gate. Gough is its OWN first-party
+    # issuer: it mints ES256 access/id tokens (OIDCProvider, used by the auth
+    # blueprint) and validates incoming bearer tokens locally with a
+    # StaticKeyVerifier built from the keystore's public key -- no external
+    # JWKS/discovery endpoint. On success the middleware sets
+    # request.scope["state"]["claims"]; on failure it returns 401 before Quart
+    # routing. Anonymous paths (login/refresh/health/version/openapi/iPXE)
+    # bypass the gate via the template-aware ANONYMOUS_PATH_SET. The provider +
+    # settings are stashed on app.config for the login/refresh handlers.
+    from .security.oidc import OIDCSettings, build_oidc
+    from .security.scope_policy import ANONYMOUS_PATH_SET
+
+    oidc_settings = OIDCSettings.from_config(app.config)
+    oidc_provider, oidc_verifier = build_oidc(oidc_settings)
+    app.config["OIDC_SETTINGS"] = oidc_settings
+    app.config["OIDC_PROVIDER"] = oidc_provider
+    app.asgi_app = OIDCAuthMiddleware(
+        app.asgi_app,
+        rp=oidc_verifier,
+        public_paths=ANONYMOUS_PATH_SET,
+    )
+
     # Wrap with audit middleware for request logging. Emitter requires at least one
     # sink; default to StdoutSink so the app always boots (production can configure
-    # FileSink/SyslogSink/KillKrillSink). Gated by AUDIT_ENABLED.
+    # FileSink/SyslogSink/KillKrillSink). Gated by AUDIT_ENABLED. Applied last so
+    # it is the outermost layer and records the OIDC gate's 401s too.
     if app.config.get("AUDIT_ENABLED", True):
         from penguin_aaa.audit.sinks import StdoutSink
         emitter = Emitter(StdoutSink())
