@@ -86,6 +86,13 @@ class AsyncStaticKeyVerifier:
         """
         loop = asyncio.get_running_loop()
         claims = await loop.run_in_executor(None, self._verifier.verify_token, raw_token)
+        # raw_token is cryptographically verified on the line above
+        # (StaticKeyVerifier.verify_token checks signature/iss/aud/exp and
+        # required claims). penguin-aaa's strict Claims model drops the
+        # non-standard `token_use` claim, so it is re-read here from the SAME,
+        # already-authenticated token — this is NOT unverified trust, hence the
+        # suppression of the generic unverified-jwt-decode rule.
+        # nosemgrep: unverified-jwt-decode
         token_use = jwt.decode(raw_token, options={"verify_signature": False}).get(
             "token_use"
         )
