@@ -76,263 +76,120 @@ def _make_expired_token(app: Quart) -> str:
 # ==============================================================================
 
 class TestRoleRequiredDecorator:
-    """Tests for role_required decorator with scope fallback."""
+    """Tests for the ``role_required`` scope-bundle decorator (regression: gh-31).
+
+    ``role_required`` reads scopes from ``g.current_user["_jwt_payload"]`` and
+    delegates to the scope-enforcement primitives. It no longer decodes a bearer
+    token itself (the deleted HS256 ``decode_token``), so these tests populate
+    ``g.current_user`` directly with the ``_jwt_payload`` the ASGI shim would
+    build. The real token->principal path is covered in
+    tests/api/test_auth_e2e_gh31.py.
+    """
+
+    @staticmethod
+    def _principal(scope: str, role: str) -> dict:
+        return {
+            "id": 123,
+            "email": f"{role}@test.com",
+            "role": role,
+            "is_active": True,
+            "_jwt_payload": {"scope": scope, "role": role, "tenant": "tenant-1"},
+        }
 
     @pytest.mark.anyio
     async def test_role_required_scope_based_success(self):
-        """Allow request when token has adequate scope."""
+        """Allow request when the token scope satisfies the role bundle."""
         app = _make_app()
+        from app.middleware import role_required
 
-        @app.route("/admin", methods=["GET"])
+        @role_required("admin")
         async def admin_only():
             return jsonify({"message": "success"})
 
-        from app.middleware import role_required, decode_token
-
-        # Decorate with role_required
-        decorated = role_required("admin")(admin_only)
-
-        async with app.app_context():
-            token = _make_token(
-                app,
-                scope="gough.cluster.admin",
-                extra={"role": "viewer"},  # Old role claim
-            )
-
-            async with app.test_request_context(
-                "/admin",
-                headers={"Authorization": f"Bearer {token}"},
-            ):
-                # Mock get_user_by_id to return a user
-                with patch("app.middleware.get_user_by_id") as mock_get_user:
-                    mock_get_user.return_value = {
-                        "id": 123,
-                        "email": "admin@test.com",
-                        "role": "admin",
-                        "is_active": True,
-                    }
-
-                    # Manually populate g.current_user (normally auth_required does this)
-                    payload = decode_token(token)
-                    user = dict(mock_get_user.return_value)
-                    user["_jwt_payload"] = payload
-                    g.current_user = user
-
-                    # Call decorated function
-                    result = await decorated()
-                    # Expect success (scope bundle satisfied)
-                    assert result.status_code == 200
+        async with app.test_request_context("/admin"):
+            g.current_user = self._principal("gough.cluster.admin", "viewer")
+            result = await admin_only()
+            assert result.status_code == 200
 
     @pytest.mark.anyio
     async def test_role_required_legacy_role_fallback(self):
-        """Allow request when legacy role matches (scope validation fails)."""
+        """Allow request when the legacy role matches (scope check falls through)."""
         app = _make_app()
+        from app.middleware import role_required
 
-        @app.route("/maint", methods=["GET"])
+        @role_required("maintainer")
         async def maintainer_only():
             return jsonify({"message": "success"})
 
-        from app.middleware import role_required, decode_token
-
-        decorated = role_required("maintainer")(maintainer_only)
-
-        async with app.app_context():
-            token = _make_token(
-                app,
-                scope="",  # No scope
-                extra={"role": "maintainer"},
-            )
-
-            async with app.test_request_context(
-                "/maint",
-                headers={"Authorization": f"Bearer {token}"},
-            ):
-                with patch("app.middleware.get_user_by_id") as mock_get_user:
-                    mock_get_user.return_value = {
-                        "id": 123,
-                        "email": "maint@test.com",
-                        "role": "maintainer",
-                        "is_active": True,
-                    }
-
-                    payload = decode_token(token)
-                    user = dict(mock_get_user.return_value)
-                    user["_jwt_payload"] = payload
-                    g.current_user = user
-
-                    result = await decorated()
-                    assert result.status_code == 200
+        async with app.test_request_context("/maint"):
+            g.current_user = self._principal("", "maintainer")
+            result = await maintainer_only()
+            assert result.status_code == 200
 
     @pytest.mark.anyio
     async def test_role_required_insufficient_scopes_and_role(self):
-        """Deny request when both scope and role check fail."""
+        """Deny request when both scope and legacy-role checks fail -> 403."""
         app = _make_app()
+        from app.middleware import role_required
 
-        @app.route("/admin", methods=["GET"])
+        @role_required("admin")
         async def admin_only():
             return jsonify({"message": "success"})
 
-        from app.middleware import role_required, decode_token
-
-        decorated = role_required("admin")(admin_only)
-
-        async with app.app_context():
-            token = _make_token(
-                app,
-                scope="gough.cluster.read",  # Insufficient scope
-                extra={"role": "viewer"},     # Wrong role
-            )
-
-            async with app.test_request_context(
-                "/admin",
-                headers={"Authorization": f"Bearer {token}"},
-            ):
-                with patch("app.middleware.get_user_by_id") as mock_get_user:
-                    mock_get_user.return_value = {
-                        "id": 123,
-                        "email": "viewer@test.com",
-                        "role": "viewer",
-                        "is_active": True,
-                    }
-
-                    payload = decode_token(token)
-                    user = dict(mock_get_user.return_value)
-                    user["_jwt_payload"] = payload
-                    g.current_user = user
-
-                    result = await decorated()
-                    assert result[1] == 403
+        async with app.test_request_context("/admin"):
+            g.current_user = self._principal("gough.cluster.read", "viewer")
+            result = await admin_only()
+            assert result[1] == 403
 
     @pytest.mark.anyio
     async def test_role_required_no_user_in_context(self):
-        """Deny request when current_user not in context."""
+        """Deny request when current_user is absent -> 401."""
         app = _make_app()
+        from app.middleware import role_required
 
-        @app.route("/admin", methods=["GET"])
+        @role_required("admin")
         async def admin_only():
             return jsonify({"message": "success"})
 
-        from app.middleware import role_required
-
-        decorated = role_required("admin")(admin_only)
-
-        async with app.app_context():
-            async with app.test_request_context("/admin"):
-                g.current_user = None
-                result = await decorated()
-                assert result[1] == 401
+        async with app.test_request_context("/admin"):
+            g.current_user = None
+            result = await admin_only()
+            assert result[1] == 401
 
     @pytest.mark.anyio
     async def test_admin_required_decorator(self):
-        """Test admin_required convenience alias."""
+        """admin_required convenience alias accepts an admin-scoped principal."""
         app = _make_app()
+        from app.middleware import admin_required
 
-        @app.route("/admin", methods=["GET"])
+        @admin_required
         async def admin_only():
             return jsonify({"message": "success"})
 
-        from app.middleware import admin_required, decode_token
-
-        decorated = admin_required(admin_only)
-
-        async with app.app_context():
-            token = _make_token(
-                app,
-                scope="gough.cluster.admin",
-                extra={"role": "admin"},
-            )
-
-            async with app.test_request_context(
-                "/admin",
-                headers={"Authorization": f"Bearer {token}"},
-            ):
-                with patch("app.middleware.get_user_by_id") as mock_get_user:
-                    mock_get_user.return_value = {
-                        "id": 123,
-                        "email": "admin@test.com",
-                        "role": "admin",
-                        "is_active": True,
-                    }
-
-                    payload = decode_token(token)
-                    user = dict(mock_get_user.return_value)
-                    user["_jwt_payload"] = payload
-                    g.current_user = user
-
-                    result = await decorated()
-                    assert result.status_code == 200
+        async with app.test_request_context("/admin"):
+            g.current_user = self._principal("gough.cluster.admin", "admin")
+            result = await admin_only()
+            assert result.status_code == 200
 
     @pytest.mark.anyio
     async def test_maintainer_or_admin_required_with_maintainer(self):
-        """Test maintainer_or_admin_required allows maintainer role."""
+        """maintainer_or_admin_required allows a maintainer via legacy-role fallback."""
         app = _make_app()
+        from app.middleware import maintainer_or_admin_required
 
-        @app.route("/edit", methods=["POST"])
+        @maintainer_or_admin_required
         async def edit_resource():
             return jsonify({"message": "success"})
 
-        from app.middleware import maintainer_or_admin_required, decode_token
-
-        decorated = maintainer_or_admin_required(edit_resource)
-
-        async with app.app_context():
-            token = _make_token(
-                app,
-                scope="gough.cluster.read",
-                extra={"role": "maintainer"},
-            )
-
-            async with app.test_request_context(
-                "/edit",
-                headers={"Authorization": f"Bearer {token}"},
-                method="POST",
-            ):
-                with patch("app.middleware.get_user_by_id") as mock_get_user:
-                    mock_get_user.return_value = {
-                        "id": 123,
-                        "email": "maint@test.com",
-                        "role": "maintainer",
-                        "is_active": True,
-                    }
-
-                    payload = decode_token(token)
-                    user = dict(mock_get_user.return_value)
-                    user["_jwt_payload"] = payload
-                    g.current_user = user
-
-                    result = await decorated()
-                    assert result.status_code == 200
+        async with app.test_request_context("/edit", method="POST"):
+            g.current_user = self._principal("gough.cluster.read", "maintainer")
+            result = await edit_resource()
+            assert result.status_code == 200
 
 
-class TestSafeImports:
-    """Tests for safe_import_* helper functions."""
-
-    def test_safe_import_tenant_middleware_success(self):
-        """Tenant middleware available when module exists."""
-        from app.middleware import safe_import_tenant_middleware
-        result = safe_import_tenant_middleware()
-        # Module exists in this codebase
-        assert result is not None
-        assert callable(result)
-
-    def test_safe_import_tenant_middleware_failure(self):
-        """Tenant middleware returns None when module unavailable."""
-        from app.middleware import safe_import_tenant_middleware
-        with patch.dict("sys.modules", {"app.security.tenant": None}):
-            with patch("builtins.__import__", side_effect=ImportError):
-                # Simulate import error
-                result = safe_import_tenant_middleware()
-                # Should return None on failure
-                # Note: This test verifies the try/except path
-
-    def test_safe_import_scope_enforcement_success(self):
-        """Scope enforcement available when module exists."""
-        from app.middleware import safe_import_scope_enforcement
-        result = safe_import_scope_enforcement()
-        # Module exists in this codebase
-        assert result is not None
-        assert isinstance(result, tuple)
-        assert len(result) == 3
+# NOTE (regression: gh-31): ``TestSafeImports`` tested the deleted
+# ``safe_import_tenant_middleware`` / ``safe_import_scope_enforcement`` defensive
+# shims (removed once middleware wiring became a hard dependency).
 
 
 # ==============================================================================

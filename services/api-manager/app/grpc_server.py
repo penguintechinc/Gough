@@ -59,7 +59,7 @@ def _cross_tenant_scope() -> Iterator[None]:
 
     gRPC servicers run outside Quart's HTTP request pipeline (see module
     docstring: mTLS/SPIFFE identity is Plan 4 scope, the runner is still an
-    insecure channel), so ``tenant_middleware`` never runs for these calls
+    insecure channel), so the tenant bridge never runs for these calls
     and ``app.db.rls``'s tenant ContextVar is never set. A scoped Postgres
     role would therefore see zero rows on every RLS-protected table (fail
     closed) -- and every query these RPCs make is *already* untenanted at

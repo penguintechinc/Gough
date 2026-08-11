@@ -5,19 +5,48 @@ Handles user login, logout, token refresh, and password reset flows.
 """
 
 from quart import Blueprint, request, jsonify, current_app
-from datetime import datetime, timedelta
-from typing import Any
-import jwt
+from datetime import UTC, datetime, timedelta
+from typing import Any, cast
 import bcrypt
 import secrets
 from functools import wraps
 
+from penguin_aaa.authn.types import Claims
+
 from ..db.run_db import run_db
 from ..models import get_db
+from ..security.scope_policy import _expand_roles_to_scopes
 from ..security_datastore import PyDALUser, PyDALRole
 
 
 auth_bp = Blueprint("auth", __name__)
+
+
+def _mint_token_set(user_row: Any, roles: list[PyDALRole]) -> Any:
+    """Mint an ES256 access/id token set for a user via the OIDC provider.
+
+    Scopes are expanded from the user's role names (all gough authorization is
+    scope-based). ``iss``/``aud``/``iat``/``exp`` on the ``Claims`` object are
+    placeholders that satisfy validation -- the provider overrides them from its
+    own config when signing. All gough data is tenant ``__default__``.
+    """
+    provider = current_app.config["OIDC_PROVIDER"]
+    settings = current_app.config["OIDC_SETTINGS"]
+    role_names = [r.name for r in roles]
+    now = datetime.now(UTC)
+    claims = Claims(
+        sub=str(user_row.id),
+        iss=settings.issuer,
+        aud=[settings.audience],
+        iat=now,
+        exp=now + settings.token_ttl,
+        scope=_expand_roles_to_scopes(role_names),
+        roles=role_names,
+        tenant="__default__",
+        teams=[],
+        ext={},
+    )
+    return provider.issue_token_set(claims)
 
 
 def hash_password(password: str) -> str:
@@ -28,21 +57,6 @@ def hash_password(password: str) -> str:
 def verify_password(password: str, password_hash: str) -> bool:
     """Verify a password against its hash."""
     return bcrypt.checkpw(password.encode(), password_hash.encode())
-
-
-def generate_jwt_token(user_id: int, expires_in_minutes: int = 30) -> str:
-    """Generate a JWT token for a user."""
-    payload = {
-        "user_id": user_id,
-        "iat": datetime.utcnow(),
-        "exp": datetime.utcnow() + timedelta(minutes=expires_in_minutes),
-    }
-    token = jwt.encode(
-        payload,
-        current_app.config.get("JWT_SECRET_KEY"),
-        algorithm="HS256"
-    )
-    return token
 
 
 def generate_refresh_token(user_id: int) -> str:
@@ -69,21 +83,6 @@ def generate_refresh_token(user_id: int) -> str:
     db.commit()
 
     return token_value
-
-
-def verify_jwt_token(token: str) -> dict | None:
-    """Verify a JWT token and return payload if valid."""
-    try:
-        payload = jwt.decode(
-            token,
-            current_app.config.get("JWT_SECRET_KEY"),
-            algorithms=["HS256"]
-        )
-        return payload
-    except jwt.ExpiredSignatureError:
-        return None
-    except jwt.InvalidTokenError:
-        return None
 
 
 def verify_refresh_token(user_id: int, token_value: str) -> bool:
@@ -119,25 +118,25 @@ def revoke_refresh_token(user_id: int, token_value: str) -> bool:
 
 
 def require_auth(f):
-    """Decorator to require JWT authentication on a route."""
+    """Decorator to require authentication on a route.
+
+    Bearer validation is performed upstream by the ASGI ``OIDCAuthMiddleware``,
+    which populates ``request.scope["state"]["claims"]``. This decorator loads
+    the corresponding user (by the token ``sub``) and exposes it as
+    ``request.user`` for handlers that read it. A request that reached here
+    without validated claims is rejected 401.
+    """
     @wraps(f)
     async def decorated_function(*args, **kwargs):
-        # Get token from Authorization header
-        auth_header = request.headers.get("Authorization")
-        if not auth_header:
-            return jsonify({"error": "Missing Authorization header"}), 401
+        scope = cast("dict[str, Any]", request.scope)
+        claims = (scope.get("state") or {}).get("claims")
+        if not claims:
+            return jsonify({"error": "Missing or invalid token"}), 401
 
-        # Extract token
-        parts = auth_header.split()
-        if len(parts) != 2 or parts[0].lower() != "bearer":
-            return jsonify({"error": "Invalid Authorization header format"}), 401
-
-        token = parts[1]
-
-        # Verify token
-        payload = verify_jwt_token(token)
-        if not payload:
-            return jsonify({"error": "Invalid or expired token"}), 401
+        try:
+            user_id = int(claims.get("sub"))
+        except (TypeError, ValueError):
+            return jsonify({"error": "Invalid token subject"}), 401
 
         # Get user from database + roles. Regression: gh-22. User fetch +
         # roles fetch is one unit of work -- off the event loop via
@@ -146,7 +145,7 @@ def require_auth(f):
         user_datastore = current_app.user_datastore
 
         def _load_user() -> tuple[Any, Any]:
-            row = db(db.auth_user.id == payload.get("user_id")).select().first()
+            row = db(db.auth_user.id == user_id).select().first()
             if not row or not row.active:
                 return None, None
             return row, user_datastore._get_user_roles(row.id)
@@ -156,10 +155,8 @@ def require_auth(f):
         if not user_row:
             return jsonify({"error": "User not found or inactive"}), 401
 
-        user = PyDALUser(user_row, roles=roles)
-
         # Store user in request context
-        request.user = user
+        request.user = PyDALUser(user_row, roles=roles)
 
         return await f(*args, **kwargs)
 
@@ -252,15 +249,20 @@ async def login():
 
     refresh_token, roles = await run_db(_finish_login)
 
-    # Generate access token (pure JWT encode, no DB)
-    access_token = generate_jwt_token(user_row.id, expires_in_minutes=30)
+    # Mint the ES256 access/id token set via the OIDC provider (no DB). The
+    # DB-backed bcrypt refresh token above is what the /refresh endpoint
+    # verifies; the provider's own opaque refresh token is unused.
+    token_set = _mint_token_set(user_row, roles)
 
     user = PyDALUser(user_row, roles=roles)
 
     # Build response
     return jsonify({
-        "access_token": access_token,
+        "access_token": token_set.access_token,
+        "id_token": token_set.id_token,
         "refresh_token": refresh_token,
+        "token_type": "Bearer",
+        "expires_in": token_set.expires_in,
         "user": {
             "id": user.id,
             "email": user.email,
@@ -291,44 +293,57 @@ async def refresh():
     if not refresh_token:
         return jsonify({"error": "Refresh token required"}), 400
 
-    # Verify token format (should contain user_id or we need to extract it)
-    # For now, we'll verify against stored tokens
     db = get_db()
+    user_datastore = current_app.user_datastore
 
-    # Regression: gh-22. Token-record scan + matching-user fetch is one
-    # unit of work -- off the event loop via run_db() instead of blocking
-    # the request coroutine inline.
-    def _verify_and_load_user() -> tuple[str, Any]:
-        # Find valid token record
-        token_record = db(
+    # Regression: gh-22. Verify the DB refresh token, revoke it, and issue a
+    # fresh one -- all one unit of work off the event loop via run_db().
+    def _rotate_refresh() -> tuple[str, Any, str | None, list[PyDALRole]]:
+        records = db(
             (db.auth_refresh_tokens.revoked == False)
             & (db.auth_refresh_tokens.expires_at > datetime.utcnow())
         ).select()
 
-        # Find matching token by hash
+        matched_id = None
         user_id = None
-        for record in token_record:
+        for record in records:
             if bcrypt.checkpw(refresh_token.encode(), record.token_hash.encode()):
+                matched_id = record.id
                 user_id = record.user_id
                 break
 
         if not user_id:
-            return "invalid_token", None
+            return "invalid_token", None, None, []
 
-        return "ok", db(db.auth_user.id == user_id).select().first()
+        user_row = db(db.auth_user.id == user_id).select().first()
+        if not user_row or not user_row.active:
+            return "inactive", None, None, []
 
-    status, user_row = await run_db(_verify_and_load_user)
+        # Revoke the presented token and issue a rotated one.
+        db(db.auth_refresh_tokens.id == matched_id).update(revoked=True)
+        db.commit()
+        new_refresh = generate_refresh_token(user_id)
+        roles = user_datastore._get_user_roles(user_id)
+        return "ok", user_row, new_refresh, roles
+
+    status, user_row, new_refresh, roles = await run_db(_rotate_refresh)
 
     if status == "invalid_token":
         return jsonify({"error": "Invalid or expired refresh token"}), 401
 
-    if not user_row or not user_row.active:
+    if status == "inactive" or not user_row:
         return jsonify({"error": "User not found or inactive"}), 401
 
-    # Generate new access token
-    access_token = generate_jwt_token(user_row.id, expires_in_minutes=30)
+    # Mint a fresh ES256 access/id token set (no DB).
+    token_set = _mint_token_set(user_row, roles)
 
-    return jsonify({"access_token": access_token}), 200
+    return jsonify({
+        "access_token": token_set.access_token,
+        "id_token": token_set.id_token,
+        "refresh_token": new_refresh,
+        "token_type": "Bearer",
+        "expires_in": token_set.expires_in,
+    }), 200
 
 
 @auth_bp.route("/logout", methods=["POST"])

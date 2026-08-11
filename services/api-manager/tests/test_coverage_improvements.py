@@ -16,73 +16,10 @@ import pytest
 # ============================================================================
 
 
-class TestMiddlewareTokenHandling:
-    """Tests for token extraction and decoding (middleware.py lines 49-70)."""
-
-    def test_decode_token_valid(self):
-        """Decode valid JWT token - tests line 57-70."""
-        from app.middleware import decode_token
-        from quart import Quart
-
-        app = Quart(__name__)
-        app.config["JWT_SECRET_KEY"] = "test-secret-key-32-bytes-minimum-"
-
-        payload = {
-            "sub": "user-1",
-            "type": "access",
-            "iat": int(time.time()),
-            "exp": int(time.time()) + 3600,
-        }
-        token = pyjwt.encode(payload, app.config["JWT_SECRET_KEY"], algorithm="HS256")
-
-        # Run in async context to use app.app_context properly
-        import asyncio
-        async def test_async():
-            async with app.app_context():
-                decoded = decode_token(token)
-                assert decoded is not None
-                assert decoded["sub"] == "user-1"
-
-        asyncio.run(test_async())
-
-    def test_decode_token_expired(self):
-        """Return None for expired token."""
-        from app.middleware import decode_token
-        from quart import Quart
-
-        app = Quart(__name__)
-        app.config["JWT_SECRET_KEY"] = "test-secret-key-32-bytes-minimum-"
-
-        payload = {
-            "sub": "user-1",
-            "type": "access",
-            "iat": int(time.time()) - 7200,
-            "exp": int(time.time()) - 3600,  # Expired 1 hour ago
-        }
-        token = pyjwt.encode(payload, app.config["JWT_SECRET_KEY"], algorithm="HS256")
-
-        import asyncio
-        async def test_async():
-            async with app.app_context():
-                decoded = decode_token(token)
-                assert decoded is None
-
-        asyncio.run(test_async())
-
-    def test_decode_token_invalid(self):
-        """Return None for invalid token."""
-        from app.middleware import decode_token
-        from quart import Quart
-
-        app = Quart(__name__)
-        app.config["JWT_SECRET_KEY"] = "test-secret-key-32-bytes-minimum-"
-        import asyncio
-        async def test_async():
-            async with app.app_context():
-                decoded = decode_token("not.a.valid.token")
-                assert decoded is None
-
-        asyncio.run(test_async())
+# NOTE (regression: gh-31): ``TestMiddlewareTokenHandling`` tested the deleted
+# HS256 ``decode_token`` helper. Bearer validation now lives in the ASGI
+# ``OIDCAuthMiddleware`` (ES256 StaticKeyVerifier); its valid / expired / invalid
+# token behaviour is exercised end-to-end in tests/api/test_auth_e2e_gh31.py.
 
 
 class TestMiddlewareGetCurrentUser:
@@ -146,27 +83,9 @@ class TestMiddlewareGetCurrentUser:
         asyncio.run(test_async())
 
 
-class TestMiddlewareHelpers:
-    """Tests for middleware helper functions."""
-
-    def test_safe_import_tenant_middleware_success(self):
-        """safe_import_tenant_middleware returns callable when available."""
-        from app.middleware import safe_import_tenant_middleware
-
-        result = safe_import_tenant_middleware()
-        # Result is either None (if module not fully available) or callable
-        if result is not None:
-            assert callable(result)
-
-    def test_safe_import_scope_enforcement_success(self):
-        """safe_import_scope_enforcement returns tuple when available."""
-        from app.middleware import safe_import_scope_enforcement
-
-        result = safe_import_scope_enforcement()
-        # Result is either None or 3-tuple of callables
-        if result is not None:
-            assert isinstance(result, tuple)
-            assert len(result) == 3
+# NOTE (regression: gh-31): ``TestMiddlewareHelpers`` tested the deleted
+# ``safe_import_tenant_middleware`` / ``safe_import_scope_enforcement`` defensive
+# shims (removed once middleware wiring became a hard dependency).
 
 
 # ============================================================================

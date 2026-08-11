@@ -15,11 +15,11 @@ from __future__ import annotations
 
 import re
 from functools import wraps
-from typing import Callable, Optional
+from typing import Any, Callable, cast
 
 from quart import g, jsonify, request
 
-from .scope_policy import ANONYMOUS_PATHS, SCOPE_POLICY
+from .scope_policy import SCOPE_POLICY, is_anonymous_request
 
 
 class InsufficientScopeError(Exception):
@@ -138,6 +138,13 @@ def lookup_required_scopes(
     Returns:
         Frozenset of required scopes, or None if endpoint not in SCOPE_POLICY
     """
+    # Normalize a trailing slash: SCOPE_POLICY keys never carry one, but Quart's
+    # strict-slashes routing canonicalises blueprint "/" routes WITH a trailing
+    # slash (e.g. GET /api/v1/nodes -> 308 -> /api/v1/nodes/). Without this, the
+    # canonical path fails the policy lookup and gets fail-closed 403'd.
+    if len(path) > 1 and path.endswith("/"):
+        path = path.rstrip("/")
+
     # Exact match first
     if (method, path) in SCOPE_POLICY:
         return SCOPE_POLICY[(method, path)]
@@ -233,8 +240,8 @@ async def scope_enforcement_middleware(app) -> None:
         method = request.method
         path = request.path
 
-        # Skip anonymous paths (no auth required)
-        if (method, path) in ANONYMOUS_PATHS:
+        # Skip anonymous paths (no auth required; method + template aware).
+        if is_anonymous_request(method, path):
             return
 
         # Lookup scopes in policy
@@ -250,16 +257,21 @@ async def scope_enforcement_middleware(app) -> None:
                 "status": "forbidden_scope",
             }), 403
 
-        # Get user from request context (set by auth_required decorator)
-        user = g.get("current_user")
+        # Scope source: the penguin-aaa claims populated by OIDCAuthMiddleware
+        # (request.scope["state"]["claims"]) are authoritative. Fall back to the
+        # g.current_user shim's _jwt_payload for any path that reached here
+        # without ASGI-validated claims.
+        scope = cast("dict[str, Any]", request.scope)
+        claims = (scope.get("state") or {}).get("claims")
+        if claims is not None:
+            payload = claims
+        else:
+            user = g.get("current_user")
+            if not user:
+                # No validated principal on a protected endpoint -> deny.
+                return jsonify({"error": "Authentication required"}), 401
+            payload = user.get("_jwt_payload", {})
 
-        if not user:
-            # auth_required decorator handles missing auth, but if middleware
-            # runs and user is missing, deny
-            return jsonify({"error": "Authentication required"}), 401
-
-        # Extract scopes from JWT payload
-        payload = user.get("_jwt_payload", {})
         provided_scopes = extract_scopes_from_jwt(payload)
 
         try:
