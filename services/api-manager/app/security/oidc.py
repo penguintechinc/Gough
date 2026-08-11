@@ -20,6 +20,7 @@ from datetime import timedelta
 from pathlib import Path
 from typing import Any
 
+import jwt
 from cryptography.hazmat.primitives import serialization
 from penguin_aaa.authn.oidc_provider import OIDCProvider, OIDCProviderConfig
 from penguin_aaa.authn.static_key import StaticKeyConfig, StaticKeyVerifier
@@ -75,19 +76,45 @@ class AsyncStaticKeyVerifier:
         self._verifier = verifier
 
     async def verify_token(self, raw_token: str) -> dict[str, Any]:
-        """Validate ``raw_token`` off the event loop; return claims as a dict."""
-        loop = asyncio.get_event_loop()
+        """Validate ``raw_token`` off the event loop; return claims as a dict.
+
+        Rejects anything that is not an access token: the provider signs id
+        tokens with the SAME key (they'd otherwise pass signature/iss/aud), and
+        stamps ``token_use``. ``Claims`` drops ``token_use``, so it is read from
+        the already-verified JWT. A non-access token raises -> the ASGI
+        middleware turns that into 401.
+        """
+        loop = asyncio.get_running_loop()
         claims = await loop.run_in_executor(None, self._verifier.verify_token, raw_token)
+        token_use = jwt.decode(raw_token, options={"verify_signature": False}).get(
+            "token_use"
+        )
+        if token_use != "access":
+            raise ValueError(f"token_use {token_use!r} is not an access token")
         return claims.model_dump()
 
 
 def _build_keystore(settings: OIDCSettings) -> KeyStore:
-    """Construct the ES256 keystore for the given settings (memory or file)."""
+    """Construct the ES256 keystore for the given settings (memory or file).
+
+    Production (``in_memory=False``) REQUIRES the key file to already exist and
+    be non-empty: ``FileKeyStore`` self-generates a key on a missing file, so a
+    fresh boot per replica would mint divergent signing keys and callers would
+    get cross-replica 401s. The key must be pre-provisioned and shared (e.g. a
+    mounted Secret). Fail fast rather than self-generate.
+    """
     if settings.in_memory:
         return MemoryKeyStore(algorithm=settings.algorithm)
-    return FileKeyStore(
-        path=Path(settings.key_store_path), algorithm=settings.algorithm
-    )
+
+    path = Path(settings.key_store_path)
+    if not path.is_file() or path.stat().st_size == 0:
+        raise RuntimeError(
+            f"OIDC ES256 key store {path} is missing or empty. In production the "
+            "signing key must be pre-provisioned and shared across replicas "
+            "(e.g. a mounted Secret at GOUGH_KEY_STORE_PATH); refusing to "
+            "self-generate divergent per-replica keys."
+        )
+    return FileKeyStore(path=path, algorithm=settings.algorithm)
 
 
 def build_oidc(
