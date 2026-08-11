@@ -52,6 +52,21 @@ class Config:
         days=int(os.getenv("JWT_REFRESH_TOKEN_DAYS", "7"))
     )
 
+    # OIDC token provider (penguin-aaa). Gough is its OWN first-party issuer:
+    # it mints ES256 access/id tokens with an OIDCProvider and validates its
+    # own tokens locally via a StaticKeyVerifier (public key exported from the
+    # keystore) -- no external JWKS/discovery endpoint. penguin-aaa forbids
+    # HS256 and requires the issuer to be an https URL even in dev.
+    OIDC_ISSUER = os.getenv("OIDC_ISSUER", "https://gough.localhost.local")
+    OIDC_AUDIENCE = os.getenv("OIDC_AUDIENCE", "gough-api")
+    OIDC_ALGORITHM = "ES256"
+    # File-backed ES256 keystore path (production; persists across restarts and
+    # is shared across replicas via a mounted secret). Dev/test use an
+    # in-memory keystore and ignore this.
+    GOUGH_KEY_STORE_PATH = os.getenv(
+        "GOUGH_KEY_STORE_PATH", "/var/gough/keys/oidc_keys.json"
+    )
+
     # Database - PyDAL compatible with multi-DB support
     DB_TYPE = os.getenv("DB_TYPE", "postgres")
     DB_HOST = os.getenv("DB_HOST", "localhost")
