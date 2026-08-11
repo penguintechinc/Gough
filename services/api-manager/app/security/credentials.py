@@ -584,7 +584,8 @@ async def credentials_middleware(
 
     Skips anonymous paths (ANONYMOUS_PATHS); detects credential type; routes to
     appropriate validate_* function. Stores Principal in quart.g.principal.
-    Tenant extraction delegated to app.security.tenant.tenant_middleware.
+    Tenant extraction delegated to app.middleware's tenant bridge
+    (install_security_middleware).
 
     Args:
         request: Quart request object.

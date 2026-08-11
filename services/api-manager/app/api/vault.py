@@ -73,10 +73,10 @@ async def rotate_keys():
     # penguin-dal DB for the current request (RLS-wired -- app.models.get_db).
     # joiner_secrets is RLS-protected (baseline migration `rls_tables`, see
     # alembic/versions/20260805_1000_baseline_full_schema.py); this is a
-    # request-path handler, so tenant_middleware has already pushed the
-    # caller's tenant (or the cross-tenant sentinel for a super-admin token)
-    # onto the RLS GUC before this handler runs -- no extra scoping needed
-    # here (see app.security.tenant.tenant_middleware).
+    # request-path handler, so app.middleware's tenant bridge has already
+    # pushed the caller's tenant (or the cross-tenant sentinel for a
+    # super-admin token) onto the RLS GUC before this handler runs -- no extra
+    # scoping needed here (see app.middleware.install_security_middleware).
     db = get_db()
     if db is None:
         return jsonify({"error": "Database not available"}), 503

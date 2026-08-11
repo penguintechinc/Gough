@@ -4,7 +4,7 @@ Per Gough spec Sprint 4 (Biome Model -> Joiner Secrets). All endpoints are
 tenant-scoped; cluster-id from the URL is filtered against the JWT's tenant
 claim through Layer 4 RLS (the GUC ``app.current_tenant`` is pushed via the
 ``contextvars.ContextVar`` in ``app.db.rls``, applied to every penguin-dal
-connection on pool checkout -- see ``app.security.tenant.tenant_middleware``).
+connection on pool checkout -- see ``app.middleware.install_security_middleware``).
 
 Response payloads NEVER expose any portion of the encrypted envelope. The
 fields ``ciphertext``, ``dek_wrapped``, ``iv``, and ``auth_tag`` are read

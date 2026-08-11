@@ -1432,7 +1432,7 @@ class PlanCompiler:
             ``PlanCompiler`` is constructed exactly once in this codebase,
             from inside a Quart request handler (``deploy_node``) *after*
             it has already called ``app.models.get_db()``, i.e. after
-            ``tenant_middleware`` has set the request's tenant on
+            the tenant bridge in ``app.middleware`` has set the request's tenant on
             ``app.db.rls``'s ContextVar. Per ``app.db.rls``'s own module
             docstring, that ContextVar propagates through
             ``asyncio.to_thread()`` (the intended way to invoke the

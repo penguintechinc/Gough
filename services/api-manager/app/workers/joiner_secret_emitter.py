@@ -447,7 +447,7 @@ class JoinerSecretEmitter:
 
         RLS note: this runs outside Quart's HTTP request pipeline (invoked
         by a background trigger on a ``biome_instance_id`` alone -- no
-        request, no ``tenant_middleware``, so ``app.db.rls``'s tenant
+        request, no tenant bridge, so ``app.db.rls``'s tenant
         ContextVar is never set by anything upstream of this call). Worse,
         resolving *which* tenant owns this row is the first thing this
         method has to do (``_load_context`` looks up the assignment/biome/
