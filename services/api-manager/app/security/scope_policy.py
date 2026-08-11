@@ -78,11 +78,13 @@ SCOPE_POLICY: dict[tuple[str, str], frozenset[str] | None] = {
     ("POST", "/api/v1/nodes/<int:node_id>/rekey"): frozenset({"gough.nodes.rekey"}),
     ("POST", "/api/v1/nodes/<int:node_id>/evacuate"): frozenset({"gough.nodes.provision"}),
     ("DELETE", "/api/v1/nodes/<int:node_id>"): frozenset({"gough.nodes.decommission"}),
-    ("POST", "/api/v1/nodes/<int:node_id>/events"): frozenset(),
+    # POST /nodes/<id>/events authenticates with a service SVID (mTLS) inside
+    # the handler, not an OIDC bearer -> ANONYMOUS_PATHS (see below).
     ("GET", "/api/v1/nodes/<int:node_id>/tags"): frozenset({"gough.nodes.read"}),
     ("PATCH", "/api/v1/nodes/<int:node_id>/tags"): frozenset({"gough.nodes.provision"}),
     ("POST", "/api/v1/nodes/manual"): frozenset({"gough.nodes.provision", "gough.cluster.admin"}),
-    ("POST", "/api/v1/nodes/discover"): frozenset(),
+    # POST /nodes/discover authenticates with a one-time bootstrap token (HS256)
+    # validated inside the handler, not an OIDC bearer -> ANONYMOUS_PATHS (below).
     ("POST", "/api/v1/nodes/<int:node_id>/biomes"): frozenset({"gough.biomes.deploy"}),
     ("GET", "/api/v1/nodes/<int:node_id>/biomes"): frozenset({"gough.biomes.read"}),
     ("DELETE", "/api/v1/nodes/<int:node_id>/biomes/<int:biome_id>"): frozenset({"gough.biomes.deploy"}),
@@ -151,7 +153,7 @@ SCOPE_POLICY: dict[tuple[str, str], frozenset[str] | None] = {
     ("POST", "/api/v1/webhooks"): frozenset({"gough.cluster.admin"}),
     ("DELETE", "/api/v1/webhooks/<int:webhook_id>"): frozenset({"gough.cluster.admin"}),
     ("POST", "/api/v1/webhooks/<int:webhook_id>/test"): frozenset({"gough.cluster.admin"}),
-    ("GET", "/api/v1/webhooks/keys/<string:tenant>"): frozenset(),
+    # GET /webhooks/keys/<tenant> serves a PUBLIC JWKS -> ANONYMOUS_PATHS (below).
 
     # Integrations endpoints
     ("GET", "/api/v1/integrations/status"): frozenset({"gough.cluster.read"}),
@@ -201,6 +203,22 @@ ANONYMOUS_PATHS: frozenset[tuple[str, str]] = frozenset({
     # Password reset: public (forgot-password flow has no JWT; reset_token in body)
     ("POST", "/api/v1/auth/request-password-reset"),
     ("POST", "/api/v1/auth/reset-password"),
+    # Public status endpoint (hello.status; no auth by design).
+    ("GET", "/api/v1/status"),
+    # Endpoints that authenticate with a NON-OIDC scheme inside the handler
+    # (regression: gh-31 -- the ES256 ASGI gate must skip these or their real
+    # callers can never reach the handler that runs their own auth check).
+    # Agent enrollment/token endpoints (X-Enrollment-Key header / HS256 agent
+    # access+refresh tokens, all validated in app.api.agents).
+    ("POST", "/api/v1/agents/enroll"),
+    ("POST", "/api/v1/agents/refresh"),
+    ("POST", "/api/v1/agents/heartbeat"),
+    # Node discovery: one-time bootstrap token (HS256) validated in the handler.
+    ("POST", "/api/v1/nodes/discover"),
+    # Node events: service SVID (mTLS X.509) validated in the handler.
+    ("POST", "/api/v1/nodes/<int:node_id>/events"),
+    # Public webhook JWKS (verification keys for a tenant).
+    ("GET", "/api/v1/webhooks/keys/<string:tenant>"),
 })
 
 
@@ -266,7 +284,10 @@ _MAINTAINER_SCOPES: frozenset[str] = (
 )
 
 ROLE_TO_SCOPE_BUNDLE: dict[str, frozenset[str]] = {
-    "admin": frozenset(KNOWN_SCOPES),
+    # Dangerous overrides (dr.promote, unsafe-skip-signing, override-lock) are
+    # never granted by a role bundle -- they require explicit approval/MFA and
+    # must be minted deliberately, not implied by "admin".
+    "admin": KNOWN_SCOPES - _DANGEROUS_SCOPES,
     "maintainer": _MAINTAINER_SCOPES,
     "viewer": _READ_SCOPES,
 }
