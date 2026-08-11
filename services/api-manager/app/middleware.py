@@ -293,12 +293,16 @@ async def install_security_middleware(app) -> None:
         try:
             user_id = int(sub)  # type: ignore[arg-type]
         except (TypeError, ValueError):
-            return None
+            # Valid-signature token with a malformed subject -> fail closed.
+            return jsonify({"error": "Invalid token subject"}), 401
 
         # get_user_by_id is a blocking penguin-dal unit; run it off the loop.
         user = await run_db(lambda: get_user_by_id(user_id))
         if not user or not user.get("is_active"):
-            return None  # Deleted/inactive user -> scope layer 401.
+            # Fail closed: a cryptographically valid token whose user has been
+            # deleted or deactivated must be rejected here -- scope enforcement
+            # trusts the token's own scope claim and would otherwise let it pass.
+            return jsonify({"error": "User inactive or not found"}), 401
 
         roles = list(claims.get("roles") or [])
         g.current_user = {
