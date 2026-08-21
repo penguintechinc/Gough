@@ -118,6 +118,25 @@ def err_internal(message: str = "Unexpected internal error"):
     return envelope_error("internal_error", message, 500)
 
 
+def err_license_required(message: str, *, details: Optional[dict] = None):
+    """402 for a request refused on license entitlement grounds.
+
+    Distinct from 403: the caller is authenticated and authorized, the
+    deployment simply has no allowance left. ``details`` should carry the
+    counts that produced the refusal so an operator can act on it.
+    """
+    return envelope_error("license_required", message, 402, details=details)
+
+
+def err_feature_disabled(message: str, *, details: Optional[dict] = None):
+    """404 for a surface switched off by a feature flag.
+
+    404 rather than 403 so a disabled surface is indistinguishable from one
+    that does not exist -- a flag that is off should not advertise itself.
+    """
+    return envelope_error("feature_disabled", message, 404, details=details)
+
+
 def validate_body(model: type[BaseModel], payload: Any):
     """Validate ``payload`` against ``model``.
 
