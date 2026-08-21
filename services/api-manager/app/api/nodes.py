@@ -36,6 +36,7 @@ from typing import Any, Optional
 from quart import Blueprint, Response, g, request, current_app
 
 from ..db.run_db import run_db
+from ..licensing import ACTIVE_NODE_STATES, count_active_nodes, node_allowance
 from ..middleware import auth_required
 from ..models import get_db
 from ._biome_schema import NodeBiomeAssignRequest
@@ -47,6 +48,7 @@ from ._helpers import (
     err_bad_request,
     err_conflict,
     err_internal,
+    err_license_required,
     err_not_found,
     err_validation,
     node_effective_tags,
@@ -1084,6 +1086,26 @@ async def deploy_node(node_id: int):
             f"Cannot deploy a node in terminal state '{current_state}'",
             details={"state": current_state},
         )
+
+    # Node allowance is metered on activation, not on inventory: discovery,
+    # iPXE registration and gRPC enrolment all stay unrestricted, and only the
+    # transition into an active state consumes a slot. A node that is already
+    # active is already counted, so re-deploying it is free.
+    if current_state not in ACTIVE_NODE_STATES:
+        allowance = await node_allowance(request.host)
+        active = await run_db(lambda: count_active_nodes(db))
+        if active >= allowance:
+            return err_license_required(
+                f"Node allowance reached ({active}/{allowance}). Deploying "
+                f"another node requires additional licensed nodes.",
+                details={
+                    "active_nodes": active,
+                    "allowed_nodes": (
+                        allowance if allowance != float("inf") else "unlimited"
+                    ),
+                    "node_id": node_id,
+                },
+            )
 
     # Regression: gh-22. Off the event loop via run_db() instead of
     # blocking the request coroutine inline.

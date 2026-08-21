@@ -11,7 +11,15 @@ from typing import Any
 from quart import Blueprint, jsonify, request
 
 from ..db.run_db import run_db
+from ..licensing import (
+    FLAG_MULTI_CLOUD,
+    count_active_nodes,
+    feature_enabled,
+    node_allowance,
+    stamp_managed_tag,
+)
 from ..middleware import auth_required, roles_accepted, roles_required
+from ._helpers import err_feature_disabled, err_license_required
 from ..clouds import (
     CLOUD_REGISTRY,
     get_cloud_provider,
@@ -27,6 +35,27 @@ from ..models import get_db
 log = logging.getLogger(__name__)
 
 clouds_bp = Blueprint("clouds", __name__)
+
+
+@clouds_bp.before_request
+async def _gate_multi_cloud():
+    """Switch the whole cloud-provider surface off behind its feature flag.
+
+    Blueprint-wide rather than per-route so a route added later cannot forget
+    the gate. Returning None lets the request proceed; returning a response
+    short-circuits it.
+
+    Defaults OFF when PostHog is unconfigured or unreachable with nothing
+    cached, per the "new flags default OFF until validated" rule -- so a
+    deployment that has never configured POSTHOG_KEY sees /api/v1/clouds/*
+    as 404 until the flag is switched on.
+    """
+    if await feature_enabled(FLAG_MULTI_CLOUD):
+        return None
+    return err_feature_disabled(
+        "Cloud provider management is not enabled for this deployment.",
+        details={"flag": FLAG_MULTI_CLOUD},
+    )
 
 
 # ============================================================================
@@ -489,6 +518,25 @@ async def create_machine(provider_id: int):
 
     if not spec.size:
         return jsonify({"error": "Size required"}), 400
+
+    # Provisioning a cloud VM is an activation, so it is metered. Syncing an
+    # operator's pre-existing fleet in via list_machines is not -- those rows
+    # carry no gough-managed tag and never reach this path.
+    allowance = await node_allowance(request.host)
+    active = await run_db(lambda: count_active_nodes(db))
+    if active >= allowance:
+        return err_license_required(
+            f"Node allowance reached ({active}/{allowance}). Creating another "
+            f"machine requires additional licensed nodes.",
+            details={
+                "active_nodes": active,
+                "allowed_nodes": allowance if allowance != float("inf") else "unlimited",
+            },
+        )
+
+    # Stamp gough's marker so this machine stays attributable across the
+    # inventory syncs that later overwrite its local row.
+    spec.tags = stamp_managed_tag(spec.tags)
 
     try:
         cloud = get_cloud_provider(provider.provider_type, provider.config)
