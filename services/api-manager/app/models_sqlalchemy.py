@@ -147,6 +147,27 @@ class EncryptedSecret(Base):
     updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
 
 
+class BootstrapNonce(Base):
+    """One-time iPXE bootstrap JWT nonce store (Redis fallback).
+
+    Populated by `app.api.ipxe._register_bootstrap_nonce` whenever the runtime
+    Redis client is unavailable; consumed by
+    `app.security.credentials.validate_one_time_bootstrap_token` for replay
+    rejection. Rows are short-lived (TTL = JWT exp).
+    """
+
+    __tablename__ = "bootstrap_nonces"
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    nonce = Column(String(128), unique=True, nullable=False)
+    mac = Column(String(17), nullable=False, index=True)
+    phase = Column(String(16), nullable=False)
+    used = Column(Boolean, default=False, nullable=False)
+    issued_at = Column(DateTime, default=datetime.utcnow, nullable=False)
+    expires_at = Column(DateTime, nullable=False, index=True)
+    used_at = Column(DateTime, nullable=True)
+
+
 # =============================================================================
 # Storage Configuration Tables
 # =============================================================================
@@ -396,6 +417,7 @@ class FleetDMConfig(Base):
     id = Column(Integer, primary_key=True, autoincrement=True)
     name = Column(String(100), unique=True, nullable=False)
     fleet_url = Column(String(500), nullable=False)
+    api_token = Column(String(500))
     api_token_path = Column(String(500))
     is_active = Column(Boolean, default=True)
     osquery_version = Column(String(20), default="5.10.2")
@@ -416,10 +438,12 @@ class FleetHost(Base):
     machine_id = Column(Integer, ForeignKey("cloud_machines.id"))
     server_id = Column(Integer, ForeignKey("servers.id"))
     last_seen_at = Column(DateTime)
+    last_seen = Column(DateTime)
     status = Column(String(50), default="offline")
     platform = Column(String(50))
     osquery_version = Column(String(20))
     enrolled_at = Column(DateTime)
+    enrollment_date = Column(DateTime)
     created_at = Column(DateTime, default=datetime.utcnow)
     updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
 
@@ -719,18 +743,49 @@ class SystemLog(Base):
     created_at = Column(DateTime, default=datetime.utcnow)
 
 
-def get_sqlalchemy_engine(db_uri: str):
-    """Create SQLAlchemy engine from database URI."""
-    # Convert PyDAL URI to SQLAlchemy URI format
-    if db_uri.startswith("postgres://"):
-        # SQLAlchemy requires postgresql:// not postgres://
-        db_uri = db_uri.replace("postgres://", "postgresql://", 1)
-    elif db_uri.startswith("sqlite:"):
-        # SQLAlchemy uses sqlite:/// for files
-        if "memory" not in db_uri:
-            db_uri = db_uri.replace("sqlite://", "sqlite:///", 1)
+def convert_pydal_to_sqlalchemy_uri(db_uri: str) -> str:
+    """Convert PyDAL database URI to SQLAlchemy format.
 
-    return create_engine(db_uri, echo=False)
+    Handles:
+    - postgres:// → postgresql://
+    - sqlite:memory → sqlite:///:memory:?check_same_thread=false
+    - sqlite://filename.db → sqlite:///filename.db
+    """
+    # Convert PostgreSQL dialect
+    if db_uri.startswith("postgres://"):
+        return db_uri.replace("postgres://", "postgresql://", 1)
+
+    # Convert SQLite dialect
+    if db_uri.startswith("sqlite:"):
+        if db_uri == "sqlite:memory":
+            # Add query param for check_same_thread (required for StaticPool + in-memory)
+            return "sqlite:///:memory:?check_same_thread=false"
+        elif db_uri.startswith("sqlite://"):
+            return db_uri.replace("sqlite://", "sqlite:///", 1)
+
+    return db_uri
+
+
+def get_sqlalchemy_engine(db_uri: str):
+    """Create SQLAlchemy engine from database URI.
+
+    Converts PyDAL format URIs to SQLAlchemy format.
+    For in-memory SQLite, disables pooling to maintain single connection.
+    """
+    from sqlalchemy.pool import StaticPool
+
+    sa_uri = convert_pydal_to_sqlalchemy_uri(db_uri)
+
+    # For in-memory SQLite, disable pooling and set check_same_thread=False
+    if sa_uri == "sqlite:///:memory:":
+        return create_engine(
+            sa_uri,
+            echo=False,
+            poolclass=StaticPool,
+            connect_args={"check_same_thread": False},
+        )
+
+    return create_engine(sa_uri, echo=False)
 
 
 def create_all_tables(db_uri: str):
@@ -738,6 +793,9 @@ def create_all_tables(db_uri: str):
     from sqlalchemy.orm import sessionmaker
     import uuid
     import bcrypt
+
+    # Register M1 ORM classes on Base.metadata
+    from . import models_m1  # noqa: E402,F401
 
     engine = get_sqlalchemy_engine(db_uri)
     Base.metadata.create_all(engine)
